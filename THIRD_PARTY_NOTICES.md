@@ -31,3 +31,7 @@ SOFTWARE.
 
 2.0 界面与虚拟流实现来自 [ywainzh/linuxdo-read-script](https://github.com/ywainzh/linuxdo-read-script)（MIT License）；
 Obsidian Markdown 转换与写入流程改编自 zsq 的 MIT 脚本 [linux.do 帖子保存到 Obsidian](https://greasyfork.org/zh-CN/scripts/587200-linux-do-%E5%B8%96%E5%AD%90%E4%BF%9D%E5%AD%98%E5%88%B0-obsidian)。
+
+## Loongphy/tools (`linux.do 发帖时间列`)
+
+话题列表「发帖时间列」采集与渲染逻辑整合自 [Loongphy/tools](https://github.com/Loongphy/tools/blob/main/linux-do-post-time.user.js)（MIT License）。

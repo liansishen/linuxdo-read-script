@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         LinuxDo 增强阅读
 // @namespace    https://linux.do/
-// @version      2.1.0
+// @version      2.2.0
 // @license      MIT
-// @description  在 LINUX DO 与 IDC Flare 高性能浮窗阅读帖子，支持虚拟楼层、右侧时间轴、楼中楼折叠、点赞、回复、表情、模板、投票、剧透、视频、公式、大图压缩与分片上传、删帖、历史收藏、双栏资料卡和 Obsidian 快照。
+// @description  在 LINUX DO 与 IDC Flare 高性能浮窗阅读帖子，支持默认楼中楼、自动载入新回复、全表情点赞回应、列表发帖时间列、右侧时间轴、投票、剧透、视频、公式、大图压缩上传、删帖、历史收藏、双栏资料卡和 Obsidian 快照。
 // @author       Fashion
 // @match        https://linux.do/*
 // @match        https://idcflare.com/*
@@ -18,7 +18,7 @@
 // @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -33,6 +33,144 @@
   let ME_USERNAME = null;
   let ME_USER = null;
   let ME_STATE = 'unknown';
+
+  // --- 楼中楼默认展开分批加载 & 自动载入新回复配置 ---
+  const SUB_REPLY_INITIAL_SIZE = 5;   // 楼中楼默认自动展开条数
+  const SUB_REPLY_PAGE_SIZE = 20;     // 点击“展示更多回复”每次追加条数
+  const REPLIES_HOVER_DELAY = 200;    // 楼层进入视口后触发楼中楼补全延迟(ms)
+  const AUTO_REFRESH_INTERVAL = 15000;// 自动检查并载入新回复间隔(ms)
+  const AUTO_LOAD_REPLIES_KEY = 'ldp-auto-load-replies';
+  const TOPIC_LIVE_LISTENERS = new Set();
+
+  function onDomReady(fn) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', fn, { once: true });
+    } else {
+      fn();
+    }
+  }
+
+  /* ============ 0. 列表发帖时间列数据采集（document-start 拦截 fetch/XHR） ============ */
+  const CREATED_AT_LS_KEY = 'linuxdo-topic-created-at';
+  const CREATED_AT_MAX_CACHE = 4000;
+  const CREATED_AT_COL_CLASS = 'topic-created-at';
+  const CREATED_AT_COL_LABEL = '发帖';
+  const CREATED_AT_THEME_MODES = { '-2': 'horizon', '105': 'classic', '106': 'classic' };
+  const topicCreatedMap = new Map();
+  let topicCreatedSaveTimer = 0;
+  let scheduleTopicCreatedSweep = () => {};
+
+  try {
+    const savedCreated = JSON.parse(localStorage.getItem(CREATED_AT_LS_KEY) || '[]');
+    for (let i = 0; i < savedCreated.length; i++) {
+      if (Array.isArray(savedCreated[i]) && savedCreated[i][0] != null && savedCreated[i][1]) {
+        topicCreatedMap.set(String(savedCreated[i][0]), savedCreated[i][1]);
+      }
+    }
+    while (topicCreatedMap.size > CREATED_AT_MAX_CACHE) {
+      topicCreatedMap.delete(topicCreatedMap.keys().next().value);
+    }
+  } catch (e) { /* ignore corrupted cache */ }
+
+  function scheduleTopicCreatedSave() {
+    if (topicCreatedSaveTimer) return;
+    topicCreatedSaveTimer = setTimeout(() => {
+      topicCreatedSaveTimer = 0;
+      try {
+        localStorage.setItem(CREATED_AT_LS_KEY, JSON.stringify(Array.from(topicCreatedMap)));
+      } catch (e) { /* ignore quota error */ }
+    }, 2000);
+  }
+
+  function putTopicCreated(id, iso) {
+    if (id == null || !iso) return;
+    const key = String(id);
+    if (topicCreatedMap.has(key)) return;
+    topicCreatedMap.set(key, iso);
+    while (topicCreatedMap.size > CREATED_AT_MAX_CACHE) {
+      topicCreatedMap.delete(topicCreatedMap.keys().next().value);
+    }
+    scheduleTopicCreatedSave();
+    scheduleTopicCreatedSweep();
+  }
+
+  function harvestTopicCreatedData(data) {
+    if (!data || typeof data !== 'object') return;
+    const topics = data.topic_list && data.topic_list.topics;
+    if (Array.isArray(topics)) {
+      for (let i = 0; i < topics.length; i++) {
+        const t = topics[i];
+        if (t && t.id != null && t.created_at) putTopicCreated(t.id, t.created_at);
+      }
+      return;
+    }
+    if (Array.isArray(data)) {
+      for (let k = 0; k < data.length; k++) {
+        const msg = data[k];
+        if (Array.isArray(msg)) {
+          const channel = typeof msg[0] === 'string' ? msg[0] : '';
+          const payload = msg[1];
+          if (payload && typeof payload === 'object') harvestTopicCreatedData(payload);
+          const topicMatch = channel.match(/^\/topic\/(\d+)$/);
+          if (topicMatch && payload && typeof payload === 'object') {
+            TOPIC_LIVE_LISTENERS.forEach((listener) => {
+              try { listener(topicMatch[1], payload); } catch (e) {}
+            });
+          }
+        }
+      }
+      return;
+    }
+    if (data.id != null && data.created_at && (data.post_stream || Array.isArray(data.posters) || data.slug)) {
+      putTopicCreated(data.id, data.created_at);
+    }
+  }
+
+  function isDiscourseHarvestUrl(url) {
+    return typeof url === 'string' && (/\.json(\?|#|$)/.test(url) || /message-bus\/.+\/poll/.test(url));
+  }
+
+  const nativePageFetch = PAGE_WIN.fetch;
+  if (typeof nativePageFetch === 'function' && !nativePageFetch.__ldpHarvestHooked) {
+    const wrappedFetch = function (input) {
+      const promise = nativePageFetch.apply(this, arguments);
+      try {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (isDiscourseHarvestUrl(url)) {
+          promise.then((res) => {
+            try { res.clone().json().then(harvestTopicCreatedData, () => {}); } catch (e) {}
+          }, () => {});
+        }
+      } catch (e) {}
+      return promise;
+    };
+    wrappedFetch.__ldpHarvestHooked = true;
+    try { PAGE_WIN.fetch = wrappedFetch; } catch (e) {}
+  }
+
+  const PageXHR = PAGE_WIN.XMLHttpRequest && PAGE_WIN.XMLHttpRequest.prototype;
+  if (PageXHR && !PageXHR.__ldpHarvestHooked) {
+    const origOpen = PageXHR.open;
+    const origSend = PageXHR.send;
+    PageXHR.open = function (method, url) {
+      this.__ldpHarvestUrl = isDiscourseHarvestUrl(url);
+      return origOpen.apply(this, arguments);
+    };
+    PageXHR.send = function () {
+      if (this.__ldpHarvestUrl) {
+        this.addEventListener('load', () => {
+          try {
+            if (this.responseType === 'json') harvestTopicCreatedData(this.response);
+            else if (this.responseType === '' || this.responseType === 'text') {
+              harvestTopicCreatedData(JSON.parse(this.responseText));
+            }
+          } catch (e) {}
+        });
+      }
+      return origSend.apply(this, arguments);
+    };
+    PageXHR.__ldpHarvestHooked = true;
+  }
 
   // --- 全局只读请求队列 & HTTP 429 退避重试 ---
   const REQUEST_MIN_INTERVAL = 100;   // 相邻 GET 请求最小间隔(ms)
@@ -414,19 +552,11 @@
     .ldp-lb-x:hover{background:rgba(255,255,255,.14);}
     .ldp-lb-x:focus-visible{outline:3px solid #fff;outline-offset:2px;}
 
-    /* 原帖式直属回复折叠 */
-    .ldp-reply-toggle{margin-left:6px;padding:4px 7px;font-size:15px;line-height:1.2;
-      color:var(--primary-medium,#6f7772);font-weight:600;opacity:.88;border-radius:6px;gap:8px;}
-    .ldp-reply-toggle::after{content:"";width:6px;height:6px;flex:none;
-      border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
-      transform:rotate(45deg) translate(-1px,-1px);transition:transform .18s ease;}
-    .ldp-reply-toggle:hover{color:#28724d;background:rgba(62,139,94,.08);opacity:1;}
-    .ldp-reply-toggle[aria-expanded="true"]{color:#28724d;background:rgba(62,139,94,.08);opacity:1;}
-    .ldp-reply-toggle[aria-expanded="true"]::after{transform:rotate(225deg) translate(-1px,-1px);}
-    .ldp-reply-toggle:focus-visible{outline:2px solid #4f9d70;outline-offset:2px;}
-    @media (prefers-reduced-motion:reduce){.ldp-reply-toggle::after{transition:none;}}
-    .ldp-reply-toggle.is-error{color:var(--danger,#c44);}
-
+    /* 楼中楼“展示更多回复”按钮与加载状态 */
+    .ldp-sub-actions{margin-left:31px;padding-left:12px;margin-top:4px;display:none;}
+    .ldp-load-more-replies{font-size:12px;color:#28724d;font-weight:600;opacity:.92;padding:4px 8px;border-radius:5px;}
+    .ldp-load-more-replies:hover{opacity:1;background:#edf6f1;text-decoration:none;}
+    .ldp-sub-loading{font-size:12px;opacity:.58;margin-left:31px;padding-left:12px;margin-top:4px;display:none;}
     /* ============ Boost样式（仿官方 discourse-boosts 插件，独立实现） ============ */
     /* 气泡列表 */
     .ldp-boosts-list{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:6px;min-height:0;}
@@ -541,27 +671,36 @@
     .ldp-v2 .ldp-actions{gap:3px;margin-top:7px;}
     .ldp-v2 .ldp-btn{min-width:27px;min-height:27px;border-radius:5px;}
     .ldp-post-bookmark.bookmarked{color:#a46015;background:#fff4df;}
+    .ldp-reaction-btn{gap:4px;}
     .ldp-reaction-btn.reacted{color:#176c43;background:#e7f3ec;}
-    .ldp-reaction-count{margin-left:4px;font-size:11px;font-variant-numeric:tabular-nums;}
+    .ldp-reaction-img{width:16px;height:16px;display:inline-block;vertical-align:middle;object-fit:contain;pointer-events:none;}
+    .ldp-reaction-pills{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px;}
+    .ldp-reaction-pills:empty{display:none;}
+    .ldp-op-reactions{margin-top:8px;display:flex;}
+    .ldp-reaction-pill{display:inline-flex;align-items:center;gap:4px;min-height:24px;padding:2px 7px;
+      border:1px solid var(--primary-low,#dce2df);border-radius:999px;background:var(--primary-very-low,#f5f7f6);
+      color:var(--primary-medium,#55605a);font-size:11px;cursor:pointer;opacity:.92;transition:all .14s ease;}
+    .ldp-reaction-pill:hover{opacity:1;border-color:#85aa96;background:#edf6f1;color:#176c43;}
+    .ldp-reaction-pill.reacted{opacity:1;border-color:#5f9f7d;background:#e4f2ea;color:#176c43;font-weight:600;}
+    .ldp-reaction-count{margin-left:2px;font-size:11px;font-variant-numeric:tabular-nums;}
     .ldp-reply-summary{position:relative;}
     .ldp-reply-summary::before{content:"";position:absolute;left:3px;top:9px;bottom:9px;width:2px;border-radius:2px;background:#79aa90;}
     .ldp-reply-summary:not(.expanded) > .ldp-content{max-height:5.1em;overflow:hidden;mask-image:linear-gradient(#000 65%,transparent);}
     .ldp-thread-toggle{margin:0 0 5px 31px;padding:0;border:0;color:#28724d;background:transparent;cursor:pointer;font-size:11px;}
-    .ldp-children{display:none;margin:8px 0 0 31px;border-left:2px solid #74aa8c;}
-    .ldp-children.expanded{display:block;}
-    .ldp-embedded-reply{position:relative;padding:10px 12px;border-bottom:1px solid var(--primary-low,#e1e4e2);
-      background:color-mix(in srgb,var(--secondary,#fff) 93%,var(--primary,#222) 7%);}
-    .ldp-embedded-reply:last-child{border-bottom:0;}
-    .ldp-embedded-head{display:flex;align-items:center;gap:7px;margin-bottom:6px;font-size:12px;min-width:0;}
-    .ldp-embedded-reply .ldp-avatar{width:24px;height:24px;}
-    .ldp-embedded-reply .ldp-content{margin:0;font-size:13px;}
-    .ldp-embedded-jump{margin-left:auto;flex:none;color:var(--primary-medium,#777);font-size:11px;}
-    .ldp-embedded-jump:hover{color:var(--tertiary,#08c);opacity:1;}
-    .ldp-reaction-picker{display:none;align-items:center;gap:4px;width:max-content;margin:5px 0 0 38px;padding:5px;
-      border:1px solid var(--primary-low,#dfe4e1);border-radius:6px;background:var(--secondary,#fff);box-shadow:0 8px 24px rgba(24,35,28,.14);}
-    .ldp-reaction-picker.open{display:flex;}
-    .ldp-reaction-picker button{width:30px;height:28px;border:0;border-radius:4px;background:transparent;cursor:pointer;}
-    .ldp-reaction-picker button:hover,.ldp-reaction-picker button.selected{background:#e7f3ec;}
+    .ldp-children{display:block;margin:6px 0 0 26px;border-left:2px solid #74aa8c;}
+    .ldp-children:empty{display:none;}
+    .ldp-children > .ldp-post-copy{margin:0;padding:10px 8px 10px 12px;background:transparent;}
+    .ldp-post-copy > .ldp-children{margin-left:18px;}
+    .ldp-post-copy.ldp-reply-depth-capped > .ldp-children{margin-left:0;}
+    .ldp-reply-gap{padding:6px 10px;color:var(--primary-medium,#777);font-size:11px;border-bottom:1px dashed var(--primary-low,#ddd);}
+    .ldp-emoji-quick{flex:none;display:flex;align-items:center;gap:4px;padding:6px 8px;overflow-x:auto;
+      border-bottom:1px solid var(--primary-low,#e4e8e6);background:var(--primary-very-low,#f6f8f7);}
+    .ldp-emoji-quick::-webkit-scrollbar{height:3px;}
+    .ldp-emoji-quick-btn{flex:none;width:30px;height:30px;padding:3px;border:1px solid transparent;border-radius:6px;
+      background:transparent;cursor:pointer;display:grid;place-items:center;transition:all .12s;}
+    .ldp-emoji-quick-btn:hover{background:#edf6f1;border-color:#9fc5b1;}
+    .ldp-emoji-quick-btn.selected{background:#e4f2ea;border-color:#5f9f7d;}
+    .ldp-emoji-quick-btn img{width:20px;height:20px;display:block;object-fit:contain;}
     .ldp-reader-panel{position:absolute;z-index:20;right:16px;top:88px;width:min(420px,calc(100% - 32px));height:min(560px,calc(100% - 108px));
       display:flex;flex-direction:column;border:1px solid var(--primary-low,#dce2df);border-radius:8px;background:var(--secondary,#fff);
       box-shadow:0 18px 48px rgba(20,30,24,.24);overflow:hidden;}
@@ -761,8 +900,26 @@
       font-size:11px;font-weight:700;line-height:1.3;white-space:nowrap;
       transform:translateY(-50%);opacity:0;pointer-events:none;transition:opacity .12s;}
     .ldp-tl-drag-tip.show{opacity:1;}
+
+    /* 话题列表“发帖时间列”样式（兼容经典表格、移动端内联与 Horizon 主题） */
+    table.topic-list th.topic-created-at{text-align:right;white-space:nowrap;}
+    table.topic-list td.topic-created-at{text-align:right;white-space:nowrap;font-size:.93em;color:var(--primary-medium,#919191);}
+    .topic-created-at-inline{display:none;}
+    .topic-created-at-inline:empty{display:none!important;}
+    html.mobile-view table.topic-list th.topic-created-at,html.mobile-view table.topic-list td.topic-created-at{display:none!important;}
+    html.mobile-view .topic-created-at-inline{display:inline-block;font-size:.87rem;line-height:1.2;color:var(--primary-medium,#919191);margin:0 8px;white-space:nowrap;}
+    html.mobile-view .topic-list .topic-item-stats .num.activity{white-space:nowrap;flex-shrink:0;}
+    .topic-list .topic-activity__time .topic-created-at-inline{display:inline-block;font-size:.87rem;line-height:1.2;color:var(--primary-medium,#919191);margin:0 8px;white-space:nowrap;}
+    html.ldc-horizon table.topic-list tr.topic-list-item td.topic-activity-data{grid-column:activity/-1;text-align:right;white-space:nowrap;overflow:hidden;}
+    html.ldc-horizon .topic-list .topic-activity__time .topic-created-at-inline{margin-right:0;color:inherit;}
+    html.ldc-horizon .topic-list .topic-activity__time{display:flex;align-items:center;justify-content:flex-end;column-gap:8px;}
+    @media (max-width:580px){
+      table.topic-list th.topic-created-at,table.topic-list td.topic-created-at{display:none!important;}
+      .topic-created-at-inline{display:inline-block;font-size:.87rem;line-height:1.2;color:var(--primary-medium,#919191);margin:0 8px;white-space:nowrap;}
+      .topic-list .topic-item-stats .num.activity{white-space:nowrap;flex-shrink:0;}
+    }
   `;
-  document.head.appendChild(style);
+  (document.head || document.documentElement).appendChild(style);
 
   /* 图标 */
   const ICONS = {
@@ -911,7 +1068,7 @@
 
     throwIfAborted(signal);
     const res = await fetch(url, fetchOptions);
-    if (res.ok) return res.json();
+    if (res.ok) return res.json().then((json) => { harvestTopicCreatedData(json); return json; });
     const error = new Error('HTTP ' + res.status);
     error.status = res.status;
     error.url = String(url);
@@ -1439,21 +1596,68 @@
     return { count: like.count || 0, acted: !!like.acted, canAct: !!like.can_act };
   }
 
+  const DEFAULT_QUICK_REACTIONS = [
+    'heart', '+1', 'laughing', 'open_mouth', 'clap', 'confetti_ball', 'hugs', 'thumbsup', 'tada', 'rocket', 'eyes', 'fire',
+  ];
+
   const REACTION_LABELS = {
     heart: '❤', '+1': '👍', laughing: '😄', tada: '🎉',
     open_mouth: '😮', cry: '😢', angry: '😠', confused: '😕',
     rocket: '🚀', eyes: '👀', fire: '🔥', clap: '👏', thinking: '🤔',
+    confetti_ball: '🎊', hugs: '🤗', thumbsup: '👍',
   };
 
+  function normalizeEmojiId(id) {
+    return String(id || '').replace(/^:|:$/g, '').trim();
+  }
+
   function reactionLabel(id) {
-    return REACTION_LABELS[String(id || '')] || `:${String(id || '')}:`;
+    const clean = normalizeEmojiId(id);
+    return REACTION_LABELS[clean] || `:${clean}:`;
+  }
+
+  function reactionIconHtml(id) {
+    const clean = normalizeEmojiId(id);
+    if (!clean) return '☺';
+    if (!emojiDataCache && !emojiDataLoading) {
+      fetchEmojiData().then(refreshCustomReactionImages).catch(() => {});
+    }
+    if (REACTION_LABELS[clean] && !emojiUrlMap.has(clean)) {
+      return `<span class="ldp-reaction-char" aria-hidden="true">${REACTION_LABELS[clean]}</span>`;
+    }
+    const fallbackName = clean === '+1' ? 'thumbsup' : clean;
+    return `<img class="ldp-reaction-img" data-emoji-name="${escAttr(clean)}" src="${escAttr(emojiUrl(fallbackName))}" alt=":${escAttr(clean)}:" loading="lazy">`;
+  }
+
+  function refreshCustomReactionImages() {
+    document.querySelectorAll('img.ldp-reaction-img[data-emoji-name]').forEach((img) => {
+      const name = img.dataset.emojiName;
+      if (name && emojiUrlMap.has(name)) {
+        const nextSrc = emojiUrlMap.get(name);
+        if (nextSrc && img.getAttribute('src') !== nextSrc) img.src = nextSrc;
+      }
+    });
   }
 
   function validReactionIds(topic, post) {
-    const source = topic && Array.isArray(topic.valid_reactions) ? topic.valid_reactions
-      : (post && Array.isArray(post.reactions) ? post.reactions.map((item) => item.id) : []);
-    return source.map((item) => String(typeof item === 'string' ? item : (item && (item.id || item.name)) || ''))
+    const fromTopic = topic && Array.isArray(topic.valid_reactions) ? topic.valid_reactions : [];
+    const fromPost = post && Array.isArray(post.reactions) ? post.reactions.map((item) => item && item.id) : [];
+    const combined = [...fromTopic, ...fromPost, ...DEFAULT_QUICK_REACTIONS]
+      .map((item) => normalizeEmojiId(typeof item === 'string' ? item : (item && (item.id || item.name)) || ''))
       .filter(Boolean);
+    return Array.from(new Set(combined));
+  }
+
+  function renderReactionPillsHtml(post) {
+    if (!post || !Array.isArray(post.reactions) || REACTIONS_AVAILABLE === false) return '';
+    const current = normalizeEmojiId(post.current_user_reaction && post.current_user_reaction.id);
+    const items = post.reactions.filter((r) => r && r.id && Number(r.count) > 0 && normalizeEmojiId(r.id) !== 'heart');
+    if (!items.length) return '';
+    return items.map((r) => {
+      const id = normalizeEmojiId(r.id);
+      const count = Math.max(0, Number(r.count) || 0);
+      return `<button type="button" class="ldp-reaction-pill ${current === id ? 'reacted' : ''}" data-reaction-id="${escAttr(id)}" title=":${escAttr(id)}:（点击切换回应）">${reactionIconHtml(id)}<span>${count}</span></button>`;
+    }).join('');
   }
 
   function parseTopicHref(href) {
@@ -2244,13 +2448,14 @@
   let emojiDataCache = null;
   let emojiDataLoading = null;
   let _emojiSet = 'twemoji';
-  (function detectEmojiSet() {
-    const img = document.querySelector('img.emoji[src*="/images/emoji/"]');
+  function detectEmojiSet() {
+    const img = document.querySelector && document.querySelector('img.emoji[src*="/images/emoji/"]');
     if (img) {
       const m = img.src.match(/\/images\/emoji\/([^/]+)\//);
       if (m) _emojiSet = m[1];
     }
-  })();
+  }
+  onDomReady(detectEmojiSet);
   const emojiUrlMap = new Map();
 
   function getRecentEmojis() {
@@ -2311,19 +2516,44 @@
       }
       emojiDataCache = groups;
       emojiDataLoading = null;
+      refreshCustomReactionImages();
       return groups;
     })().catch((err) => { emojiDataLoading = null; throw err; });
     return emojiDataLoading;
   }
 
-  function buildEmojiPanel(onPick) {
+  function buildEmojiPanel(onPick, options) {
+    const opts = options || {};
     const panel = document.createElement('div');
     panel.className = 'ldp-emoji-panel';
+    if (Array.isArray(opts.quickReactions) && opts.quickReactions.length) {
+      const quickWrap = document.createElement('div');
+      quickWrap.className = 'ldp-emoji-quick';
+      const current = normalizeEmojiId(opts.currentReaction);
+      opts.quickReactions.slice(0, 12).forEach((rawId) => {
+        const id = normalizeEmojiId(rawId);
+        if (!id) return;
+        const qBtn = document.createElement('button');
+        qBtn.type = 'button';
+        qBtn.className = 'ldp-emoji-quick-btn' + (current === id ? ' selected' : '');
+        qBtn.title = ':' + id + ':';
+        const fallbackName = id === '+1' ? 'thumbsup' : id;
+        qBtn.innerHTML = `<img class="ldp-reaction-img" data-emoji-name="${escAttr(id)}" src="${escAttr(emojiUrl(fallbackName))}" alt=":${escAttr(id)}:" loading="lazy">`;
+        qBtn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          addRecentEmoji(id);
+          onPick(':' + id + ':', id);
+        });
+        quickWrap.appendChild(qBtn);
+      });
+      panel.appendChild(quickWrap);
+    }
     const searchWrap = document.createElement('div');
     searchWrap.className = 'ldp-emoji-search';
     const searchInput = document.createElement('input');
     searchInput.type = 'text';
-    searchInput.placeholder = '搜索表情…';
+    searchInput.placeholder = opts.placeholder || '搜索表情…';
     searchWrap.appendChild(searchInput);
     panel.appendChild(searchWrap);
     const tabsWrap = document.createElement('div');
@@ -2352,7 +2582,7 @@
           e.preventDefault();
           e.stopPropagation();
           addRecentEmoji(name);
-          onPick(':' + name + ':');
+          onPick(':' + name + ':', name);
         });
         frag.appendChild(btn);
       }
@@ -2451,11 +2681,15 @@
       panel.remove();
       triggerBtn._ldpEmojiPanel = null;
     });
+    mountFloatingEmojiPanel(triggerBtn, panel);
+  }
+
+  function mountFloatingEmojiPanel(triggerBtn, panel) {
     panel._ownerBtn = triggerBtn;
     panel.style.position = 'fixed';
     document.body.appendChild(panel);
     triggerBtn._ldpEmojiPanel = panel;
-    const panelW = 320, panelH = 360, gap = 6;
+    const panelW = 320, panelH = panel.offsetHeight || 380, gap = 6;
     const btnRect = triggerBtn.getBoundingClientRect();
     const modal = triggerBtn.closest('.ldp-modal');
     const bounds = modal ? modal.getBoundingClientRect()
@@ -2463,7 +2697,8 @@
     let top = (btnRect.top - panelH - gap >= bounds.top) ? (btnRect.top - panelH - gap) : (btnRect.bottom + gap);
     if (top + panelH > bounds.bottom) top = bounds.bottom - panelH;
     if (top < bounds.top) top = bounds.top;
-    let left = btnRect.right - panelW;
+    let left = btnRect.left;
+    if (left + panelW > bounds.right) left = btnRect.right - panelW;
     if (left < bounds.left) left = bounds.left;
     if (left + panelW > bounds.right) left = bounds.right - panelW;
     panel.style.top = top + 'px';
@@ -3768,10 +4003,13 @@
     const boostsHtml = isDeleted ? '' : renderBoosts(p.boosts || []);
     const canBoost = !isDeleted && p.can_boost === true;
     const canDelete = !isDeleted && isME && Number(p.post_number) !== 1;
-    const currentReaction = String((p.current_user_reaction && p.current_user_reaction.id) || '');
-    const reactionCount = (p.reactions || []).reduce((sum, item) => sum + Math.max(0, Number(item.count) || 0), 0);
+    const currentReaction = normalizeEmojiId(p.current_user_reaction && p.current_user_reaction.id);
+    const nonHeartReactionCount = (p.reactions || []).reduce((sum, item) => (
+      item && normalizeEmojiId(item.id) !== 'heart' ? sum + Math.max(0, Number(item.count) || 0) : sum
+    ), 0);
     const validReactions = validReactionIds(ctx.topic, p);
-    const directReplyCount = Math.max(0, Number(p.reply_count) || 0);
+    const reactionPillsHtml = isDeleted ? '' : renderReactionPillsHtml(p);
+    const isOpRoot = Number(p.post_number) === 1;
 
     const lastReadPostNumber = Math.max(1, Number(
       ctx.tracker && ctx.tracker.getReadWaterline ? ctx.tracker.getReadWaterline() : ctx.lastReadPostNumber
@@ -3779,20 +4017,20 @@
     const isUnread = !p._ldpSkipUnread && p.post_number > lastReadPostNumber;
 
     const actionsHtml = isDeleted
-      ? (directReplyCount ? `<div class="ldp-actions"><button type="button" class="ldp-btn ldp-reply-toggle"
-          aria-expanded="false" aria-label="此楼层有 ${directReplyCount} 条直属回复">${directReplyCount} 个回复</button></div>` : '')
+      ? ''
       : `<div class="ldp-actions">
         <button class="ldp-btn ldp-like ${acted ? 'liked' : ''}"
           data-acted="${acted ? '1' : '0'}" ${canAct || acted ? '' : 'disabled'} title="点赞">
             <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;vertical-align:middle;">${ICONS.like}</svg>
           <span class="ldp-like-count">${count}</span>
         </button>
+        ${REACTIONS_AVAILABLE !== false ? `<button type="button" class="ldp-btn ldp-reaction-btn ${currentReaction && currentReaction !== 'heart' ? 'reacted' : ''}"
+          data-current-reaction="${escAttr(currentReaction)}" data-valid-reactions="${escAttr(validReactions.join(','))}"
+          title="使用任意表情点赞/回应" aria-label="使用任意表情点赞/回应">${currentReaction && currentReaction !== 'heart' ? reactionIconHtml(currentReaction) : EMOJI_BTN_ICON}${nonHeartReactionCount ? `<span class="ldp-reaction-count">${nonHeartReactionCount}</span>` : ''}</button>` : ''}
+        <span class="ldp-reaction-pills">${reactionPillsHtml}</span>
         <button class="ldp-btn ldp-replybtn" title="回复">
             <svg viewBox="0 0 1024 1024" style="width:12px;height:12px;fill:currentColor;vertical-align:middle;">${ICONS.reply}</svg>
         </button>
-        ${REACTIONS_AVAILABLE !== false && (validReactions.length || reactionCount) ? `<button class="ldp-btn ldp-reaction-btn ${currentReaction ? 'reacted' : ''}"
-          data-current-reaction="${escAttr(currentReaction)}" data-valid-reactions="${escAttr(validReactions.join(','))}"
-          title="添加回应" aria-label="添加回应">${currentReaction ? reactionLabel(currentReaction) : '☺'}${reactionCount ? `<span class="ldp-reaction-count">${reactionCount}</span>` : ''}</button>` : ''}
         <button class="ldp-btn ldp-post-bookmark ${p.bookmarked ? 'bookmarked' : ''}"
           data-bookmark-id="${escAttr(String(p.bookmark_id || ''))}" title="收藏楼层" aria-label="收藏楼层">
           <svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:currentColor;vertical-align:middle;">${ICONS.bookmark}</svg>
@@ -3801,10 +4039,7 @@
           <svg viewBox="0 0 1024 1024" style="width:12px;height:12px;fill:currentColor;vertical-align:middle;">${ICONS.boost}</svg>
         </button>
         ${canDelete ? `<button type="button" class="ldp-btn ldp-deletebtn" title="删除" aria-label="删除">${TRASH_BTN_ICON}</button>` : ''}
-        ${directReplyCount ? `<button type="button" class="ldp-btn ldp-reply-toggle"
-          aria-expanded="false" aria-label="此楼层有 ${directReplyCount} 条直属回复">${directReplyCount} 个回复</button>` : ''}
       </div>`;
-
     const userIdentityHtml = username
       ? `<a class="ldp-user-link" href="${escAttr(profileUrl)}" target="_blank" rel="noopener noreferrer" data-username="${escAttr(username)}"><span class="ldp-author">${esc(displayName)}</span><span class="ldp-user">@${esc(username)}</span></a>`
       : (displayName ? `<span class="ldp-author">${esc(displayName)}</span>` : '');
@@ -3828,6 +4063,7 @@
         <span class="ldp-unread-dot" title="未读" aria-label="未读"></span>
       </div>
       <div class="ldp-content">${cooked}</div>
+      ${!isDeleted && isOpRoot ? `<div class="ldp-reaction-pills ldp-op-reactions">${reactionPillsHtml}</div>` : ''}
       ${isDeleted ? '' : `<div class="ldp-boosts-list">${boostsHtml}</div>
       <div class="ldp-boost-input-wrap">
         <input type="text" class="ldp-boost-input" maxlength="50"
@@ -3838,6 +4074,8 @@
       </div>`}
       ${actionsHtml}
       <div class="ldp-children"></div>
+      <div class="ldp-sub-loading">加载楼中楼中…</div>
+      <div class="ldp-sub-actions"><button type="button" class="ldp-btn ldp-load-more-replies">展示更多回复 ↓</button></div>
     `;
     const content = node.querySelector('.ldp-content');
     content.querySelectorAll('a[href]').forEach((anchor) => {
@@ -3869,32 +4107,30 @@
     }
     if (!modal) return;
     const escapedId = CSS.escape(String(postId));
-    modal.querySelectorAll(`.ldp-post[data-post-id="${escapedId}"], .ldp-embedded-reply[data-post-id="${escapedId}"]`).forEach((node) => {
+    modal.querySelectorAll(`.ldp-post[data-post-id="${escapedId}"]`).forEach((node) => {
       const content = node.querySelector(':scope > .ldp-content');
       if (content) content.innerHTML = '<p class="ldp-deleted">（帖子已被作者删除）</p>';
-      node.querySelectorAll(':scope > .ldp-boosts-list, :scope > .ldp-boost-input-wrap, :scope > .ldp-replybox, :scope > .ldp-reaction-picker').forEach((el) => el.remove());
-      const actions = node.querySelector(':scope > .ldp-actions');
-      if (actions) {
-        const replyToggle = actions.querySelector('.ldp-reply-toggle');
-        if (replyToggle && !replyToggle.hidden) actions.replaceChildren(replyToggle);
-        else actions.remove();
-      }
-      if (node.classList.contains('ldp-post') && ctx && ctx.refreshRenderRevision) {
-        ctx.refreshRenderRevision(node);
-      }
+      node.querySelectorAll(':scope > .ldp-boosts-list, :scope > .ldp-boost-input-wrap, :scope > .ldp-replybox, :scope > .ldp-actions, :scope > .ldp-op-reactions').forEach((el) => el.remove());
+      if (ctx && ctx.refreshRenderRevision) ctx.refreshRenderRevision(node);
     });
   }
 
-  function syncRenderedPostState(root, post, ctx) {
+  function syncRenderedPostState(root, post) {
     if (!root || !post || !post.id) return;
-    const { count, acted } = likeInfo(post);
-    const currentReaction = String((post.current_user_reaction && post.current_user_reaction.id) || '');
-    const reactionCount = (post.reactions || []).reduce((sum, item) => sum + Math.max(0, Number(item.count) || 0), 0);
+    const { count, acted, canAct } = likeInfo(post);
+    const currentReaction = normalizeEmojiId(post.current_user_reaction && post.current_user_reaction.id);
+    const nonHeartReactionCount = (post.reactions || []).reduce((sum, item) => (
+      item && normalizeEmojiId(item.id) !== 'heart' ? sum + Math.max(0, Number(item.count) || 0) : sum
+    ), 0);
+    const pillsHtml = renderReactionPillsHtml(post);
     root.querySelectorAll(`.ldp-post[data-post-id="${CSS.escape(String(post.id))}"]`).forEach((node) => {
       const like = node.querySelector(':scope > .ldp-actions .ldp-like');
       if (like) {
-        like.classList.toggle('liked', acted); like.dataset.acted = acted ? '1' : '0';
-        const countNode = like.querySelector('.ldp-like-count'); if (countNode) countNode.textContent = String(count);
+        like.classList.toggle('liked', acted);
+        like.dataset.acted = acted ? '1' : '0';
+        like.disabled = !(canAct || acted);
+        const countNode = like.querySelector('.ldp-like-count');
+        if (countNode) countNode.textContent = String(count);
       }
       const bookmark = node.querySelector(':scope > .ldp-actions .ldp-post-bookmark');
       if (bookmark) {
@@ -3903,12 +4139,93 @@
       }
       const reaction = node.querySelector(':scope > .ldp-actions .ldp-reaction-btn');
       if (reaction) {
-        reaction.classList.toggle('reacted', !!currentReaction);
+        reaction.classList.toggle('reacted', !!(currentReaction && currentReaction !== 'heart'));
         reaction.dataset.currentReaction = currentReaction;
-        reaction.innerHTML = `${currentReaction ? reactionLabel(currentReaction) : '☺'}${reactionCount ? `<span class="ldp-reaction-count">${reactionCount}</span>` : ''}`;
+        reaction.innerHTML = `${currentReaction && currentReaction !== 'heart' ? reactionIconHtml(currentReaction) : EMOJI_BTN_ICON}${nonHeartReactionCount ? `<span class="ldp-reaction-count">${nonHeartReactionCount}</span>` : ''}`;
       }
-      if (ctx) updateReplyToggle(node, post.post_number, ctx);
+      node.querySelectorAll(':scope > .ldp-actions > .ldp-reaction-pills, :scope > .ldp-op-reactions').forEach((pillsEl) => {
+        pillsEl.innerHTML = pillsHtml;
+      });
     });
+  }
+
+  async function togglePostReaction(postId, rawReactionId, ctx, modal) {
+    const reactionId = normalizeEmojiId(rawReactionId);
+    if (!postId || !reactionId) return;
+    try {
+      const res = await apiSend(
+        `${BASE}/discourse-reactions/posts/${postId}/custom-reactions/${encodeURIComponent(reactionId)}/toggle.json`,
+        'PUT',
+      );
+      if (ctx && ctx.loader) {
+        ctx.loader.updatePost(postId, (post) => {
+          if (res && (Array.isArray(res.reactions) || Array.isArray(res.actions_summary))) {
+            if (Array.isArray(res.reactions)) post.reactions = res.reactions;
+            if ('current_user_reaction' in res) post.current_user_reaction = res.current_user_reaction;
+            if (Array.isArray(res.actions_summary)) post.actions_summary = res.actions_summary;
+            return post;
+          }
+          const previous = normalizeEmojiId(post.current_user_reaction && post.current_user_reaction.id);
+          const selected = previous !== reactionId;
+          const reactions = Array.isArray(post.reactions) ? post.reactions.map((item) => Object.assign({}, item)) : [];
+          const adjust = (id, delta) => {
+            if (!id) return;
+            let item = reactions.find((entry) => normalizeEmojiId(entry.id) === id);
+            if (!item && delta > 0) { item = { id, type: 'emoji', count: 0 }; reactions.push(item); }
+            if (item) item.count = Math.max(0, Number(item.count || 0) + delta);
+          };
+          if (previous) adjust(previous, -1);
+          if (selected) adjust(reactionId, 1);
+          post.reactions = reactions.filter((item) => Number(item.count) > 0);
+          post.current_user_reaction = selected ? { id: reactionId, type: 'emoji', can_undo: true } : null;
+          const actions = Array.isArray(post.actions_summary) ? post.actions_summary.map((item) => Object.assign({}, item)) : [];
+          let like = actions.find((item) => Number(item.id) === 2);
+          if (!like) { like = { id: 2, can_act: true, count: 0 }; actions.push(like); }
+          if (!previous && selected) like.count = Math.max(0, Number(like.count || 0) + 1);
+          else if (previous && !selected) like.count = Math.max(0, Number(like.count || 0) - 1);
+          like.acted = selected;
+          post.actions_summary = actions;
+          return post;
+        });
+      }
+      const updated = ctx && ctx.loader && ctx.loader.getPostById(postId);
+      if (updated && modal) syncRenderedPostState(modal, updated);
+      invalidateCollectionCache('responses').catch(() => {});
+      if (ctx && ctx.topicId) invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+    } catch (err) {
+      if (err && err.status === 404) {
+        REACTIONS_AVAILABLE = false;
+        if (modal) modal.querySelectorAll('.ldp-reaction-btn, .ldp-reaction-pills, .ldp-f-reaction').forEach((node) => node.remove());
+      } else {
+        alert('表情回应操作失败：' + err.message);
+      }
+    }
+  }
+
+  function toggleReactionEmojiPanel(triggerBtn, postId, ctx, modal) {
+    const existing = triggerBtn._ldpEmojiPanel;
+    if (existing && existing.parentNode) {
+      existing.remove();
+      triggerBtn._ldpEmojiPanel = null;
+      return;
+    }
+    closeEmojiPanels();
+    const post = (ctx && ctx.loader && ctx.loader.getPostById(postId))
+      || (ctx && ctx.topic && Number(ctx.topic._opPost?.id) === Number(postId) ? ctx.topic._opPost : null);
+    const quickReactions = validReactionIds(ctx && ctx.topic, post);
+    const currentReaction = normalizeEmojiId(
+      (post && post.current_user_reaction && post.current_user_reaction.id) || triggerBtn.dataset.currentReaction || '',
+    );
+    const panel = buildEmojiPanel((_code, emojiName) => {
+      panel.remove();
+      triggerBtn._ldpEmojiPanel = null;
+      togglePostReaction(postId, emojiName, ctx, modal);
+    }, {
+      quickReactions,
+      currentReaction,
+      placeholder: '搜索全部表情进行点赞/回应…',
+    });
+    mountFloatingEmojiPanel(triggerBtn, panel);
   }
 
   /* ============ 8. 回复框 ============ */
@@ -4242,123 +4559,123 @@
     });
   }
 
-  /* ============ 9. 原帖式直属回复折叠 ============ */
-  function renderEmbeddedReply(post, ctx) {
-    const isDeleted = Boolean(post.deleted_at || post.user_deleted === true || (!post.username && !post.cooked));
-    const username = post.username || '';
-    const displayName = post.name || post.display_name || username;
-    const avatar = resolveAvatar(post.avatar_template, 32);
-    const time = fmtTime(post.created_at);
-    const profileUrl = username ? userProfileUrl(username) : '';
-    const userIdentityHtml = username
-      ? `<a class="ldp-user-link" href="${escAttr(profileUrl)}" target="_blank" rel="noopener noreferrer" data-username="${escAttr(username)}"><span class="ldp-author">${esc(displayName)}</span><span class="ldp-user">@${esc(username)}</span></a>`
-      : `<span class="ldp-author">${esc(displayName)}</span>`;
-    const node = document.createElement('div');
-    node.className = 'ldp-embedded-reply';
-    node.dataset.postId = String(post.id);
-    node.dataset.postNumber = String(post.post_number);
-    node.setAttribute('aria-label', `楼层 #${post.post_number} 的直属回复`);
-    node.innerHTML = `
-      <div class="ldp-embedded-head">
-        ${avatar && username ? `<button type="button" class="ldp-avatar-btn" title="查看 ${escAttr(username)} 的个人详情"
-          aria-label="查看 ${escAttr(username)} 的个人详情" data-username="${escAttr(username)}">
-          <img class="ldp-avatar" src="${escAttr(avatar)}" alt="" loading="lazy" decoding="async"></button>` : (avatar ? `<img class="ldp-avatar" src="${escAttr(avatar)}" alt="" loading="lazy" decoding="async">` : '')}
-        ${userIdentityHtml}
-        ${post.trust_level != null && post.trust_level !== '' ? `<span class="ldp-level">Lv.${esc(String(post.trust_level))}</span>` : ''}
-        ${ctx.op && username && username === ctx.op ? '<span class="ldp-op">OP</span>' : ''}
-        ${ME_USERNAME && username && username === ME_USERNAME ? '<span class="ldp-me">ME</span>' : ''}
-        ${time ? `<span class="ldp-time">· ${esc(time)}</span>` : ''}
-        <button type="button" class="ldp-btn ldp-embedded-jump" data-post-number="${Number(post.post_number)}"
-          title="跳到原始楼层">跳到 #${Number(post.post_number)}</button>
-      </div>
-      <div class="ldp-content">${isDeleted ? '<p class="ldp-deleted">（帖子已被作者删除）</p>' : (post.cooked || '')}</div>`;
-    const content = node.querySelector('.ldp-content');
-    content.querySelectorAll('a[href]').forEach((anchor) => {
-      if (!isImageAnchor(anchor) && !anchor.getAttribute('target')) anchor.setAttribute('target', '_blank');
-    });
-    content.querySelectorAll('img').forEach((img) => {
-      if (!img.hasAttribute('loading')) img.setAttribute('loading', 'lazy');
-      if (!img.hasAttribute('decoding')) img.setAttribute('decoding', 'async');
-    });
-    content.querySelectorAll('iframe').forEach((iframe) => {
-      if (!iframe.hasAttribute('loading')) iframe.setAttribute('loading', 'lazy');
-    });
-    if (!isDeleted) {
-      renderPolls(content, post);
-      prepareSpoilers(content);
-      renderMath(node);
-      enhanceCodeBlocks(node);
-    }
-    return node;
-  }
-
-  function mergeSubReplyState(postNumber, replies, ctx, options) {
+  /* ============ 9. 默认楼中楼嵌套渲染（与脚本 b 一致，按需补全） ============ */
+  function mergeSubReplyState(postNumber, replies, ctx, targetPostId) {
     const key = Number(postNumber);
-    const state = ctx.subReplyState.get(key)
-      || { all: [], expanded: false, loaded: false, loading: false, error: null };
+    const existing = ctx.subReplyState.get(key);
     const byId = new Map();
-    [...state.all, ...(replies || [])].forEach((reply) => {
+    [...((existing && existing.all) || []), ...(replies || [])].forEach((reply) => {
       if (!reply || !reply.id || Number(reply.reply_to_post_number) !== key) return;
-      const canonical = ctx.loader.getPostById(reply.id) || reply;
+      const canonical = (ctx.loader && ctx.loader.getPostById(reply.id)) || reply;
       byId.set(Number(canonical.id), canonical);
     });
+    const state = existing || { all: [], renderedCount: 0, targetIds: new Set() };
     state.all = Array.from(byId.values()).sort((a, b) => Number(a.post_number) - Number(b.post_number));
-    if (options && options.loaded) state.loaded = true;
-    state.loading = false;
-    state.error = null;
+    if (!(state.targetIds instanceof Set)) state.targetIds = new Set(state.targetIds || []);
+    if (targetPostId) state.targetIds.add(Number(targetPostId));
+    state.renderedCount = Math.max(Number(state.renderedCount) || 0, Math.min(SUB_REPLY_INITIAL_SIZE, state.all.length));
     ctx.subReplyState.set(key, state);
     return state;
   }
 
-  function updateReplyToggle(parentNode, postNumber, ctx) {
-    if (!parentNode) return;
-    const state = ctx.subReplyState.get(Number(postNumber));
-    const post = ctx.loader.getPostById(parentNode.dataset.postId);
-    const count = Math.max(Number(post && post.reply_count) || 0, Number(state && state.all.length) || 0);
-    let button = parentNode.querySelector(':scope > .ldp-actions .ldp-reply-toggle');
-    if (!button && count > 0) {
-      button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'ldp-btn ldp-reply-toggle';
-      const actions = parentNode.querySelector(':scope > .ldp-actions');
-      if (actions) actions.appendChild(button);
-    }
-    if (!button) return;
-    button.hidden = count <= 0 && !(state && state.error);
-    button.setAttribute('aria-label', `此楼层有 ${count} 条直属回复`);
-    button.classList.toggle('is-error', !!(state && state.error));
-    button.setAttribute('aria-expanded', state && state.expanded ? 'true' : 'false');
-    if (state && state.loading) button.textContent = '回复加载中…';
-    else if (state && state.error) button.textContent = '加载失败，点击重试';
-    else button.textContent = `${count} 个回复`;
+  function clearRenderedReplyChildren(children, ctx) {
+    if (!children) return;
+    children.querySelectorAll('.ldp-post[data-post-id]').forEach((node) => {
+      ctx.tracker.unobserve(node);
+      if (ctx.repliesIO && ctx.repliesIO.clearNode) ctx.repliesIO.clearNode(node);
+      const postNumber = Number(node.dataset.postNumber);
+      if (ctx.nodeMap.get(postNumber) === node) ctx.nodeMap.delete(postNumber);
+    });
+    children.replaceChildren();
   }
 
-  function renderSubReplyStateInto(parentNode, postNumber, ctx) {
+  function renderSubReplyStateInto(parentNode, postNumber, ctx, depth, ancestry) {
     const state = ctx.subReplyState.get(Number(postNumber));
     if (!state || !parentNode) return;
     const children = parentNode.querySelector(':scope > .ldp-children');
     if (!children) return;
-    children.replaceChildren();
-    children.classList.toggle('expanded', !!state.expanded);
-    if (state.expanded) {
-      const fragment = document.createDocumentFragment();
-      state.all.forEach((reply) => {
-        fragment.appendChild(renderEmbeddedReply(ctx.loader.getPostById(reply.id) || reply, ctx));
-      });
-      children.appendChild(fragment);
+    const seenAncestry = ancestry instanceof Set ? ancestry : new Set([Number(parentNode.dataset.postId)]);
+    clearRenderedReplyChildren(children, ctx);
+    const selected = [];
+    state.all.forEach((reply, index) => {
+      if (index < state.renderedCount || state.targetIds.has(Number(reply.id))) selected.push({ reply, index });
+    });
+    let previousIndex = -1;
+    selected.forEach(({ reply, index }) => {
+      if (index - previousIndex > 1) {
+        const gap = document.createElement('div');
+        gap.className = 'ldp-reply-gap';
+        gap.textContent = `省略 ${index - previousIndex - 1} 条回复`;
+        children.appendChild(gap);
+      }
+      previousIndex = index;
+      const canonical = ctx.loader.getPostById(reply.id) || reply;
+      if (seenAncestry.has(Number(canonical.id))) return;
+      const copy = renderPost(canonical, true, ctx);
+      const nextDepth = Math.max(1, Number(depth) || 1);
+      copy.classList.add('ldp-post-copy');
+      copy.dataset.replyDepth = String(nextDepth);
+      if (nextDepth >= 4) copy.classList.add('ldp-reply-depth-capped');
+      copy.setAttribute('aria-label', `#${canonical.post_number} 的楼中楼回复`);
+      children.appendChild(copy);
+      ctx.nodeMap.set(Number(canonical.post_number), copy);
+      ctx.tracker.observe(copy);
+      if (ctx.repliesIO && Number(canonical.reply_count) > 0) ctx.repliesIO.observe(copy);
+
+      const knownChildren = ctx.loader.getKnownChildren(canonical.post_number);
+      if (knownChildren.length) {
+        const childState = mergeSubReplyState(canonical.post_number, knownChildren, ctx);
+        if (!childState.renderedCount) childState.renderedCount = Math.min(SUB_REPLY_INITIAL_SIZE, childState.all.length);
+        const nextAncestry = new Set(seenAncestry);
+        nextAncestry.add(Number(canonical.id));
+        renderSubReplyStateInto(copy, canonical.post_number, ctx, nextDepth + 1, nextAncestry);
+      }
+    });
+    if (state.all.length - previousIndex > 1 && state.targetIds.size) {
+      const gap = document.createElement('div');
+      gap.className = 'ldp-reply-gap';
+      gap.textContent = `省略 ${state.all.length - previousIndex - 1} 条回复`;
+      children.appendChild(gap);
     }
-    updateReplyToggle(parentNode, postNumber, ctx);
+    const actionEl = parentNode.querySelector(':scope > .ldp-sub-actions');
+    const btnEl = actionEl && actionEl.querySelector('.ldp-load-more-replies');
+    const parentPost = ctx.loader.getPostById(parentNode.dataset.postId);
+    const expectedTotal = Math.max(state.all.length, Number(parentPost && parentPost.reply_count) || 0);
+    const remaining = Math.max(0, expectedTotal - state.renderedCount);
+    if (remaining > 0) {
+      if (actionEl) actionEl.style.display = 'block';
+      if (btnEl) btnEl.textContent = `展示更多回复（还剩 ${remaining} 条） ↓`;
+    } else if (actionEl) {
+      actionEl.style.display = 'none';
+    }
   }
 
   function renderSubReplyState(postNumber, ctx) {
     const parentNode = ctx.nodeMap.get(Number(postNumber))
       || ctx.topicEl.querySelector(`.ldp-post[data-post-number="${postNumber}"]`);
     if (!parentNode) return;
-    const mutate = () => renderSubReplyStateInto(parentNode, postNumber, ctx);
+    const mutate = () => renderSubReplyStateInto(parentNode, postNumber, ctx, 1, new Set([Number(parentNode.dataset.postId)]));
     if (ctx.withViewportAnchor) ctx.withViewportAnchor(mutate);
     else mutate();
     if (ctx.refreshRenderRevision) ctx.refreshRenderRevision(parentNode);
     if (ctx.onPostsChanged) ctx.onPostsChanged();
+  }
+
+  async function renderSubReplyBatch(postNode, ctx) {
+    if (!postNode) return;
+    const postNumber = Number(postNode.dataset.postNumber);
+    const postId = String(postNode.dataset.postId || '');
+    const btn = postNode.querySelector(':scope > .ldp-sub-actions .ldp-load-more-replies');
+    if (!ctx.subReplyCache.has(postId) && ctx.repliesIO) {
+      if (btn) { btn.disabled = true; btn.textContent = '加载回复中…'; }
+      try { await ctx.repliesIO.loadForNode(postNode, { priority: 'target' }); }
+      catch (e) {}
+      finally { if (btn && btn.isConnected) btn.disabled = false; }
+    }
+    const state = ctx.subReplyState.get(postNumber);
+    if (!state) return;
+    state.renderedCount = Math.min(state.all.length, (Number(state.renderedCount) || 0) + SUB_REPLY_PAGE_SIZE);
+    renderSubReplyState(postNumber, ctx);
   }
 
   /* ============ 10. 事件委托 ============ */
@@ -4442,10 +4759,11 @@
         return;
       }
 
-      const replyToggle = e.target.closest('.ldp-reply-toggle');
-      if (replyToggle && ctx.repliesIO) {
-        const post = replyToggle.closest('.ldp-post');
-        await ctx.repliesIO.toggle(post);
+      // 楼中楼“展示更多回复”按钮
+      const moreBtn = e.target.closest('.ldp-load-more-replies');
+      if (moreBtn) {
+        const post = moreBtn.closest('.ldp-post');
+        await renderSubReplyBatch(post, ctx);
         return;
       }
 
@@ -4521,63 +4839,24 @@
         return;
       }
 
-      const reactionBtn = e.target.closest('.ldp-reaction-btn');
-      if (reactionBtn) {
-        let picker = postNode.querySelector(':scope > .ldp-reaction-picker');
-        if (!picker) {
-          const reactionIds = String(reactionBtn.dataset.validReactions || '').split(',').filter(Boolean);
-          if (!reactionIds.length) return;
-          picker = document.createElement('div');
-          picker.className = 'ldp-reaction-picker';
-          const current = reactionBtn.dataset.currentReaction || '';
-          picker.innerHTML = reactionIds.map((id) => `<button type="button" data-reaction-id="${escAttr(id)}"
-            class="${id === current ? 'selected' : ''}" title="${escAttr(id)}">${reactionLabel(id)}</button>`).join('');
-          postNode.querySelector(':scope > .ldp-actions').after(picker);
+      const reactionPill = e.target.closest('.ldp-reaction-pill[data-reaction-id]');
+      if (reactionPill && !reactionPill.disabled) {
+        e.preventDefault();
+        e.stopPropagation();
+        reactionPill.disabled = true;
+        try {
+          await togglePostReaction(postId, reactionPill.dataset.reactionId, ctx, modal);
+        } finally {
+          if (reactionPill.isConnected) reactionPill.disabled = false;
         }
-        picker.classList.toggle('open');
         return;
       }
 
-      const reactionChoice = e.target.closest('.ldp-reaction-picker [data-reaction-id]');
-      if (reactionChoice) {
-        reactionChoice.disabled = true;
-        try {
-          const reactionId = reactionChoice.dataset.reactionId;
-          await apiSend(`${BASE}/discourse-reactions/posts/${postId}/custom-reactions/${encodeURIComponent(reactionId)}/toggle.json`, 'PUT');
-          const cachedPost = ctx.loader && ctx.loader.getPostById(postId);
-          const previous = String((cachedPost && cachedPost.current_user_reaction && cachedPost.current_user_reaction.id)
-            || postNode.querySelector('.ldp-reaction-btn').dataset.currentReaction || '');
-          const selected = previous !== reactionId;
-          if (ctx.loader) ctx.loader.updatePost(postId, (post) => {
-            const reactions = Array.isArray(post.reactions) ? post.reactions.map((item) => Object.assign({}, item)) : [];
-            const adjust = (id, delta) => {
-              if (!id) return;
-              let item = reactions.find((entry) => String(entry.id) === String(id));
-              if (!item && delta > 0) { item = { id, type: 'emoji', count: 0 }; reactions.push(item); }
-              if (item) item.count = Math.max(0, Number(item.count || 0) + delta);
-            };
-            if (previous) adjust(previous, -1);
-            if (selected) adjust(reactionId, 1);
-            post.reactions = reactions.filter((item) => Number(item.count) > 0);
-            post.current_user_reaction = selected ? { id: reactionId, type: 'emoji', can_undo: true } : null;
-            return post;
-          });
-          syncCopies('.ldp-reaction-btn', (button) => {
-            button.classList.toggle('reacted', selected);
-            button.dataset.currentReaction = selected ? reactionId : '';
-            button.textContent = selected ? reactionLabel(reactionId) : '☺';
-          });
-          invalidateCollectionCache('responses').catch(() => {});
-          invalidateTopicSnapshot(ctx.topicId).catch(() => {});
-        } catch (err) {
-          if (err && err.status === 404) {
-            REACTIONS_AVAILABLE = false;
-            modal.querySelectorAll('.ldp-reaction-btn,.ldp-reaction-picker').forEach((node) => node.remove());
-          } else {
-            alert('回应操作失败：' + err.message);
-          }
-        }
-        finally { reactionChoice.disabled = false; }
+      const reactionBtn = e.target.closest('.ldp-reaction-btn');
+      if (reactionBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleReactionEmojiPanel(reactionBtn, postId, ctx, modal);
         return;
       }
 
@@ -4745,31 +5024,35 @@
           if (postData && postData.cooked) {
             if (ctx.loader) {
               if (!postData.reply_to_post_number) postData.reply_to_post_number = postNumber;
+              postData._ldpSkipUnread = true;
               const canonicalReply = ctx.loader.mergePost(postData) || postData;
-              const parentPost = ctx.loader.getPostByNumber(postNumber);
-              if (parentPost) {
-                ctx.loader.updatePost(parentPost.id, {
-                  reply_count: Math.max(0, Number(parentPost.reply_count) || 0) + 1,
-                });
-                const parentNode = ctx.nodeMap.get(Number(postNumber));
-                const cacheKey = String(parentPost.id);
-                if (ctx.subReplyCache.has(cacheKey)) {
-                  const replies = [...(ctx.subReplyCache.get(cacheKey) || []), canonicalReply];
-                  ctx.subReplyCache.set(cacheKey, replies);
-                  mergeSubReplyState(postNumber, replies, ctx, { loaded: true });
+              if (postNumber > 1) {
+                const parentPost = ctx.loader.getPostByNumber(postNumber);
+                if (parentPost) {
+                  ctx.loader.updatePost(parentPost.id, {
+                    reply_count: Math.max(0, Number(parentPost.reply_count) || 0) + 1,
+                  });
+                  const cacheKey = String(parentPost.id);
+                  if (ctx.subReplyCache.has(cacheKey)) {
+                    const replies = [...(ctx.subReplyCache.get(cacheKey) || []), canonicalReply];
+                    ctx.subReplyCache.set(cacheKey, replies);
+                  }
                 }
-                if (parentNode) {
-                  const state = ctx.subReplyState.get(Number(postNumber));
-                  if (state && state.expanded) renderSubReplyState(postNumber, ctx);
-                  else updateReplyToggle(parentNode, postNumber, ctx);
-                }
+                const state = mergeSubReplyState(postNumber, [canonicalReply, ...ctx.loader.getKnownChildren(postNumber)], ctx, canonicalReply.id);
+                state.renderedCount = Math.max(state.renderedCount, state.all.length);
+                renderSubReplyState(postNumber, ctx);
               }
+              ctx.highlightPostId = Number(canonicalReply.id) || 0;
+              ctx.highlightUntil = Date.now() + 1700;
               ctx.totalComments = (ctx.totalComments || 0) + 1;
               updateCommentsHeader(ctx);
               invalidateTopicSnapshot(ctx.topicId).catch(() => {});
               if (ctx.onMutation) ctx.onMutation(postData);
               box.classList.remove('open');
               textarea.value = '';
+              if (postNumber === 1 && ctx.virtualFlow) {
+                ctx.virtualFlow.seekToPost(Number(canonicalReply.post_number)).catch(() => {});
+              }
               return;
             }
             const isTopLevel = postNumber === 1; // 回复楼主帖时按普通顶级评论处理，而非楼中楼
@@ -4833,82 +5116,204 @@
     });
   }
 
-  /* ============ 11. 直属回复按需加载 ============ */
+  /* ============ 11. 楼中楼自动补全（视口懒加载 + 祖先链展开） ============ */
   function createRepliesIO(ctx) {
+    const fetched = new Set();
     const inFlight = new Map();
-    const loadForNode = async (node) => {
+    const hoverTimers = new Map();
+    const pendingReplies = new Map();
+    const appliedReplyParents = new Set();
+    let scrollActive = false;
+
+    const applyReplies = (node, replies, targetPostId, render) => {
+      if (!node || !node.isConnected) return null;
+      const postId = Number(node.dataset.postId);
+      const postNumber = Number(node.dataset.postNumber);
+      const existingState = ctx.subReplyState.get(postNumber);
+      const canonicalReplies = (replies || [])
+        .filter((reply) => reply && Number(reply.reply_to_post_number) === postNumber)
+        .map((reply) => ctx.loader.mergePost(reply) || reply);
+      const knownReplies = ctx.loader.getKnownChildren(postNumber);
+      const merged = [...knownReplies, ...canonicalReplies];
+      if (replies) ctx.subReplyCache.set(String(postId), canonicalReplies);
+      const state = mergeSubReplyState(postNumber, merged, ctx, targetPostId);
+      appliedReplyParents.add(String(postId));
+      if (!state.renderedCount) state.renderedCount = Math.min(SUB_REPLY_INITIAL_SIZE, state.all.length);
+      const parent = ctx.loader.getPostById(postId);
+      if (parent && state.all.length > Number(parent.reply_count || 0)) {
+        ctx.loader.updatePost(postId, { reply_count: state.all.length });
+      }
+      const needsRender = canonicalReplies.length > 0 || !existingState || !!targetPostId;
+      if (render !== false && needsRender) {
+        renderSubReplyState(postNumber, ctx);
+      }
+      return state;
+    };
+
+    const commitOrQueue = (node, replies, targetPostId, immediate) => {
+      if (!node || !node.isConnected) return null;
+      const postId = String(node.dataset.postId || '');
+      if (!postId) return null;
+      ctx.subReplyCache.set(postId, replies || []);
+      if (scrollActive && !immediate) {
+        pendingReplies.set(postId, {
+          postId, postNumber: Number(node.dataset.postNumber), replies: replies || [], targetPostId,
+        });
+        return null;
+      }
+      pendingReplies.delete(postId);
+      return applyReplies(node, replies, targetPostId);
+    };
+
+    const flushPendingReplies = () => {
+      if (scrollActive || !pendingReplies.size) return 0;
+      const batch = Array.from(pendingReplies.values());
+      pendingReplies.clear();
+      const renderedParents = [];
+      const mutate = () => {
+        batch.forEach((entry) => {
+          const node = ctx.nodeMap.get(Number(entry.postNumber));
+          if (!node || !node.isConnected || String(node.dataset.postId) !== entry.postId) return;
+          const needsLayout = entry.replies.length > 0
+            || !ctx.subReplyState.has(Number(entry.postNumber)) || !!entry.targetPostId;
+          if (applyReplies(node, entry.replies, entry.targetPostId, false) && needsLayout) {
+            renderedParents.push(entry.postNumber);
+          }
+        });
+        renderedParents.forEach((postNumber) => {
+          const parent = ctx.nodeMap.get(Number(postNumber));
+          if (parent && parent.isConnected) {
+            renderSubReplyStateInto(parent, postNumber, ctx, 1, new Set([Number(parent.dataset.postId)]));
+            if (ctx.refreshRenderRevision) ctx.refreshRenderRevision(parent);
+          }
+        });
+      };
+      if (ctx.withViewportAnchor) ctx.withViewportAnchor(mutate); else mutate();
+      if (renderedParents.length && ctx.onPostsChanged) ctx.onPostsChanged();
+      return renderedParents.length;
+    };
+
+    const loadForNode = async (node, options) => {
       if (!node || !node.isConnected) return [];
       const postId = String(node.dataset.postId || '');
-      const postNumber = Number(node.dataset.postNumber);
+      const targetPostId = options && options.targetPostId;
+      const immediate = !!(options && options.priority === 'target');
       if (!postId) return [];
       if (ctx.subReplyCache.has(postId)) {
         const cached = ctx.subReplyCache.get(postId) || [];
-        mergeSubReplyState(postNumber, cached, ctx, { loaded: true });
+        if (appliedReplyParents.has(postId) && !targetPostId) return cached;
+        commitOrQueue(node, cached, targetPostId, immediate);
         return cached;
       }
-      if (inFlight.has(postId)) return inFlight.get(postId);
-      const request = fetchJSON(`${BASE}/posts/${postId}/replies.json`, {
-        signal: ctx.signal, priority: 'visible',
-        dedupeKey: `direct-replies:${BASE}:${postId}`,
-      }).then((items) => {
-        const replies = (Array.isArray(items) ? items : [])
-          .filter((reply) => Number(reply.reply_to_post_number) === postNumber)
-          .map((reply) => ctx.loader.mergePost(reply) || reply);
-        ctx.subReplyCache.set(postId, replies);
-        mergeSubReplyState(postNumber, replies, ctx, { loaded: true });
-        const parent = ctx.loader.getPostById(postId);
-        if (parent && Number(parent.reply_count) !== replies.length) {
-          ctx.loader.updatePost(postId, { reply_count: replies.length });
-        }
+      if (inFlight.has(postId)) {
+        const replies = await inFlight.get(postId);
+        commitOrQueue(node, replies, targetPostId, immediate);
         return replies;
-      });
+      }
+      const loadingEl = node.querySelector(':scope > .ldp-sub-loading');
+      if (loadingEl && immediate) {
+        const showLoading = () => { loadingEl.style.display = 'block'; };
+        if (ctx.withViewportAnchor) ctx.withViewportAnchor(showLoading); else showLoading();
+      }
+      const request = fetchJSON(`${BASE}/posts/${postId}/replies.json`, {
+        signal: ctx.signal,
+        priority: immediate ? 'target' : 'visible',
+        dedupeKey: `direct-replies:${BASE}:${postId}`,
+      }).then((items) => Array.isArray(items) ? items : []);
       inFlight.set(postId, request);
       try {
-        return await request;
+        const replies = await request;
+        fetched.add(postId);
+        ctx.subReplyCache.set(postId, replies);
+        if (node.isConnected) commitOrQueue(node, replies, targetPostId, immediate);
+        return replies;
       } finally {
         inFlight.delete(postId);
+        if (loadingEl && loadingEl.isConnected) {
+          const hideLoading = () => { loadingEl.style.display = 'none'; };
+          if (ctx.withViewportAnchor) ctx.withViewportAnchor(hideLoading); else hideLoading();
+        }
       }
     };
 
-    const toggle = async (node) => {
-      if (!node || !node.isConnected) return;
-      const postNumber = Number(node.dataset.postNumber);
-      let state = ctx.subReplyState.get(postNumber);
-      if (!state) {
-        state = mergeSubReplyState(postNumber, ctx.loader.getKnownChildren(postNumber), ctx);
-      }
-      if (state.expanded) {
-        state.expanded = false;
-        renderSubReplyState(postNumber, ctx);
-        return;
-      }
-      state.expanded = true;
-      state.error = null;
-      if (state.loaded) {
-        renderSubReplyState(postNumber, ctx);
-        return;
-      }
-      state.loading = true;
-      updateReplyToggle(node, postNumber, ctx);
-      try {
-        await loadForNode(node);
-      } catch (error) {
-        state.loading = false;
-        state.error = error;
-        state.expanded = false;
-      }
-      if (node.isConnected) renderSubReplyState(postNumber, ctx);
-    };
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        const postId = String(en.target.dataset.postId || '');
+        if (!postId) return;
+        if (en.isIntersecting) {
+          if (ctx.subReplyCache.has(postId)) {
+            commitOrQueue(en.target, ctx.subReplyCache.get(postId), null, false);
+            return;
+          }
+          if (fetched.has(postId) || hoverTimers.has(postId)) return;
+          const timer = setTimeout(() => {
+            hoverTimers.delete(postId);
+            if (!en.target.isConnected) return;
+            loadForNode(en.target).catch(() => { fetched.delete(postId); });
+          }, REPLIES_HOVER_DELAY);
+          hoverTimers.set(postId, timer);
+        } else if (hoverTimers.has(postId)) {
+          clearTimeout(hoverTimers.get(postId));
+          hoverTimers.delete(postId);
+        }
+      });
+    }, { root: ctx.scrollRoot, rootMargin: '220px', threshold: 0.05 });
 
+    const clearNode = (node) => {
+      if (!node) return;
+      observer.unobserve(node);
+      const postId = node.dataset.postId;
+      if (postId && hoverTimers.has(postId)) {
+        clearTimeout(hoverTimers.get(postId));
+        hoverTimers.delete(postId);
+      }
+    };
+    const nativeDisconnect = observer.disconnect.bind(observer);
     return {
-      toggle,
+      observe(node) { if (node) observer.observe(node); },
+      unobserve(node) { if (node) observer.unobserve(node); },
+      clearNode,
       loadForNode,
-      observe() {},
-      unobserve() {},
-      clearNode() {},
-      setScrollActive() {},
-      flushPendingReplies() { return 0; },
-      disconnect() { inFlight.clear(); },
+      setScrollActive(active) { scrollActive = !!active; },
+      flushPendingReplies,
+      revealPath(path) {
+        const posts = (path || []).filter(Boolean);
+        if (posts.length < 2) return null;
+        const mutate = () => {
+          for (let index = 0; index < posts.length - 1; index++) {
+            const parent = posts[index], child = posts[index + 1];
+            const parentNode = ctx.nodeMap.get(Number(parent.post_number));
+            mergeSubReplyState(parent.post_number, [child, ...ctx.loader.getKnownChildren(parent.post_number)], ctx, child.id);
+            const state = ctx.subReplyState.get(Number(parent.post_number));
+            if (state && !state.renderedCount) state.renderedCount = Math.min(SUB_REPLY_INITIAL_SIZE, state.all.length);
+            if (parentNode) {
+              renderSubReplyStateInto(
+                parentNode,
+                parent.post_number,
+                ctx,
+                index + 1,
+                new Set(posts.slice(0, index + 1).map((post) => Number(post.id))),
+              );
+            }
+          }
+        };
+        if (ctx.withViewportAnchor) ctx.withViewportAnchor(mutate); else mutate();
+        posts.slice(0, -1).forEach((post) => {
+          const node = ctx.nodeMap.get(Number(post.post_number));
+          if (node && Number(post.reply_count) > 0) {
+            loadForNode(node, { priority: 'target', targetPostId: posts[posts.length - 1].id }).catch(() => {});
+          }
+        });
+        return ctx.nodeMap.get(Number(posts[posts.length - 1].post_number)) || null;
+      },
+      disconnect() {
+        hoverTimers.forEach((timer) => clearTimeout(timer));
+        hoverTimers.clear();
+        pendingReplies.clear();
+        appliedReplyParents.clear();
+        inFlight.clear();
+        nativeDisconnect();
+      },
     };
   }
 
@@ -4946,24 +5351,44 @@
     if (!footer || !opNode || !topic._opPost) return;
     const likeButton = footer.querySelector('.ldp-f-like');
     const likeCount = footer.querySelector('.ldp-f-like-count');
+    const reactionButton = footer.querySelector('.ldp-f-reaction');
+    const reactionIconSlot = footer.querySelector('.ldp-f-reaction-icon');
     const replyCount = footer.querySelector('.ldp-f-reply-count');
     const replyButton = footer.querySelector('.ldp-f-reply');
     const boostButton = footer.querySelector('.ldp-f-boost');
     const opId = Number(topic._opPost.id);
+    const shellEl = opNode.closest('.ldp-shell') || opNode.parentElement;
     ctx.footerReplyCountEl = replyCount;
     updateCommentsHeader(ctx);
 
-    const syncLike = (post) => {
+    const syncOpFooterState = (post) => {
       if (!post || Number(post.id) !== opId) return;
       const info = likeInfo(post);
       likeCount.textContent = String(info.count);
       likeButton.classList.toggle('liked', info.acted);
       likeButton.dataset.acted = info.acted ? '1' : '0';
       likeButton.disabled = !(info.canAct || info.acted);
+      if (reactionButton) {
+        reactionButton.hidden = REACTIONS_AVAILABLE === false;
+        const currentReaction = normalizeEmojiId(post.current_user_reaction && post.current_user_reaction.id);
+        reactionButton.dataset.currentReaction = currentReaction;
+        reactionButton.classList.toggle('liked', !!(currentReaction && currentReaction !== 'heart'));
+        if (reactionIconSlot) {
+          reactionIconSlot.innerHTML = currentReaction && currentReaction !== 'heart'
+            ? reactionIconHtml(currentReaction)
+            : EMOJI_BTN_ICON;
+        }
+      }
     };
-    syncLike(ctx.loader.getPostById(opId) || topic._opPost);
-    ctx.loader.subscribePosts((posts) => posts.forEach(syncLike));
-
+    syncOpFooterState(ctx.loader.getPostById(opId) || topic._opPost);
+    ctx.loader.subscribePosts((posts) => posts.forEach(syncOpFooterState));
+    if (reactionButton) {
+      reactionButton.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleReactionEmojiPanel(reactionButton, opId, ctx, shellEl);
+      });
+    }
     likeButton.addEventListener('click', async () => {
       const post = ctx.loader.getPostById(opId) || topic._opPost;
       const info = likeInfo(post);
@@ -4984,7 +5409,7 @@
         invalidateCollectionCache('responses').catch(() => {});
         invalidateTopicSnapshot(ctx.topicId).catch(() => {});
       } catch (error) {
-        syncLike(post);
+        syncOpFooterState(post);
         alert('操作失败：' + error.message);
       }
     });
@@ -5051,34 +5476,88 @@
     track.setAttribute('aria-valuemin', '1');
     track.setAttribute('aria-valuemax', String(getTotalPosts()));
 
-    const visiblePost = () => {
-      if (!cachedPosts.length) return null;
-      if (body.scrollTop <= 1) {
+    const computeScrollProgress = () => {
+      const totalPosts = getTotalPosts();
+      const streamLength = getStreamLength();
+      if (!cachedPosts.length) {
+        return { post: null, postNumber: 1, ratio: 0, totalPosts, atBottom: false };
+      }
+      const maxScroll = Math.max(0, body.scrollHeight - body.clientHeight);
+      const bottomSpacer = body.querySelector('.ldp-virtual-spacer-bottom');
+      const bottomSpacerHeight = bottomSpacer ? bottomSpacer.offsetHeight : 0;
+      const atTop = body.scrollTop <= 2;
+      const atRealBottom = bottomSpacerHeight <= 4
+        && (maxScroll <= 2 ? totalPosts <= cachedPosts.length : (maxScroll - body.scrollTop <= 6));
+
+      if (atTop && !(maxScroll <= 2 && totalPosts === 1)) {
         currentPost = cachedPosts[0];
-        return currentPost;
+        return { post: currentPost, postNumber: 1, ratio: 0, totalPosts, atBottom: false };
       }
+      if (atRealBottom) {
+        currentPost = cachedPosts[cachedPosts.length - 1];
+        return { post: currentPost, postNumber: totalPosts, ratio: totalPosts > 1 ? 1 : 0, totalPosts, atBottom: true };
+      }
+
       const bodyRect = body.getBoundingClientRect();
-      const probeX = bodyRect.left + Math.max(1, bodyRect.width * 0.5);
-      const probeY = bodyRect.top + Math.min(bodyRect.height * 0.35, 180);
-      const hit = document.elementFromPoint(probeX, probeY);
-      const hitPost = hit && hit.closest ? hit.closest('.ldp-post[data-post-number]') : null;
-      if (hitPost && body.contains(hitPost)) currentPost = hitPost;
-      if (!currentPost || !currentPost.isConnected) {
-        currentPost = body.scrollTop <= 1 ? cachedPosts[0] : cachedPosts[cachedPosts.length - 1];
+      const baseOffset = Math.min(bodyRect.height * 0.28, 160);
+      const tailRange = Math.min(maxScroll, Math.max(120, bodyRect.height * 0.9));
+      const tailProgress = (bottomSpacerHeight <= 4 && maxScroll > 2 && tailRange > 0)
+        ? Math.max(0, Math.min(1, (body.scrollTop - (maxScroll - tailRange)) / tailRange))
+        : 0;
+      const probeY = bodyRect.top + baseOffset + tailProgress * Math.max(0, bodyRect.height - baseOffset - 8);
+
+      // 在已挂载楼层中寻找覆盖或最接近 probeY 的最深楼层节点，避免滚到底部仍停在视口首条楼层
+      let matched = null;
+      for (let i = 0; i < cachedPosts.length; i++) {
+        const candidate = cachedPosts[i];
+        if (!candidate.isConnected) continue;
+        const rect = candidate.getBoundingClientRect();
+        if (rect.height <= 0) continue;
+        if (rect.top <= probeY + 2) matched = candidate;
+        else if (!matched) { matched = candidate; break; }
       }
-      return currentPost;
+      if (matched) currentPost = matched;
+      if (!currentPost || !currentPost.isConnected) {
+        currentPost = cachedPosts[cachedPosts.length - 1];
+      }
+
+      let rootPost = currentPost;
+      while (rootPost && rootPost.parentElement && rootPost.parentElement.classList.contains('ldp-children')) {
+        const parentPost = rootPost.parentElement.closest('.ldp-post[data-post-number]');
+        if (!parentPost) break;
+        rootPost = parentPost;
+      }
+
+      let postNumber = currentPost ? (+currentPost.dataset.postNumber || 1) : 1;
+      const rootNumber = rootPost ? (+rootPost.dataset.postNumber || 1) : postNumber;
+      const streamIndex = rootNumber <= 1 ? -1 : controls.getStreamIndex(rootPost.dataset.postId);
+      let baseRatio = 0;
+      if (streamLength > 0) {
+        if (streamIndex >= 0) {
+          let intra = 0.5;
+          if (rootPost) {
+            const rRect = rootPost.getBoundingClientRect();
+            if (rRect.height > 1) intra = Math.max(0, Math.min(1, (probeY - rRect.top) / rRect.height));
+          }
+          baseRatio = Math.max(0, Math.min(1, (streamIndex + intra) / streamLength));
+        } else if (totalPosts > 1) {
+          baseRatio = Math.max(0, Math.min(1, (postNumber - 1) / (totalPosts - 1)));
+        }
+      }
+      const ratio = tailProgress > 0
+        ? Math.max(baseRatio, baseRatio + (1 - baseRatio) * tailProgress)
+        : baseRatio;
+      if (tailProgress > 0.65 && totalPosts > postNumber) {
+        const highestMounted = cachedPosts.reduce((m, n) => Math.max(m, +n.dataset.postNumber || 1), postNumber);
+        if (tailProgress > 0.92) postNumber = Math.max(postNumber, highestMounted);
+      }
+      return { post: currentPost, postNumber: Math.min(totalPosts, postNumber), ratio, totalPosts, atBottom: false };
     };
 
     const setProgress = () => {
-      const post = visiblePost();
-      const postNumber = post ? (+post.dataset.postNumber || 1) : 1;
-      const streamIndex = postNumber <= 1 ? -1 : controls.getStreamIndex(post.dataset.postId);
-      const streamLength = getStreamLength();
-      const totalPosts = getTotalPosts();
+      const { post, postNumber, ratio, totalPosts, atBottom } = computeScrollProgress();
       track.setAttribute('aria-valuemax', String(totalPosts));
-      const ratio = streamLength
-        ? Math.max(0, Math.min(1, (streamIndex + 1) / streamLength))
-        : 0;
+      if (atBottom && controls.onReachBottom) controls.onReachBottom();
       if (Math.abs(ratio - lastRatio) >= 0.0005) {
         fill.style.transform = `translateX(-50%) scaleY(${ratio})`;
         thumb.style.transform = `translate(-50%,-50%) translateY(${ratio * trackHeight}px)`;
@@ -5349,8 +5828,10 @@
     const postIdByNumber = new Map();
     const parentNumberByPostId = new Map();
     const childrenByParentNumber = new Map();
+    const orphanReplyIds = new Set();
     const streamListeners = new Set();
     const postListeners = new Set();
+    const projectionListeners = new Set();
     let prefetchedAnchor = null;
     let refreshPromise = null;
     let streamRevision = 0;
@@ -5359,10 +5840,23 @@
     let snapshotDirty = false;
     let snapshotSuspended = 0;
     let snapshotWriting = false;
+    let projectionRevision = 0;
+    let projectionScheduled = false;
 
     const bumpPostRevision = (postId) => {
       const id = Number(postId);
       postRevisions.set(id, (postRevisions.get(id) || 0) + 1);
+    };
+
+    const emitProjection = () => {
+      if (projectionScheduled) return;
+      projectionScheduled = true;
+      queueMicrotask(() => {
+        projectionScheduled = false;
+        projectionRevision += 1;
+        const ids = getRootStreamIds();
+        projectionListeners.forEach((listener) => listener(ids, projectionRevision));
+      });
     };
 
     const indexPost = (post) => {
@@ -5385,7 +5879,9 @@
         childrenByParentNumber.get(nextParent).add(id);
       } else {
         parentNumberByPostId.delete(id);
+        orphanReplyIds.delete(id);
       }
+      return previousParent !== nextParent;
     };
 
     const rebuildReplyIndex = () => {
@@ -5394,18 +5890,28 @@
     };
 
     const cachePosts = (posts, emit) => {
+      let projectionChanged = false;
       const changed = (posts || []).filter((post) => post && post.id).map((post) => {
         const id = Number(post.id);
         const next = Object.assign({}, cache.get(id) || {}, post);
         cache.set(id, next);
         bumpPostRevision(id);
-        indexPost(next);
+        projectionChanged = indexPost(next) || projectionChanged;
         return next;
       });
       if (emit) emitPosts(changed);
+      if (projectionChanged) emitProjection();
       return changed;
     };
 
+    function isNestedPostId(postId) {
+      const id = Number(postId);
+      return parentNumberByPostId.has(id) && !orphanReplyIds.has(id);
+    }
+
+    function getRootStreamIds() {
+      return stream.filter((id) => !isNestedPostId(id));
+    }
     function getPostByNumber(postNumber) {
       const id = postIdByNumber.get(Number(postNumber));
       return id ? cache.get(id) || null : null;
@@ -5603,6 +6109,22 @@
       return { index, postNumber: resolved ? resolved.post_number : target, start, end, posts };
     }
 
+    function markOrphanReply(postId) {
+      const id = Number(postId);
+      if (!parentNumberByPostId.has(id) || orphanReplyIds.has(id)) return;
+      orphanReplyIds.add(id);
+      emitProjection();
+    }
+
+    async function resolveExactPost(postNumber, requestSignal) {
+      const expected = Math.max(1, Number(postNumber) || 1);
+      let post = getPostByNumber(expected);
+      if (post) return post;
+      await resolveTarget(expected, requestSignal);
+      post = getPostByNumber(expected);
+      return post && Number(post.post_number) === expected ? post : null;
+    }
+
     async function resolveThreadTarget(targetPostNumber, requestSignal) {
       const requested = Math.max(1, Number(targetPostNumber) || 1);
       if (requested <= 1) {
@@ -5613,14 +6135,30 @@
         || getPostByNumber(resolved.postNumber)
         || cache.get(Number(stream[resolved.index])) || null;
       if (!targetPost) return Object.assign({}, resolved, { targetPostNumber: requested, path: [] });
-      const targetIndex = streamIndex.get(String(targetPost.id));
+
+      const reversePath = [targetPost];
+      const visited = new Set([Number(targetPost.id)]);
+      let current = targetPost;
+      for (let depth = 0; depth < 64 && Number(current.reply_to_post_number) > 1; depth++) {
+        const parent = await resolveExactPost(current.reply_to_post_number, requestSignal);
+        if (!parent || visited.has(Number(parent.id))) {
+          markOrphanReply(current.id);
+          break;
+        }
+        reversePath.push(parent);
+        visited.add(Number(parent.id));
+        current = parent;
+      }
+      const path = reversePath.reverse();
+      const rootPost = path[0] || targetPost;
+      const rootIndex = streamIndex.get(String(rootPost.id));
       return {
-        index: targetIndex === undefined ? resolved.index : targetIndex,
-        postNumber: Number(targetPost.post_number) || resolved.postNumber,
-        rootPostId: Number(targetPost.id) || null,
+        index: rootIndex === undefined ? resolved.index : rootIndex,
+        postNumber: Number(rootPost.post_number) || resolved.postNumber,
+        rootPostId: Number(rootPost.id) || null,
         targetPostId: Number(targetPost.id) || null,
         targetPostNumber: Number(targetPost.post_number) || requested,
-        path: [targetPost],
+        path,
       };
     }
 
@@ -5652,7 +6190,7 @@
       if (!next) return current;
       cache.set(id, next);
       bumpPostRevision(id);
-      indexPost(next);
+      if (indexPost(next)) emitProjection();
       emitPosts([next]);
       scheduleSnapshotWrite();
       return next;
@@ -5673,8 +6211,31 @@
       return next;
     }
 
+    function syncLatestTopic(latestData) {
+      if (!latestData || !topic) return { addedIds: [] };
+      const opId = Number((topic._opPost && topic._opPost.id) || 0);
+      const previousSet = new Set(stream.map(Number));
+      const incomingPosts = (latestData.post_stream && latestData.post_stream.posts) || [];
+      if (incomingPosts.length) cachePosts(incomingPosts, true);
+      const nextStream = ((latestData.post_stream && latestData.post_stream.stream) || [])
+        .map(Number)
+        .filter((id) => id > 0 && id !== opId);
+      const addedIds = nextStream.filter((id) => !previousSet.has(id));
+      topic = Object.assign({}, topic, {
+        title: latestData.title || topic.title,
+        posts_count: Math.max(Number(topic.posts_count) || 1, Number(latestData.posts_count) || 1),
+        highest_post_number: Math.max(Number(topic.highest_post_number) || 1, Number(latestData.highest_post_number) || 1),
+        views: Math.max(Number(topic.views) || 0, Number(latestData.views) || 0),
+        last_posted_at: latestData.last_posted_at || topic.last_posted_at,
+        bumped_at: latestData.bumped_at || topic.bumped_at,
+      });
+      if (nextStream.length && replaceStream(nextStream)) emitProjection();
+      scheduleSnapshotWrite();
+      return { addedIds, topic };
+    }
+
     return {
-      init, resolveTarget, resolveThreadTarget, fetchRange, fetchIds, loadAll, updatePost, mergePost, flushSnapshot,
+      init, resolveTarget, resolveThreadTarget, fetchRange, fetchIds, loadAll, updatePost, mergePost, syncLatestTopic, flushSnapshot,
       get streamLength() { return stream.length; },
       get streamRevision() { return streamRevision; },
       get topic() { return topic; },
@@ -5689,15 +6250,18 @@
       getPostRevision(postId) { return postRevisions.get(Number(postId)) || 0; },
       getPostByNumber,
       getStreamIds() { return stream.slice(); },
+      getRootStreamIds,
       getKnownChildren,
+      isNestedPostId,
       getCachedPosts() { return Array.from(cache.values()); },
       subscribeStream(listener) { streamListeners.add(listener); return () => streamListeners.delete(listener); },
       subscribePosts(listener) { postListeners.add(listener); return () => postListeners.delete(listener); },
+      subscribeProjection(listener) { projectionListeners.add(listener); return () => projectionListeners.delete(listener); },
       destroy() {
-        if (snapshotTimer) clearTimeout(snapshotTimer);
-        if (snapshotMaxTimer) clearTimeout(snapshotMaxTimer);
+        clearTimeout(snapshotTimer);
+        clearTimeout(snapshotMaxTimer);
         snapshotTimer = snapshotMaxTimer = 0;
-        streamListeners.clear(); postListeners.clear();
+        streamListeners.clear(); postListeners.clear(); projectionListeners.clear();
         if (snapshotDirty) flushSnapshot().catch(() => {});
       },
     };
@@ -5715,8 +6279,8 @@
     const DISCONTINUOUS_SCROLL_SCREENS = 1.5;
     const displayStreamIds = () => onlyOp
       ? loader.getStreamIds().filter((id) => (loader.getPostById(id) || {}).username === ctx.op)
-      : loader.getStreamIds();
-    let logicalIds = loader.getStreamIds();
+      : loader.getRootStreamIds();
+    let logicalIds = loader.getRootStreamIds();
     const heightByPostId = new Map();
     let positionByPostId = new Map();
     let heights = logicalIds.map((id) => heightByPostId.get(id) || DEFAULT_HEIGHT);
@@ -6015,14 +6579,28 @@
       }
     }
 
-    function renderTreeRevision(post) {
-      if (!post || !post.id) return 'missing';
-      const id = Number(post.id);
-      const state = ctx.subReplyState.get(Number(post.post_number));
-      const replyIds = state ? state.all.map((reply) => Number(reply.id)).join(',') : '';
-      return `${onlyOp ? 'op' : 'all'}:${id}:${loader.getPostRevision(id)}:${state && state.expanded ? 1 : 0}:${replyIds}`;
+    function prepareReplyState(post) {
+      const knownChildren = loader.getKnownChildren(post.post_number);
+      if (knownChildren.length) {
+        const state = mergeSubReplyState(post.post_number, knownChildren, ctx);
+        if (!state.renderedCount) state.renderedCount = Math.min(SUB_REPLY_INITIAL_SIZE, state.all.length);
+      }
     }
 
+    function renderTreeRevision(post, ancestry) {
+      if (!post || !post.id) return 'missing';
+      const id = Number(post.id);
+      const seen = ancestry || new Set();
+      if (seen.has(id)) return `${id}:cycle`;
+      const nextSeen = new Set(seen);
+      nextSeen.add(id);
+      const state = ctx.subReplyState.get(Number(post.post_number));
+      const targets = state && state.targetIds instanceof Set
+        ? Array.from(state.targetIds).sort((a, b) => a - b).join(',') : '';
+      const children = loader.getKnownChildren(post.post_number)
+        .map((child) => renderTreeRevision(child, nextSeen)).join(';');
+      return `${onlyOp ? 'op' : 'all'}:${id}:${loader.getPostRevision(id)}:${Number(state && state.renderedCount) || 0}:${targets}[${children}]`;
+    }
     function rebuildNodeMap() {
       ctx.nodeMap.clear();
       windowEl.querySelectorAll('.ldp-post[data-post-number]').forEach((node) => {
@@ -6047,6 +6625,8 @@
           fragment.appendChild(placeholder);
           return;
         }
+        if (!onlyOp && loader.isNestedPostId(id)) return;
+        prepareReplyState(post);
         const revision = renderTreeRevision(post);
         const previousNode = previous.get(String(id));
         let node = previousNode && previousNode.classList.contains('ldp-post')
@@ -6056,6 +6636,7 @@
           node = renderPost(post, false, ctx);
           node.dataset.renderRevision = revision;
           ctx.tracker.observe(node);
+          if (ctx.repliesIO && Number(post.reply_count) > 0) ctx.repliesIO.observe(node);
         }
         node.dataset.streamPostId = String(id);
         node.dataset.windowEpoch = String(ctx.windowEpoch + 1);
@@ -6074,10 +6655,11 @@
       entries.forEach(({ post }) => {
         if (!post) return;
         const parent = ctx.nodeMap.get(Number(post.post_number));
-        if (!parent) return;
+        if (!parent || onlyOp) return;
         if (parent.dataset.renderRevision === renderTreeRevision(post)
-          && ctx.subReplyState.has(Number(post.post_number))) {
-          renderSubReplyStateInto(parent, post.post_number, ctx);
+          && ctx.subReplyState.has(Number(post.post_number))
+          && !parent.querySelector(':scope > .ldp-children > .ldp-post-copy')) {
+          renderSubReplyStateInto(parent, post.post_number, ctx, 1, new Set([Number(post.id)]));
         }
       });
       rebuildNodeMap();
@@ -6412,6 +6994,32 @@
       viewportWasAtBottom = isAtBottom();
       stableViewportAnchor = captureViewportAnchor();
       notePinnedActivity();
+      if (target && Array.isArray(target.path) && target.path.length > 1 && ctx.repliesIO) {
+        node = ctx.repliesIO.revealPath(target.path) || node;
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        node = ctx.nodeMap.get(Number(target.targetPostNumber)) || node;
+        if (node) {
+          preferredFocusPostId = Number(node.dataset.postId) || preferredFocusPostId;
+          preferredProtectedUntil = performance.now() + SEEK_MAX_MS;
+          clearPinnedAnchor();
+          seekingScroll = true;
+          node.scrollIntoView({ block: 'center', behavior: 'auto' });
+          stableViewportAnchor = captureNodeViewportAnchor(node) || captureViewportAnchor();
+          preferredViewportAnchor = stableViewportAnchor;
+          pinnedAnchor = Object.assign({}, stableViewportAnchor, { pinned: true });
+          pendingResizeAnchor = stableViewportAnchor;
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+          lastObservedScrollTop = ctx.scrollRoot.scrollTop;
+          stableViewportAnchor = captureNodeViewportAnchor(node) || captureViewportAnchor();
+          preferredViewportAnchor = stableViewportAnchor;
+          pinnedAnchor = Object.assign({}, stableViewportAnchor, { pinned: true });
+          if (pendingResizeAnchor || pendingResizeHeights.size || resizeRaf) {
+            pendingResizeAnchor = stableViewportAnchor;
+          }
+          seekingScroll = false;
+          notePinnedActivity();
+        }
+      }
       if (node) {
         ctx.highlightPostId = Number(node.dataset.postId) || Number(target && target.targetPostId) || 0;
         ctx.highlightUntil = Date.now() + 1700;
@@ -6556,9 +7164,12 @@
       if (post) rootNode.dataset.renderRevision = renderTreeRevision(post);
     };
     const unsubscribeStream = loader.subscribeStream(() => requestProjectionReconcile());
+    const unsubscribeProjection = loader.subscribeProjection(() => {
+      if (!onlyOp) requestProjectionReconcile();
+    });
     const unsubscribePosts = loader.subscribePosts((posts) => {
       const root = ctx.commentsEl.closest('.ldp-shell') || ctx.commentsEl;
-      posts.forEach((post) => syncRenderedPostState(root, post, ctx));
+      posts.forEach((post) => syncRenderedPostState(root, post));
       if (onlyOp && posts.some((post) => post && post.username === ctx.op)) reconcileStream(displayStreamIds()).catch(() => {});
     });
     const releasePinnedAnchor = () => beginManualScroll();
@@ -6588,6 +7199,10 @@
         return seekResolvedTarget(target, { smooth: false });
       },
       seekToIndex, seekToPost, scrollToTop, setOnlyOp,
+      isNearBottom() {
+        return bottomSpacer.offsetHeight <= 4
+          && ctx.scrollRoot.scrollHeight - ctx.scrollRoot.clientHeight - ctx.scrollRoot.scrollTop <= Math.max(120, ctx.scrollRoot.clientHeight * 0.35);
+      },
       getCurrentPost() {
         const anchor = currentAnchor();
         return visibleRenderedPost() || loader.getPostById(logicalIds[anchor.position]);
@@ -6596,10 +7211,10 @@
       destroy() {
         destroyed = true;
         if (onlyOpController) onlyOpController.abort();
-        unsubscribeStream(); unsubscribePosts();
+        unsubscribeStream(); unsubscribeProjection(); unsubscribePosts();
         cancelAnimationFrame(scrollRaf);
         cancelAnimationFrame(resizeRaf);
-        if (userScrollTimer) clearTimeout(userScrollTimer);
+        clearTimeout(userScrollTimer);
         userScrollTimer = 0;
         setUserScrollActive(false);
         clearPinnedAnchor();
@@ -6633,9 +7248,21 @@
     bookmark: readerIcon(ICONS.bookmark),
     filter: readerIcon('<path d="M4 5h16v2H4V5Zm3 6h10v2H7v-2Zm3 6h4v2h-4v-2Z"/>'),
     refresh: readerIcon('<path d="M17.65 6.35A8 8 0 1 0 20 12h-2.5a5.5 5.5 0 1 1-1.46-3.73L13 11h7V4l-2.35 2.35Z"/>'),
+    autoSync: readerIcon('<path d="M12 3a9 9 0 0 1 8.48 6h-2.18A7 7 0 0 0 6.34 7.88L9 10.5H3v-6l1.92 1.92A8.96 8.96 0 0 1 12 3Zm9 10.5v6l-1.92-1.92A8.96 8.96 0 0 1 12 21a9 9 0 0 1-8.48-6h2.18a7 7 0 0 0 11.96 1.12L15 13.5h6Z"/>'),
     close: readerIcon('<path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/>'),
     trash: readerIcon('<path d="M8 3h8l1 2h4v2H3V5h4l1-2Zm-2 6h12l-1 12H7L6 9Zm3 2 .5 8h2L11 11H9Zm4 0-.5 8h2l.5-8h-2Z"/>'),
   };
+
+  function isAutoLoadRepliesEnabled() {
+    try {
+      const raw = localStorage.getItem(AUTO_LOAD_REPLIES_KEY);
+      return raw === null ? true : raw !== '0';
+    } catch (e) { return true; }
+  }
+
+  function setAutoLoadRepliesEnabled(enabled) {
+    try { localStorage.setItem(AUTO_LOAD_REPLIES_KEY, enabled ? '1' : '0'); } catch (e) {}
+  }
 
   function closeReaderPanel(app) {
     if (!app) return;
@@ -6846,6 +7473,7 @@
         <div class="ldp-toolbar">
           <div class="ldp-toolbar-group">
             <button class="ldp-toolbtn" data-reader-action="only-op" title="只看楼主">${READER_ICONS.filter}</button>
+            <button class="ldp-toolbtn ${isAutoLoadRepliesEnabled() ? 'active' : ''}" data-reader-action="auto-load" title="自动载入新回复（${isAutoLoadRepliesEnabled() ? '已开启' : '已暂停'}）">${READER_ICONS.autoSync}</button>
           </div>
           <div class="ldp-head-btns">
             <button class="ldp-toolbtn" data-reader-action="history" title="浏览历史">${READER_ICONS.history}</button>
@@ -6859,6 +7487,7 @@
       </header><div class="ldp-shell-host"></div>
       <footer class="ldp-footer" hidden>
         <button class="ldp-fbtn ldp-f-like" disabled title="点赞"><svg viewBox="0 0 24 24">${ICONS.like}</svg><span class="ldp-f-like-count">0</span></button>
+        <button class="ldp-fbtn ldp-f-reaction" type="button" title="使用任意表情回应楼主"><span class="ldp-f-reaction-icon">${EMOJI_BTN_ICON}</span><span>表情</span></button>
         <button class="ldp-fbtn ldp-f-reply" title="回复帖子"><svg viewBox="0 0 1024 1024">${ICONS.reply}</svg><span class="ldp-f-reply-count">0</span></button>
         <button class="ldp-fbtn ldp-f-boost" title="给楼主发送 Boost"><svg viewBox="0 0 1024 1024">${ICONS.boost}</svg><span>Boost</span></button>
         <button class="ldp-fbtn ldp-f-bookmark" title="收藏本帖"><svg viewBox="0 0 24 24">${ICONS.bookmark}</svg><span>收藏</span></button>
@@ -6870,12 +7499,14 @@
     const app = {
       overlay, modal, topicId: null, targetPostNumber: 1, topic: null, loader: null,
       controller: null, virtualFlow: null, tracker: null, timeline: null, stopBase64: null,
-      repliesIO: null, refreshTimer: null, panelAbort: null, onlyOp: false, closed: false,
+      repliesIO: null, refreshTimer: null, stopLiveSync: null, panelAbort: null,
+      onlyOp: false, autoLoadReplies: isAutoLoadRepliesEnabled(), closed: false,
       loadTopic: null, close: null,
     };
 
     const cleanupTopic = () => {
       clearInterval(app.refreshTimer); app.refreshTimer = null;
+      if (app.stopLiveSync) { app.stopLiveSync(); app.stopLiveSync = null; }
       if (app.controller) app.controller.abort();
       if (app.virtualFlow) app.virtualFlow.destroy();
       if (app.repliesIO) app.repliesIO.disconnect();
@@ -6919,6 +7550,11 @@
         button.classList.toggle('active', app.onlyOp);
         try { await app.virtualFlow.setOnlyOp(app.onlyOp); }
         finally { button.disabled = false; }
+      } else if (action === 'auto-load') {
+        app.autoLoadReplies = !app.autoLoadReplies;
+        setAutoLoadRepliesEnabled(app.autoLoadReplies);
+        button.classList.toggle('active', app.autoLoadReplies);
+        button.title = `自动载入新回复（${app.autoLoadReplies ? '已开启' : '已暂停'}）`;
       } else if (action === 'refresh' && app.topicId) {
         const id = app.topicId, target = (app.virtualFlow && app.virtualFlow.getCurrentPost() || {}).post_number || app.targetPostNumber;
         await invalidateTopicSnapshot(id); app.loadTopic(id, target, { forceNetwork: true });
@@ -6926,8 +7562,14 @@
     });
 
     modal.querySelector('.ldp-new-posts').addEventListener('click', () => {
-      const target = Number(modal.querySelector('.ldp-new-posts').dataset.postNumber) || 1;
-      app.loadTopic(app.topicId, target, { forceNetwork: true });
+      const notice = modal.querySelector('.ldp-new-posts');
+      const target = Number(notice.dataset.postNumber) || 1;
+      notice.hidden = true;
+      if (app.virtualFlow) {
+        app.virtualFlow.seekToPost(target).catch(() => {});
+      } else {
+        app.loadTopic(app.topicId, target, { forceNetwork: true });
+      }
     });
 
     app.loadTopic = async (topicId, targetPostNumber, options) => {
@@ -7026,11 +7668,13 @@
         const virtualFlow = createVirtualFlow(loader, ctx);
         app.virtualFlow = virtualFlow;
         ctx.virtualFlow = virtualFlow;
+        const noticeEl = modal.querySelector('.ldp-new-posts');
         const controls = {
           getStreamLength: () => loader.streamLength,
           getTotalPosts: () => Number((loader.topic && (loader.topic.highest_post_number || loader.topic.posts_count)) || ctx.totalComments + 1),
           getStreamIndex: (postId) => loader.getStreamIndex(postId),
           scrollToTop: () => virtualFlow.scrollToTop(),
+          onReachBottom: () => { if (noticeEl && !noticeEl.hidden) noticeEl.hidden = true; },
           seekToIndex: async (index, postNumber) => {
             if (Number(postNumber) <= 1) return virtualFlow.scrollToTop();
             return virtualFlow.seekToIndex(index, postNumber, { smooth: true });
@@ -7053,22 +7697,121 @@
           const categoryName = latest.category_name || (latest.category && latest.category.name) || resolveDomCategoryName(latest.category_id);
           renderTaxonomy(categoryName, latest.tags);
         }).catch(() => {});
-        app.refreshTimer = setInterval(async () => {
-          if (document.visibilityState !== 'visible' || controller.signal.aborted) return;
+
+        let syncingNewReplies = false;
+        let pendingNoticeCount = 0;
+        const syncNewReplies = async () => {
+          if (!app.autoLoadReplies || syncingNewReplies || document.visibilityState !== 'visible' || controller.signal.aborted) return;
+          syncingNewReplies = true;
           try {
-            const latest = await fetchJSON(`${BASE}/t/${topicId}.json`, {
-              signal: controller.signal, priority: 'background', dedupeKey: `new-posts:${BASE}:${topicId}:${Date.now() >> 15}`,
+            const latest = await fetchJSON(`${BASE}/t/${topicId}.json?track_visit=false`, {
+              signal: controller.signal,
+              cache: 'no-store',
+              priority: 'background',
+              dedupeKey: `auto-sync:${BASE}:${topicId}:${Math.floor(Date.now() / 3000)}`,
             });
-            const currentTopic = loader.topic || topic;
-            const currentHighest = Number(currentTopic.highest_post_number || currentTopic.posts_count || 1);
-            const nextHighest = Number(latest.highest_post_number || latest.posts_count || 1);
-            if (nextHighest > currentHighest) {
-              const notice = modal.querySelector('.ldp-new-posts');
-              notice.textContent = `${nextHighest - currentHighest} 条新回应`;
-              notice.dataset.postNumber = String(nextHighest); notice.hidden = false;
+            if (controller.signal.aborted || String(app.topicId) !== String(topicId)) return;
+            const wasNearBottom = virtualFlow.isNearBottom();
+            const opId = Number((topic._opPost && topic._opPost.id) || 0);
+            const existingSet = new Set(loader.getStreamIds().map(Number));
+            const latestStream = ((latest.post_stream && latest.post_stream.stream) || [])
+              .map(Number)
+              .filter((id) => id > 0 && id !== opId);
+            const missingNewIds = latestStream.filter((id) => !existingSet.has(id));
+            if (!missingNewIds.length) {
+              const currentTopic = loader.topic || topic;
+              const nextViews = Number(latest.views) || 0;
+              if (nextViews > (Number(currentTopic.views) || 0)) {
+                loader.syncLatestTopic(latest);
+                const meta = modal.querySelector('.ldp-meta > span:first-child');
+                if (meta && loader.topic) {
+                  meta.textContent = `${Number(loader.topic.posts_count) || 1} 帖 · ${Number(loader.topic.views) || 0} 浏览 · 楼主 @${ctx.op || '?'}`;
+                }
+              }
+              return;
             }
-          } catch (error) { /* 后台检查失败不打断阅读 */ }
-        }, 45000);
+
+            // 自动拉取新增回复实体并无刷新注入虚拟流与楼中楼
+            await loader.fetchIds(missingNewIds, 'background', controller.signal);
+            if (controller.signal.aborted || String(app.topicId) !== String(topicId)) return;
+            const { topic: syncedTopic } = loader.syncLatestTopic(latest);
+            if (syncedTopic) { app.topic = syncedTopic; ctx.topic = syncedTopic; }
+
+            let newestPostNumber = Number((syncedTopic && syncedTopic.highest_post_number) || 1);
+            missingNewIds.forEach((id) => {
+              const newPost = loader.getPostById(id);
+              if (!newPost) return;
+              newestPostNumber = Math.max(newestPostNumber, Number(newPost.post_number) || 1);
+              const parentNum = Number(newPost.reply_to_post_number) || 0;
+              if (parentNum > 1) {
+                const parentPost = loader.getPostByNumber(parentNum);
+                if (parentPost) {
+                  const known = loader.getKnownChildren(parentNum);
+                  loader.updatePost(parentPost.id, {
+                    reply_count: Math.max(Number(parentPost.reply_count) || 0, known.length),
+                  });
+                  const cacheKey = String(parentPost.id);
+                  if (ctx.subReplyCache.has(cacheKey)) {
+                    const prev = ctx.subReplyCache.get(cacheKey) || [];
+                    if (!prev.some((r) => Number(r.id) === Number(newPost.id))) {
+                      ctx.subReplyCache.set(cacheKey, [...prev, newPost]);
+                    }
+                  }
+                  const state = mergeSubReplyState(parentNum, known, ctx);
+                  if (state.renderedCount >= Math.max(0, state.all.length - missingNewIds.length)) {
+                    state.renderedCount = state.all.length;
+                  }
+                  renderSubReplyState(parentNum, ctx);
+                }
+              }
+            });
+
+            const updatedTopic = loader.topic || topic;
+            ctx.totalComments = Math.max(0, Number(updatedTopic.posts_count || updatedTopic.highest_post_number || 1) - 1);
+            updateCommentsHeader(ctx);
+            const meta = modal.querySelector('.ldp-meta > span:first-child');
+            if (meta) {
+              meta.textContent = `${Number(updatedTopic.posts_count) || 1} 帖 · ${Number(updatedTopic.views) || 0} 浏览 · 楼主 @${ctx.op || '?'}`;
+            }
+            const bottomDateBtn = shell.querySelector('.ldp-tl-bottom-date');
+            if (bottomDateBtn && updatedTopic.last_posted_at) {
+              bottomDateBtn.textContent = fmtDate(updatedTopic.last_posted_at) || '底部';
+            }
+            if (app.timeline) app.timeline.refresh();
+            virtualFlow.refresh();
+
+            if (!wasNearBottom && noticeEl) {
+              pendingNoticeCount = (noticeEl.hidden ? 0 : pendingNoticeCount) + missingNewIds.length;
+              noticeEl.textContent = `已自动载入 ${pendingNoticeCount} 条新回复 · 点击查看 ↓`;
+              noticeEl.dataset.postNumber = String(newestPostNumber);
+              noticeEl.hidden = false;
+            } else if (noticeEl) {
+              pendingNoticeCount = 0;
+              noticeEl.hidden = true;
+            }
+          } catch (error) { /* 后台自动同步失败不打断阅读 */ }
+          finally { syncingNewReplies = false; }
+        };
+
+        let liveDebounceTimer = 0;
+        const onLiveTopicMessage = (liveTopicId, payload) => {
+          if (String(liveTopicId) !== String(topicId) || !app.autoLoadReplies) return;
+          if (payload && (payload.type === 'created' || payload.type === 'revised' || payload.id)) {
+            clearTimeout(liveDebounceTimer);
+            liveDebounceTimer = setTimeout(syncNewReplies, 400);
+          }
+        };
+        const onVisibilityChange = () => {
+          if (document.visibilityState === 'visible') syncNewReplies();
+        };
+        TOPIC_LIVE_LISTENERS.add(onLiveTopicMessage);
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        app.stopLiveSync = () => {
+          clearTimeout(liveDebounceTimer);
+          TOPIC_LIVE_LISTENERS.delete(onLiveTopicMessage);
+          document.removeEventListener('visibilitychange', onVisibilityChange);
+        };
+        app.refreshTimer = setInterval(syncNewReplies, AUTO_REFRESH_INTERVAL);
       } catch (error) {
         if (error && error.name === 'AbortError') return;
         mask.remove(); body.innerHTML = `<div class="ldp-error">加载失败：${esc(error.message)}</div>`;
@@ -7222,7 +7965,158 @@
     openModalV2(parsed.topicId, directTarget);
   }, true);
 
-  startBase64MenuObserver();
-  startObsidianPageActions();
-  startPageCollectionAction();
+  /* ============ 15. 话题列表“发帖时间列”（整合自 linux.do 发帖时间列） ============ */
+  function startTopicCreatedColumn() {
+    if (window.top !== window.self) return;
+
+    const pad2 = (n) => (n < 10 ? '0' : '') + n;
+    const fmtShortCreated = (d) => {
+      const now = new Date();
+      const dayMs = 86400000;
+      const dayOf = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+      const diffDays = Math.round((dayOf(now) - dayOf(d)) / dayMs);
+      if (diffDays <= 0) return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+      if (diffDays === 1) return '昨天';
+      if (diffDays === 2) return '前天';
+      if (diffDays < 7) return diffDays + '天前';
+      if (d.getFullYear() === now.getFullYear()) return pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+      return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    };
+    const fmtFullCreated = (d) => (
+      `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+    );
+
+    const harvestPreloaded = () => {
+      const el = document.getElementById('data-preloaded');
+      if (!el || !el.dataset.preloaded) return;
+      let data;
+      try { data = JSON.parse(el.dataset.preloaded); } catch (e) { return; }
+      for (const key of Object.keys(data)) {
+        if (!/^topic/.test(key)) continue;
+        let v = data[key];
+        if (typeof v === 'string') {
+          try { v = JSON.parse(v); } catch (e) { continue; }
+        }
+        harvestTopicCreatedData(v);
+      }
+    };
+
+    const currentThemeMode = () => {
+      const m = document.querySelector('meta[name="discourse_theme_id"]');
+      if (!m || !m.content) return 'classic';
+      const ids = m.content.split(',');
+      for (let i = 0; i < ids.length; i++) {
+        const mode = CREATED_AT_THEME_MODES[String(parseInt(ids[i], 10))];
+        if (mode) return mode;
+      }
+      return 'classic';
+    };
+
+    const ensureHeader = (table) => {
+      const headRow = table.tHead && table.tHead.querySelector('tr');
+      if (!headRow || headRow.querySelector('th.' + CREATED_AT_COL_CLASS)) return;
+      const th = document.createElement('th');
+      th.className = 'topic-list-data num ' + CREATED_AT_COL_CLASS;
+      th.setAttribute('scope', 'col');
+      th.textContent = CREATED_AT_COL_LABEL;
+      headRow.insertBefore(th, headRow.querySelector('th.activity'));
+    };
+
+    let refetchedUrl = '';
+    const sweep = () => {
+      const tables = document.querySelectorAll('table.topic-list');
+      if (!tables.length) return;
+      const mode = currentThemeMode();
+      const rootCls = document.documentElement.classList;
+      if (mode === 'horizon') rootCls.add('ldc-horizon');
+      else rootCls.remove('ldc-horizon');
+
+      for (let i = 0; i < tables.length; i++) {
+        const table = tables[i];
+        const horizon = mode === 'horizon' && !!table.querySelector('.topic-activity__time, td.topic-activity-data');
+        if (!horizon) ensureHeader(table);
+
+        const rows = table.querySelectorAll('tr.topic-list-item[data-topic-id]');
+        for (let j = 0; j < rows.length; j++) {
+          const row = rows[j];
+          const id = row.getAttribute('data-topic-id');
+          let td = null;
+          if (!horizon) {
+            td = row.querySelector('td.' + CREATED_AT_COL_CLASS);
+            if (!td) {
+              td = document.createElement('td');
+              td.className = 'topic-list-data num ' + CREATED_AT_COL_CLASS;
+              const anchor = row.querySelector('td.activity');
+              if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(td, anchor);
+              else row.appendChild(td);
+            }
+          }
+
+          const target = row.querySelector('.topic-item-stats .num.activity') || row.querySelector('.topic-activity__time');
+          const created = topicCreatedMap.get(id);
+          if (!created) continue;
+          const ts = Date.parse(created);
+          if (!Number.isFinite(ts)) continue;
+          const d = new Date(ts);
+
+          if (td && td.dataset.filled !== id) {
+            td.textContent = fmtShortCreated(d);
+            td.title = fmtFullCreated(d);
+            td.dataset.filled = id;
+          }
+          if (target) {
+            let inline = row.querySelector('.' + CREATED_AT_COL_CLASS + '-inline');
+            if (!inline) {
+              inline = document.createElement('span');
+              inline.className = CREATED_AT_COL_CLASS + '-inline';
+              target.insertBefore(inline, target.firstChild);
+            }
+            if (inline.dataset.filled !== id) {
+              inline.textContent = fmtShortCreated(d);
+              inline.title = fmtFullCreated(d);
+              inline.dataset.filled = id;
+            }
+          }
+        }
+      }
+
+      const allRows = document.querySelectorAll('tr.topic-list-item[data-topic-id]');
+      if (allRows.length && refetchedUrl !== location.href) {
+        let missing = 0;
+        for (let k = 0; k < allRows.length; k++) {
+          if (!topicCreatedMap.has(allRows[k].getAttribute('data-topic-id'))) missing++;
+        }
+        if (missing * 3 > allRows.length) {
+          refetchedUrl = location.href;
+          const url = (location.pathname.replace(/\/+$/, '') || '/latest') + '.json' + location.search;
+          fetch(url, { credentials: 'same-origin' })
+            .then((res) => (res.ok ? res.json() : null))
+            .then((json) => { if (json) harvestTopicCreatedData(json); })
+            .catch(() => {});
+        }
+      }
+    };
+
+    let sweepScheduled = false;
+    scheduleTopicCreatedSweep = () => {
+      if (sweepScheduled) return;
+      sweepScheduled = true;
+      setTimeout(() => { sweepScheduled = false; sweep(); }, 120);
+    };
+
+    harvestPreloaded();
+    sweep();
+    if (document.body) {
+      new MutationObserver(scheduleTopicCreatedSweep).observe(document.body, { childList: true, subtree: true });
+    }
+    setInterval(sweep, 1500);
+  }
+
+  onDomReady(() => {
+    if (window.top !== window.self) return;
+    startBase64MenuObserver();
+    startObsidianPageActions();
+    startPageCollectionAction();
+    startTopicCreatedColumn();
+  });
 })();
