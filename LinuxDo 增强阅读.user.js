@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinuxDo 增强阅读
 // @namespace    https://linux.do/
-// @version      2.2.1
+// @version      2.2.2
 // @license      MIT
 // @description  在 LINUX DO 与 IDC Flare 高性能浮窗阅读帖子，支持默认楼中楼、自动载入新回复、全表情点赞回应、列表发帖时间列、右侧时间轴、投票、剧透、视频、公式、大图压缩上传、删帖、历史收藏、双栏资料卡和 Obsidian 快照。
 // @author       Fashion
@@ -685,14 +685,25 @@
     .ldp-post-copy > .ldp-children{margin-left:18px;}
     .ldp-post-copy.ldp-reply-depth-capped > .ldp-children{margin-left:0;}
     .ldp-reply-gap{padding:6px 10px;color:var(--primary-medium,#777);font-size:11px;border-bottom:1px dashed var(--primary-low,#ddd);}
-    .ldp-emoji-quick{flex:none;display:flex;align-items:center;gap:4px;padding:6px 8px;overflow-x:auto;
-      border-bottom:1px solid var(--primary-low,#e4e8e6);background:var(--primary-very-low,#f6f8f7);}
-    .ldp-emoji-quick::-webkit-scrollbar{height:3px;}
-    .ldp-emoji-quick-btn{flex:none;width:30px;height:30px;padding:3px;border:1px solid transparent;border-radius:6px;
-      background:transparent;cursor:pointer;display:grid;place-items:center;transition:all .12s;}
-    .ldp-emoji-quick-btn:hover{background:#edf6f1;border-color:#9fc5b1;}
-    .ldp-emoji-quick-btn.selected{background:#e4f2ea;border-color:#5f9f7d;}
-    .ldp-emoji-quick-btn img{width:20px;height:20px;display:block;object-fit:contain;}
+    .ldp-reaction-hover-bar{position:fixed;z-index:2147483565;display:flex;align-items:center;
+      gap:4px;max-width:min(92vw,520px);overflow-x:auto;padding:5px 8px;
+      border:1px solid var(--primary-low,#dce2df);border-radius:999px;
+      background:var(--secondary,#fff);box-shadow:0 8px 26px rgba(0,0,0,.2);
+      scrollbar-width:none;animation:ldp-rx-pop .12s ease-out;}
+    .ldp-reaction-hover-bar::-webkit-scrollbar{display:none;}
+    @keyframes ldp-rx-pop{from{opacity:0;transform:translateY(4px) scale(.96);}to{opacity:1;transform:none;}}
+    .ldp-reaction-hover-item{flex:none;width:32px;height:32px;padding:4px;border:0;border-radius:50%;
+      background:transparent;cursor:pointer;display:grid;place-items:center;
+      transition:transform .14s ease,background-color .14s ease;}
+    .ldp-reaction-hover-item:hover{background:#edf6f1;transform:scale(1.22);}
+    .ldp-reaction-hover-item.selected{background:#e4f2ea;box-shadow:inset 0 0 0 1.5px #5f9f7d;}
+    .ldp-reaction-hover-item img{width:22px;height:22px;display:block;object-fit:contain;pointer-events:none;}
+    .ldp-reaction-hover-item .ldp-reaction-char{font-size:19px;line-height:1;pointer-events:none;}
+    .ldp-char-counter{font-size:12px;line-height:1.2;color:var(--primary-medium,#7a837e);
+      font-variant-numeric:tabular-nums;white-space:nowrap;user-select:none;flex:none;}
+    .ldp-reply-tools .ldp-char-counter{margin-left:2px;}
+    .ldp-boost-input-wrap .ldp-char-counter{margin:0 2px;}
+    .ldp-char-counter.is-short{color:var(--danger,#e03131);font-weight:600;}
     .ldp-reader-panel{position:absolute;z-index:20;right:16px;top:88px;width:min(420px,calc(100% - 32px));height:min(560px,calc(100% - 108px));
       display:flex;flex-direction:column;border:1px solid var(--primary-low,#dce2df);border-radius:8px;background:var(--secondary,#fff);
       box-shadow:0 18px 48px rgba(20,30,24,.24);overflow:hidden;}
@@ -910,6 +921,21 @@
       .topic-created-at-inline{display:inline-block;font-size:.87rem;line-height:1.2;color:var(--primary-medium,#919191);margin:0 8px;white-space:nowrap;}
       .topic-list .topic-item-stats .num.activity{white-space:nowrap;flex-shrink:0;}
     }
+    /* 发帖时间颜色梯度：当天鲜红，近7天（1~6天前）逐级变淡过渡至默认灰色 */
+    table.topic-list td.topic-created-at[data-age-bucket="0"],
+    .topic-created-at-inline[data-age-bucket="0"]{color:#e03131!important;font-weight:600;}
+    table.topic-list td.topic-created-at[data-age-bucket="1"],
+    .topic-created-at-inline[data-age-bucket="1"]{color:#d64f4f!important;color:color-mix(in srgb,#e03131 82%,var(--primary-medium,#919191))!important;}
+    table.topic-list td.topic-created-at[data-age-bucket="2"],
+    .topic-created-at-inline[data-age-bucket="2"]{color:#c86464!important;color:color-mix(in srgb,#e03131 66%,var(--primary-medium,#919191))!important;}
+    table.topic-list td.topic-created-at[data-age-bucket="3"],
+    .topic-created-at-inline[data-age-bucket="3"]{color:#ba7474!important;color:color-mix(in srgb,#e03131 50%,var(--primary-medium,#919191))!important;}
+    table.topic-list td.topic-created-at[data-age-bucket="4"],
+    .topic-created-at-inline[data-age-bucket="4"]{color:#ad8080!important;color:color-mix(in srgb,#e03131 35%,var(--primary-medium,#919191))!important;}
+    table.topic-list td.topic-created-at[data-age-bucket="5"],
+    .topic-created-at-inline[data-age-bucket="5"]{color:#a08989!important;color:color-mix(in srgb,#e03131 22%,var(--primary-medium,#919191))!important;}
+    table.topic-list td.topic-created-at[data-age-bucket="6"],
+    .topic-created-at-inline[data-age-bucket="6"]{color:#978e8e!important;color:color-mix(in srgb,#e03131 11%,var(--primary-medium,#919191))!important;}
   `;
   (document.head || document.documentElement).appendChild(style);
 
@@ -1588,9 +1614,55 @@
     return { count: like.count || 0, acted: !!like.acted, canAct: !!like.can_act };
   }
 
-  const DEFAULT_QUICK_REACTIONS = [
-    'heart', '+1', 'laughing', 'open_mouth', 'clap', 'confetti_ball', 'hugs', 'thumbsup', 'tada', 'rocket', 'eyes', 'fire',
+  const DEFAULT_ENABLED_REACTIONS = [
+    'heart', '+1', 'laughing', 'open_mouth', 'clap', 'confetti_ball', 'hugs',
   ];
+
+  let cachedDiscourseSiteSettings = null;
+  function getDiscourseSiteSettings() {
+    try {
+      const live = PAGE_WIN && PAGE_WIN.Discourse && PAGE_WIN.Discourse.SiteSettings;
+      if (live && typeof live === 'object') {
+        cachedDiscourseSiteSettings = live;
+        return live;
+      }
+    } catch (e) {}
+    if (cachedDiscourseSiteSettings) return cachedDiscourseSiteSettings;
+    try {
+      const el = document.getElementById && document.getElementById('data-preloaded');
+      if (el && el.dataset && el.dataset.preloaded) {
+        const pre = JSON.parse(el.dataset.preloaded);
+        if (pre && pre.siteSettings) {
+          cachedDiscourseSiteSettings = typeof pre.siteSettings === 'string'
+            ? JSON.parse(pre.siteSettings) : pre.siteSettings;
+          return cachedDiscourseSiteSettings;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function getMinReplyLength(topic) {
+    const settings = getDiscourseSiteSettings();
+    const isPM = topic && topic.archetype === 'private_message';
+    const raw = settings && (isPM ? settings.min_personal_message_post_length : settings.min_post_length);
+    const num = Number(raw);
+    return Number.isFinite(num) && num > 0 ? num : 16;
+  }
+
+  function getBoostCharLimits() {
+    const settings = getDiscourseSiteSettings();
+    const maxRaw = Number(settings && (settings.discourse_boosts_max_length || settings.boost_max_length));
+    const minRaw = Number(settings && (settings.discourse_boosts_min_length || settings.boost_min_length));
+    return {
+      min: Number.isFinite(minRaw) && minRaw > 0 ? minRaw : 1,
+      max: Number.isFinite(maxRaw) && maxRaw > 0 ? maxRaw : 16,
+    };
+  }
+
+  function countInputChars(text) {
+    return Array.from(String(text || '').trim()).length;
+  }
 
   const REACTION_LABELS = {
     heart: '❤', '+1': '👍', laughing: '😄', tada: '🎉',
@@ -1632,14 +1704,25 @@
   }
 
   function validReactionIds(topic, post) {
-    const fromTopic = topic && Array.isArray(topic.valid_reactions) ? topic.valid_reactions : [];
-    const fromPost = post && Array.isArray(post.reactions) ? post.reactions.map((item) => item && item.id) : [];
-    const combined = [...fromTopic, ...fromPost, ...DEFAULT_QUICK_REACTIONS]
-      .map((item) => normalizeEmojiId(typeof item === 'string' ? item : (item && (item.id || item.name)) || ''))
-      .filter(Boolean);
-    return Array.from(new Set(combined));
+    if (topic && Array.isArray(topic.valid_reactions) && topic.valid_reactions.length) {
+      return Array.from(new Set(
+        topic.valid_reactions
+          .map((item) => normalizeEmojiId(typeof item === 'string' ? item : (item && (item.id || item.name)) || ''))
+          .filter(Boolean),
+      ));
+    }
+    const settings = getDiscourseSiteSettings();
+    const rawEnabled = settings && settings.discourse_reactions_enabled_reactions;
+    if (typeof rawEnabled === 'string' && rawEnabled.trim()) {
+      const mainId = normalizeEmojiId((settings && settings.discourse_reactions_reaction_for_like) || 'heart').replace(/-/g, '');
+      const list = [mainId, ...rawEnabled.split('|').map(normalizeEmojiId)].filter(Boolean);
+      if (list.length) return Array.from(new Set(list));
+    }
+    const fromPost = post && Array.isArray(post.reactions)
+      ? post.reactions.map((item) => normalizeEmojiId(item && item.id)).filter(Boolean)
+      : [];
+    return Array.from(new Set([...DEFAULT_ENABLED_REACTIONS, ...fromPost]));
   }
-
   function getPostLikeView(post) {
     const info = likeInfo(post || {});
     const currentReaction = normalizeEmojiId(post && post.current_user_reaction && post.current_user_reaction.id);
@@ -2653,9 +2736,19 @@
     activeHoverReactionBtn = null;
   }
 
-  function closeEmojiPanels() {
+  function closeReactionHoverBar() {
     clearHoverReactionTimers();
     let closed = false;
+    document.querySelectorAll('.ldp-reaction-hover-bar').forEach((bar) => {
+      if (bar._ownerBtn) bar._ownerBtn._ldpReactionBar = null;
+      bar.remove();
+      closed = true;
+    });
+    return closed;
+  }
+
+  function closeEmojiPanels() {
+    let closed = closeReactionHoverBar();
     document.querySelectorAll('.ldp-emoji-panel').forEach((panel) => {
       if (panel._ownerBtn) panel._ownerBtn._ldpEmojiPanel = null;
       panel.remove();
@@ -2682,6 +2775,7 @@
         const insertion = prev && !/[\s\u200b\p{P}]/u.test(prev) ? ' ' + code : code;
         inputEl.value = before + insertion + val.substring(end);
         inputEl.selectionStart = inputEl.selectionEnd = start + insertion.length;
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
         inputEl.focus();
       }
       panel.remove();
@@ -4069,16 +4163,29 @@
       ${isDeleted ? '' : `<div class="ldp-boosts-list">${boostsHtml}</div>
       <div class="ldp-boost-input-wrap">
         <input type="text" class="ldp-boost-input" maxlength="50"
-          placeholder="Boost ${esc(username)}… (最多16字符)">
+          placeholder="Boost ${esc(username)}… (最多${getBoostCharLimits().max}字符)">
         <button class="ldp-emoji-btn ldp-boost-emoji" type="button" title="表情">${EMOJI_BTN_ICON}</button>
-        <button class="ldp-boost-submit" title="发送">✓</button>
-        <button class="ldp-boost-cancel" title="取消">×</button>
+        <button class="ldp-boost-submit" type="button" title="发送">✓</button>
+        <span class="ldp-char-counter ldp-boost-counter is-short">0/${getBoostCharLimits().max}</span>
+        <button class="ldp-boost-cancel" type="button" title="取消">×</button>
       </div>`}
       ${actionsHtml}
       <div class="ldp-children"></div>
       <div class="ldp-sub-loading">加载楼中楼中…</div>
       <div class="ldp-sub-actions"><button type="button" class="ldp-btn ldp-load-more-replies">展示更多回复 ↓</button></div>
     `;
+    const boostInput = node.querySelector(':scope > .ldp-boost-input-wrap .ldp-boost-input');
+    const boostCounter = node.querySelector(':scope > .ldp-boost-input-wrap .ldp-boost-counter');
+    if (boostInput && boostCounter) {
+      const syncBoostCount = () => {
+        const limits = getBoostCharLimits();
+        const len = countInputChars(boostInput.value);
+        boostCounter.textContent = `${len}/${limits.max}`;
+        boostCounter.classList.toggle('is-short', len < limits.min || len > limits.max);
+      };
+      boostInput.addEventListener('input', syncBoostCount);
+      syncBoostCount();
+    }
     const content = node.querySelector('.ldp-content');
     content.querySelectorAll('a[href]').forEach((anchor) => {
       if (!isImageAnchor(anchor) && !anchor.getAttribute('target')) anchor.setAttribute('target', '_blank');
@@ -4254,48 +4361,93 @@
   const LIKE_HOVER_OPEN_DELAY = 320;
   const LIKE_HOVER_CLOSE_DELAY = 260;
 
-  function scheduleHoverReactionPanelClose(panel) {
+  function scheduleHoverReactionPanelClose(bar) {
     clearTimeout(hoverReactionCloseTimer);
     hoverReactionCloseTimer = setTimeout(() => {
       hoverReactionCloseTimer = 0;
-      if (!panel || !panel.isConnected) return;
-      const searchInput = panel.querySelector('.ldp-emoji-search input');
-      if (searchInput && document.activeElement === searchInput) return;
-      if (panel.matches(':hover') || (panel._ownerBtn && panel._ownerBtn.isConnected && panel._ownerBtn.matches(':hover'))) {
+      if (!bar || !bar.isConnected) return;
+      if (bar.matches(':hover') || (bar._ownerBtn && bar._ownerBtn.isConnected && bar._ownerBtn.matches(':hover'))) {
         return;
       }
-      if (panel._ownerBtn) panel._ownerBtn._ldpEmojiPanel = null;
-      panel.remove();
+      if (bar._ownerBtn) bar._ownerBtn._ldpReactionBar = null;
+      bar.remove();
     }, LIKE_HOVER_CLOSE_DELAY);
   }
 
   function openHoverReactionPanel(triggerBtn, postId, ctx, syncRoot) {
     if (!triggerBtn || !triggerBtn.isConnected || triggerBtn.disabled || REACTIONS_AVAILABLE === false) return;
-    if (triggerBtn._ldpEmojiPanel && triggerBtn._ldpEmojiPanel.isConnected) return;
-    closeEmojiPanels();
+    if (triggerBtn._ldpReactionBar && triggerBtn._ldpReactionBar.isConnected) return;
+    closeReactionHoverBar();
     const post = (ctx && ctx.loader && ctx.loader.getPostById(postId))
       || (ctx && ctx.topic && Number(ctx.topic._opPost?.id) === Number(postId) ? ctx.topic._opPost : null);
-    const quickReactions = validReactionIds(ctx && ctx.topic, post);
+    const reactionIds = validReactionIds(ctx && ctx.topic, post);
+    if (!reactionIds.length) return;
     const currentReaction = normalizeEmojiId(
       (post && post.current_user_reaction && post.current_user_reaction.id) || triggerBtn.dataset.currentReaction || '',
     );
-    const panel = buildEmojiPanel((_code, emojiName) => {
-      closeEmojiPanels();
-      togglePostReaction(postId, emojiName, ctx, syncRoot);
-    }, {
-      quickReactions,
-      currentReaction,
-      placeholder: '搜索全部表情点赞…',
+    if (!emojiDataCache && !emojiDataLoading) {
+      fetchEmojiData().then(refreshCustomReactionImages).catch(() => {});
+    }
+    const bar = document.createElement('div');
+    bar.className = 'ldp-reaction-hover-bar';
+    bar.setAttribute('role', 'toolbar');
+    bar.setAttribute('aria-label', '选择点赞表情');
+    reactionIds.forEach((id) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'ldp-reaction-hover-item' + (currentReaction === id ? ' selected' : '');
+      item.title = ':' + id + ':';
+      const fallbackName = id === '+1' ? 'thumbsup' : id;
+      item.innerHTML = `<img class="ldp-reaction-img" data-emoji-name="${escAttr(id)}" src="${escAttr(emojiUrl(fallbackName))}" alt=":${escAttr(id)}:" loading="lazy">`;
+      item.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeReactionHoverBar();
+        togglePostReaction(postId, id, ctx, syncRoot);
+      });
+      bar.appendChild(item);
     });
-    mountFloatingEmojiPanel(triggerBtn, panel, { autoFocus: false });
-    panel.addEventListener('mouseenter', () => {
+
+    bar._ownerBtn = triggerBtn;
+    document.body.appendChild(bar);
+    triggerBtn._ldpReactionBar = bar;
+    const btnRect = triggerBtn.getBoundingClientRect();
+    const barW = bar.offsetWidth || (reactionIds.length * 36 + 16);
+    const barH = bar.offsetHeight || 44;
+    const gap = 6;
+    const modal = triggerBtn.closest('.ldp-modal');
+    const bounds = modal ? modal.getBoundingClientRect()
+      : { top: 8, left: 8, bottom: window.innerHeight - 8, right: window.innerWidth - 8 };
+    let top = (btnRect.top - barH - gap >= bounds.top) ? (btnRect.top - barH - gap) : (btnRect.bottom + gap);
+    if (top + barH > bounds.bottom) top = bounds.bottom - barH;
+    if (top < bounds.top) top = bounds.top;
+    let left = btnRect.left + (btnRect.width - barW) / 2;
+    if (left < bounds.left + 4) left = bounds.left + 4;
+    if (left + barW > bounds.right - 4) left = bounds.right - barW - 4;
+    bar.style.top = `${Math.round(top)}px`;
+    bar.style.left = `${Math.round(left)}px`;
+
+    bar.addEventListener('mouseenter', () => {
       clearTimeout(hoverReactionCloseTimer);
       hoverReactionCloseTimer = 0;
     });
-    panel.addEventListener('mouseleave', (e) => {
+    bar.addEventListener('mouseleave', (e) => {
       if (triggerBtn.contains(e.relatedTarget)) return;
-      scheduleHoverReactionPanelClose(panel);
+      scheduleHoverReactionPanelClose(bar);
     });
+    setTimeout(() => {
+      const closer = (e) => {
+        if (!bar.isConnected) {
+          document.removeEventListener('mousedown', closer, true);
+          return;
+        }
+        if (bar.contains(e.target) || triggerBtn.contains(e.target)) return;
+        if (bar._ownerBtn) bar._ownerBtn._ldpReactionBar = null;
+        bar.remove();
+        document.removeEventListener('mousedown', closer, true);
+      };
+      document.addEventListener('mousedown', closer, true);
+    }, 0);
   }
 
   function bindHoverLikeReaction(container, selector, resolvePostId, ctx, syncRoot) {
@@ -4303,7 +4455,7 @@
     container.addEventListener('mouseover', (e) => {
       const btn = e.target.closest(selector);
       if (!btn || btn.disabled || REACTIONS_AVAILABLE === false) return;
-      if (btn._ldpEmojiPanel && btn._ldpEmojiPanel.isConnected) {
+      if (btn._ldpReactionBar && btn._ldpReactionBar.isConnected) {
         clearTimeout(hoverReactionCloseTimer);
         hoverReactionCloseTimer = 0;
         return;
@@ -4327,22 +4479,40 @@
         hoverReactionOpenTimer = 0;
         activeHoverReactionBtn = null;
       }
-      const panel = btn._ldpEmojiPanel;
-      if (panel && panel.isConnected && !panel.contains(e.relatedTarget)) {
-        scheduleHoverReactionPanelClose(panel);
+      const bar = btn._ldpReactionBar;
+      if (bar && bar.isConnected && !bar.contains(e.relatedTarget)) {
+        scheduleHoverReactionPanelClose(bar);
       }
     });
   }
+
   /* ============ 8. 回复框 ============ */
-  function ensureReplyBox(post) {
+  function ensureReplyBox(post, topic) {
     let box = post.querySelector(':scope > .ldp-replybox');
-    if (box) return box;
+    if (box) {
+      if (typeof box._syncReplyCounter === 'function') box._syncReplyCounter(topic);
+      return box;
+    }
     const username = (post.querySelector(':scope > .ldp-post-head .ldp-user')?.textContent || '').replace(/^@/, '');
+    const initialMin = getMinReplyLength(topic);
     box = document.createElement('div');
     box.className = 'ldp-replybox';
-    box.innerHTML = `<textarea placeholder="回复 @${esc(username)} …"></textarea><div class="ldp-reply-tools"><div class="ldp-insert-wrap"><button class="ldp-emoji-btn ldp-reply-insert" type="button" title="插入模板" aria-haspopup="true" aria-expanded="false">${INSERT_BTN_ICON}</button><div class="ldp-insert-menu" hidden><button class="ldp-insert-item ldp-reply-details" type="button">${DETAILS_ICON}<span>隐藏详细信息</span></button><button class="ldp-insert-item ldp-reply-spoiler" type="button">${SPOILER_ICON}<span>模糊剧透</span></button></div></div><button class="ldp-emoji-btn ldp-reply-emoji" type="button" title="表情">${EMOJI_BTN_ICON}</button><button class="ldp-send" type="button">发送</button><span class="ldp-reply-tip">✓ 已发送</span></div>`;
+    box.innerHTML = `<textarea placeholder="回复 @${esc(username)} …（最少 ${initialMin} 个字符）"></textarea><div class="ldp-reply-tools"><div class="ldp-insert-wrap"><button class="ldp-emoji-btn ldp-reply-insert" type="button" title="插入模板" aria-haspopup="true" aria-expanded="false">${INSERT_BTN_ICON}</button><div class="ldp-insert-menu" hidden><button class="ldp-insert-item ldp-reply-details" type="button">${DETAILS_ICON}<span>隐藏详细信息</span></button><button class="ldp-insert-item ldp-reply-spoiler" type="button">${SPOILER_ICON}<span>模糊剧透</span></button></div></div><button class="ldp-emoji-btn ldp-reply-emoji" type="button" title="表情">${EMOJI_BTN_ICON}</button><button class="ldp-send" type="button">发送</button><span class="ldp-char-counter ldp-reply-counter is-short">0/${initialMin}</span><span class="ldp-reply-tip">✓ 已发送</span></div>`;
 
     const textarea = box.querySelector('textarea');
+    const counterEl = box.querySelector('.ldp-reply-counter');
+    let activeTopic = topic || null;
+    const syncReplyCounter = (nextTopic) => {
+      if (nextTopic) activeTopic = nextTopic;
+      const minLen = getMinReplyLength(activeTopic);
+      const len = countInputChars(textarea.value);
+      counterEl.textContent = `${len}/${minLen}`;
+      counterEl.classList.toggle('is-short', len < minLen);
+      textarea.placeholder = `回复 @${username} …（最少 ${minLen} 个字符）`;
+    };
+    box._syncReplyCounter = syncReplyCounter;
+    textarea.addEventListener('input', () => syncReplyCounter());
+    syncReplyCounter();
     bindPasteEvent(textarea);
     const emojiBtn = box.querySelector('.ldp-reply-emoji');
     emojiBtn.addEventListener('click', (e) => {
@@ -4632,6 +4802,7 @@
     const val = textarea.value;
     textarea.value = val.substring(0, start) + text + val.substring(end);
     textarea.selectionStart = textarea.selectionEnd = start + text.length;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
     textarea.focus();
   }
 
@@ -4651,11 +4822,13 @@
             const res = await uploadFile(uploadableFile);
             if (res && res.short_url) {
               textarea.value = textarea.value.replace(placeholder, uploadMarkdown(res));
+              textarea.dispatchEvent(new Event('input', { bubbles: true }));
             } else {
               throw new Error('上传返回数据异常');
             }
           } catch (err) {
             textarea.value = textarea.value.replace(placeholder, `[文件上传失败: ${err.message}]`);
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
           } finally {
             textarea.classList.remove('uploading');
           }
@@ -4794,7 +4967,7 @@
     );
     if (ctx.scrollRoot) {
       ctx.scrollRoot.addEventListener('scroll', () => {
-        if (hoverReactionOpenTimer || document.querySelector('.ldp-emoji-panel')) {
+        if (hoverReactionOpenTimer || document.querySelector('.ldp-emoji-panel, .ldp-reaction-hover-bar')) {
           closeEmojiPanels();
         }
       }, { passive: true });
@@ -4943,9 +5116,12 @@
 
       const replyBtn = e.target.closest('.ldp-replybtn');
       if (replyBtn) {
-        const box = ensureReplyBox(postNode);
+        const box = ensureReplyBox(postNode, ctx.topic);
         box.classList.toggle('open');
-        if (box.classList.contains('open')) box.querySelector('textarea').focus();
+        if (box.classList.contains('open')) {
+          if (typeof box._syncReplyCounter === 'function') box._syncReplyCounter(ctx.topic);
+          box.querySelector('textarea').focus();
+        }
         return;
       }
 
@@ -4992,7 +5168,14 @@
       const boostCancel = e.target.closest('.ldp-boost-cancel');
       if (boostCancel) {
         const wrap = boostCancel.closest('.ldp-boost-input-wrap');
-        if (wrap) { wrap.classList.remove('open'); wrap.querySelector('.ldp-boost-input').value = ''; }
+        if (wrap) {
+          wrap.classList.remove('open');
+          const bInput = wrap.querySelector('.ldp-boost-input');
+          if (bInput) {
+            bInput.value = '';
+            bInput.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        }
         return;
       }
 
@@ -5002,8 +5185,10 @@
         const wrap = boostSubmit.closest('.ldp-boost-input-wrap');
         const input = wrap && wrap.querySelector('.ldp-boost-input');
         const raw = input ? input.value.trim() : '';
-        if (!raw) { input && input.focus(); return; }
-        if (raw.length > 16) { alert('Boost内容不能超过16个字符'); return; }
+        const limits = getBoostCharLimits();
+        const charCount = countInputChars(raw);
+        if (charCount < limits.min) { input && input.focus(); return; }
+        if (charCount > limits.max) { alert(`Boost内容不能超过${limits.max}个字符`); return; }
         boostSubmit.disabled = true;
         try {
           const res = await apiSend(`${BASE}/discourse-boosts/posts/${postId}/boosts`, 'POST', { raw });
@@ -5026,6 +5211,7 @@
               listEl.appendChild(newBubble);
             }
             input.value = '';
+            input.dispatchEvent(new Event('input', { bubbles: true }));
             wrap.classList.remove('open');
 
             const btn = postNode.querySelector(':scope > .ldp-actions > .ldp-boost-btn');
@@ -5131,6 +5317,7 @@
               if (ctx.onMutation) ctx.onMutation(postData);
               box.classList.remove('open');
               textarea.value = '';
+              textarea.dispatchEvent(new Event('input', { bubbles: true }));
               if (postNumber === 1 && ctx.virtualFlow) {
                 ctx.virtualFlow.seekToPost(Number(canonicalReply.post_number)).catch(() => {});
               }
@@ -5178,6 +5365,7 @@
 
             box.classList.remove('open');
             textarea.value = '';
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
           }
         } catch (err) {
           alert('回复失败：' + err.message);
@@ -5471,7 +5659,7 @@
       }
     });
     replyButton.addEventListener('click', () => {
-      const box = ensureReplyBox(opNode);
+      const box = ensureReplyBox(opNode, ctx.topic || topic);
       box.classList.toggle('open');
       if (box.classList.contains('open')) {
         box.querySelector('textarea').focus({ preventScroll: true });
@@ -8039,27 +8227,46 @@
     if (window.top !== window.self) return;
 
     const pad2 = (n) => (n < 10 ? '0' : '') + n;
-    const fmtShortCreated = (d) => {
-      const now = new Date();
+    const formatCreatedInfo = (d, now) => {
       const dayMs = 86400000;
       const dayOf = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
-      const diffDays = Math.round((dayOf(now) - dayOf(d)) / dayMs);
-      if (diffDays <= 0) return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
-      if (diffDays === 1) return '昨天';
-      if (diffDays === 2) return '前天';
-      if (diffDays < 7) return diffDays + '天前';
-      if (d.getFullYear() === now.getFullYear()) return pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
-      return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+      const diffDays = Math.max(0, Math.round((dayOf(now) - dayOf(d)) / dayMs));
+      let text;
+      if (diffDays <= 0) text = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+      else if (diffDays === 1) text = '昨天';
+      else if (diffDays === 2) text = '前天';
+      else if (diffDays < 7) text = diffDays + '天前';
+      else if (d.getFullYear() === now.getFullYear()) text = pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+      else text = d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+      return {
+        text,
+        ageBucket: diffDays < 7 ? String(diffDays) : '',
+      };
     };
     const fmtFullCreated = (d) => (
       `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
     );
+
+    const applyCreatedCell = (el, filledKey, info, fullTitle) => {
+      if (!el || el.dataset.filled === filledKey) return;
+      el.textContent = info.text;
+      el.title = fullTitle;
+      if (info.ageBucket !== '') el.dataset.ageBucket = info.ageBucket;
+      else delete el.dataset.ageBucket;
+      el.dataset.filled = filledKey;
+    };
 
     const harvestPreloaded = () => {
       const el = document.getElementById('data-preloaded');
       if (!el || !el.dataset.preloaded) return;
       let data;
       try { data = JSON.parse(el.dataset.preloaded); } catch (e) { return; }
+      if (data.siteSettings && !cachedDiscourseSiteSettings) {
+        try {
+          cachedDiscourseSiteSettings = typeof data.siteSettings === 'string'
+            ? JSON.parse(data.siteSettings) : data.siteSettings;
+        } catch (e) {}
+      }
       for (const key of Object.keys(data)) {
         if (!/^topic/.test(key)) continue;
         let v = data[key];
@@ -8095,6 +8302,8 @@
     const sweep = () => {
       const tables = document.querySelectorAll('table.topic-list');
       if (!tables.length) return;
+      const now = new Date();
+      const todayStamp = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
       const mode = currentThemeMode();
       const rootCls = document.documentElement.classList;
       if (mode === 'horizon') rootCls.add('ldc-horizon');
@@ -8127,12 +8336,10 @@
           const ts = Date.parse(created);
           if (!Number.isFinite(ts)) continue;
           const d = new Date(ts);
-
-          if (td && td.dataset.filled !== id) {
-            td.textContent = fmtShortCreated(d);
-            td.title = fmtFullCreated(d);
-            td.dataset.filled = id;
-          }
+          const filledKey = `${id}:${todayStamp}`;
+          const info = formatCreatedInfo(d, now);
+          const fullTitle = fmtFullCreated(d);
+          if (td) applyCreatedCell(td, filledKey, info, fullTitle);
           if (target) {
             let inline = row.querySelector('.' + CREATED_AT_COL_CLASS + '-inline');
             if (!inline) {
@@ -8140,11 +8347,7 @@
               inline.className = CREATED_AT_COL_CLASS + '-inline';
               target.insertBefore(inline, target.firstChild);
             }
-            if (inline.dataset.filled !== id) {
-              inline.textContent = fmtShortCreated(d);
-              inline.title = fmtFullCreated(d);
-              inline.dataset.filled = id;
-            }
+            applyCreatedCell(inline, filledKey, info, fullTitle);
           }
         }
       }
