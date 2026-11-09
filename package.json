@@ -1,0 +1,12 @@
+{
+  "name": "linuxdo-read-script",
+  "version": "2.1.0",
+  "private": true,
+  "scripts": {
+    "check": "node --check \"LinuxDo 增强阅读.user.js\"",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}

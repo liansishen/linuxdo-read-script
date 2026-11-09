@@ -1,13 +1,20 @@
 // ==UserScript==
 // @name         LinuxDo 增强阅读
 // @namespace    https://linux.do/
-// @version      1.9.1
+// @version      2.1.0
 // @license      MIT
-// @description  在 LINUX DO 列表页点击标题即可弹窗预览整帖，楼中楼展示、点赞、回复、收藏、原图灯箱一应俱全，并按真实阅读节奏上报已读进度——无需离开列表页，也无需反复返回。
+// @description  在 LINUX DO 与 IDC Flare 高性能浮窗阅读帖子，支持虚拟楼层、右侧时间轴、楼中楼折叠、点赞、回复、表情、模板、投票、剧透、视频、公式、大图压缩与分片上传、删帖、历史收藏、双栏资料卡和 Obsidian 快照。
 // @author       Fashion
 // @match        https://linux.do/*
+// @match        https://idcflare.com/*
 // @icon         https://cdn3.ldstatic.com/optimized/4X/6/a/6/6a6affc7b1ce8140279e959d32671304db06d5ab_2_180x180.png
-// @grant        none
+// @grant        unsafeWindow
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.setClipboard
+// @grant        GM.xmlHttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -15,87 +22,188 @@
   'use strict';
 
   const BASE = location.origin;
-  const PAGE_SIZE = 20;          // 每次请求帖子数（与 Discourse 默认一致），也是 loadUp/loadDown 每次追加的数量
+  const PAGE_WIN = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+  const PAGE_SIZE = 40;
+  const MAX_RENDERED_POSTS = 72;
   const READ_THRESHOLD = 1500;
   const FLUSH_INTERVAL = 5000;
   let ME_USERNAME = null;
+  let ME_USER = null;
+  let ME_STATE = 'unknown';
 
-  // --- 嵌套树 API 状态管理 ---
-  const idToPost = new Map();     // postId → post 数据（混合索引）
-  let nestedTreeRoots = [];       // 顶层回复数组
-  let nestedHasMoreRoots = false; // 是否有更多顶层回复
-  let nestedRootsPage = 0;        // 当前已加载的分页号
+  // --- 全局只读请求队列 & HTTP 429 退避重试 ---
+  const REQUEST_MIN_INTERVAL = 100;   // 相邻 GET 请求最小间隔(ms)
+  const REQUEST_MAX_CONCURRENCY = 3;
+  const RETRY_MAX_ATTEMPTS = 3;       // 429 最多重试次数（不含首次请求）
+  const RETRY_BASE_DELAY = 500;       // 无 Retry-After 时的指数退避基础延迟(ms)
+  const SLICE_RADIUS = 20;            // 定位楼层前后各预加载的窗口半径
+  const TOPIC_CACHE_FRESH_MS = 90 * 1000;
+  const TOPIC_CACHE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+  const TOPIC_CACHE_MAX_COUNT = 50;
+  const TOPIC_CACHE_MAX_BYTES = 25 * 1024 * 1024;
+  const TOPIC_SNAPSHOT_WRITES = new Map();
+  const HISTORY_KEY = 'ldp-reader-history-v1';
+  const DB_NAME = 'linuxdo-convenience-reader-v1';
+  const DB_VERSION = 1;
+  const REQUEST_PRIORITY = { target: 0, visible: 1, background: 2 };
+  let lastRequestTime = 0;
+  let requestSequence = 0;
+  let activeGetRequests = 0;
+  let globalCooldownUntil = 0;
+  let requestPumpTimer = null;
+  const requestQueue = [];
+  const inflightGetRequests = new Map();
+  const cooldownChannel = typeof BroadcastChannel === 'function'
+    ? new BroadcastChannel('ldp-reader-request-cooldown-v1') : null;
 
   const MENU_PANEL_SEL = '.menu-panel, .user-menu, .quick-access-panel, .notifications';
   const SEARCH_SEL = '.search-results, .fps-result, .search-menu, .search-menu-container, .search-result-topic';
+  const USER_CARD_CACHE_TTL = 5 * 60 * 1000;
+  const USER_CARD_CACHE = new Map();
+  let REACTIONS_AVAILABLE = null;
+  let CURRENT_USER_CARD = null;
 
   /* ============ 1. 样式 ============ */
   const style = document.createElement('style');
   style.textContent = `
     .ldp-overlay{position:fixed;inset:0;z-index:2147483000;display:flex;
       align-items:center;justify-content:center;background:rgba(0,0,0,.55);}
-    .ldp-modal{position:relative;display:flex;flex-direction:column;
-      width:90%;max-width:1000px;height:90vh;
+    .ldp-modal{display:flex;flex-direction:column;
+      width: 90%;max-width: 1080px;height:90vh;
       border-radius:12px;overflow:hidden;font-size:16px;
       line-height:1.65;background:var(--secondary,#fff);color:var(--primary,#222);
       box-shadow:0 16px 50px rgba(0,0,0,.4);}
     .ldp-header{display:flex;align-items:flex-start;gap:10px;padding:16px 20px;
       border-bottom:1px solid var(--primary-low,#e5e5e5);}
-    .ldp-title{margin:0;font-size:18px;font-weight:700;}
-    .ldp-topic-tags{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px;}
-    .ldp-topic-tags[hidden]{display:none;}
-    .ldp-topic-category,.ldp-topic-tag{max-width:100%;padding:1px 7px;border-radius:4px;
-      font-size:11px;line-height:18px;background:var(--primary-low,#eee);
-      color:var(--primary-medium,#666);overflow:hidden;text-overflow:ellipsis;
-      white-space:nowrap;}
-    .ldp-topic-category{background:rgba(8,132,255,.1);color:var(--tertiary,#08c);
-      font-weight:600;}
+    .ldp-header-main{flex:1;min-width:0;}
+    .ldp-title-lockup{display:flex;align-items:flex-start;gap:9px;min-width:0;}
+    .ldp-title-copy{flex:1;min-width:0;}
+    .ldp-title{margin:0;font-size:18px;font-weight:700;line-height:1.35;}
     .ldp-meta{font-size:12px;opacity:.7;margin-top:4px;}
     .ldp-head-btns{display:flex;gap:8px;align-items:center;}
     .ldp-close{cursor:pointer;border:none;background:transparent;font-size:22px;
       line-height:1;color:inherit;padding:0 4px;}
-    .ldp-body{flex:1;min-height:0;position:relative;
-      padding:8px 20px 20px;overflow-y:auto;overscroll-behavior:contain;}
+    /* Obsidian 快照操作沿用论坛主题，保持工具按钮视觉一致 */
+    .ldp-obsidian-actions{display:inline-flex;align-items:center;gap:6px;flex:none;}
+    .ldp-obsidian-save,.ldp-obsidian-copy,.ldp-obsidian-settings{display:inline-flex;align-items:center;
+      justify-content:center;border:1px solid transparent;border-radius:7px;cursor:pointer;
+      font:600 13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      transition:background-color .16s ease,border-color .16s ease,color .16s ease,opacity .16s ease;}
+    .ldp-obsidian-save svg,.ldp-obsidian-copy svg,.ldp-obsidian-settings svg{width:16px;height:16px;fill:currentColor;flex:none;}
+    .ldp-obsidian-label{display:none;}
+    .ldp-obsidian-save,.ldp-obsidian-copy,.ldp-obsidian-settings{width:32px;height:32px;padding:0;color:var(--primary-medium,#667085);
+      background:var(--primary-very-low,#f7f7f8);border-color:var(--primary-low,#e5e7eb);}
+    .ldp-obsidian-save:hover,.ldp-obsidian-copy:hover,.ldp-obsidian-settings:hover{color:var(--primary,#1f2937);
+      border-color:var(--primary-medium,#9ca3af);background:var(--primary-low,#e9e9e9);}
+    .ldp-obsidian-save:disabled,.ldp-obsidian-copy:disabled,.ldp-obsidian-settings:disabled{cursor:wait;opacity:.62;}
+    .ldp-obsidian-save:focus-visible,.ldp-obsidian-copy:focus-visible,.ldp-obsidian-settings:focus-visible,
+    .ldp-obsidian-dialog button:focus-visible,.ldp-obsidian-dialog input:focus-visible,
+    .ldp-obsidian-dialog select:focus-visible{outline:2px solid #2f855a;outline-offset:2px;}
+    .ldp-obsidian-page-actions{width:max-content;margin:8px 0 8px auto;}
+    .ldp-obsidian-dialog-overlay{position:fixed;inset:0;z-index:2147483640;display:grid;
+      place-items:center;padding:20px;background:rgba(10,12,18,.58);backdrop-filter:blur(3px);}
+    .ldp-obsidian-dialog{width:min(540px,100%);max-height:calc(100vh - 40px);overflow:auto;
+      box-sizing:border-box;padding:22px;border:1px solid var(--primary-low,#e5e7eb);
+      border-radius:13px;color:var(--primary,#1f2937);background:var(--secondary,#fff);
+      box-shadow:0 22px 70px rgba(0,0,0,.34);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+    .ldp-obsidian-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;
+      gap:16px;margin-bottom:16px;}
+    .ldp-obsidian-dialog h2{margin:0;font-size:20px;line-height:1.3;}
+    .ldp-obsidian-dialog-subtitle{margin:4px 0 0;color:var(--primary-medium,#667085);font-size:12px;}
+    .ldp-obsidian-dialog-close{border:0;background:transparent;color:inherit;cursor:pointer;
+      padding:0 4px;font-size:24px;line-height:1;}
+    .ldp-obsidian-dialog label{display:block;margin:13px 0 5px;font-weight:650;}
+    .ldp-obsidian-dialog input,.ldp-obsidian-dialog select{width:100%;box-sizing:border-box;
+      padding:9px 10px;border:1px solid var(--primary-low-mid,#cfd4dc);border-radius:7px;
+      color:var(--primary,#1f2937);background:var(--secondary,#fff);font:inherit;}
+    .ldp-obsidian-dialog-help{margin:5px 0 0;color:var(--primary-medium,#667085);font-size:12px;}
+    .ldp-obsidian-dialog-note{margin:0 0 14px;padding:10px 12px;border-left:3px solid #2f855a;
+      border-radius:0 7px 7px 0;background:rgba(47,133,90,.08);font-size:12px;}
+    .ldp-obsidian-dialog-status{min-height:21px;margin-top:12px;color:var(--primary-medium,#667085);
+      font-size:13px;}
+    .ldp-obsidian-dialog-status[data-type="error"]{color:var(--danger,#b42318);}
+    .ldp-obsidian-dialog-status[data-type="success"]{color:#15803d;}
+    .ldp-obsidian-confirm-icon{display:grid;width:42px;height:42px;margin-bottom:14px;
+      place-items:center;border-radius:11px;color:#26734d;background:rgba(47,133,90,.11);
+      font-size:24px;font-weight:700;}
+    .ldp-obsidian-confirm-copy{margin:8px 0 0;color:var(--primary-medium,#667085);}
+    .ldp-obsidian-confirm-path{display:block;margin-top:14px;padding:9px 10px;overflow-wrap:anywhere;
+      border:1px solid var(--primary-low,#e5e7eb);border-radius:7px;
+      color:var(--primary,#1f2937);background:var(--primary-very-low,#f7f7f8);font-size:12px;}
+    .ldp-obsidian-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px;}
+    .ldp-obsidian-dialog-actions button,.ldp-obsidian-test{border:0;border-radius:7px;
+      padding:8px 12px;cursor:pointer;font:inherit;font-size:13px;font-weight:600;line-height:1.2;}
+    .ldp-obsidian-dialog button:disabled{cursor:wait;opacity:.62;}
+    .ldp-obsidian-primary{color:#fff;background:#2f855a;}
+    .ldp-obsidian-primary:hover{background:#26734d;}
+    .ldp-obsidian-secondary,.ldp-obsidian-test{color:var(--primary,#1f2937);
+      background:var(--primary-low,#e9eaec);}
+    .ldp-obsidian-test{margin-top:10px;}
+    .ldp-obsidian-toast{position:fixed;right:20px;bottom:20px;z-index:2147483641;
+      max-width:min(460px,calc(100vw - 40px));padding:11px 14px;border-radius:9px;
+      color:#fff;background:#24262d;box-shadow:0 10px 32px rgba(0,0,0,.28);
+      font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+    .ldp-obsidian-toast[data-type="success"]{background:#166534;}
+    .ldp-obsidian-toast[data-type="error"]{background:#b42318;}
+    @media (prefers-reduced-motion:reduce){
+      .ldp-obsidian-save,.ldp-obsidian-copy,.ldp-obsidian-settings{transition:none;}
+    }
+    .ldp-shell{flex:1;min-width:0;min-height:0;position:relative;display:flex;overflow:hidden;}
+    .ldp-body{flex:1;min-width:0;min-height:0;position:relative;
+      padding:8px 20px 20px;overflow-y:auto;overscroll-behavior:contain;
+      scrollbar-width:none;overflow-anchor:none;}
+    .ldp-body::-webkit-scrollbar{width:0;height:0;}
 
-    /* 楼层滑动跳转条（仿 L 站原生） */
-    .ldp-slider{position:absolute;top:0;right:0;bottom:0;width:22px;z-index:8;
-      display:flex;flex-direction:column;align-items:center;}
-    .ldp-slider[hidden]{display:none;}
-    .ldp-slider-track{position:absolute;top:8px;bottom:8px;left:50%;
-      width:4px;transform:translateX(-50%);border-radius:2px;
-      background:var(--primary-low,#ddd);}
-    .ldp-slider-thumb{position:absolute;left:50%;width:auto;min-width:18px;
-      height:18px;padding:0 5px;border-radius:9px;background:var(--tertiary,#08c);
-      transform:translate(-50%,-50%);cursor:grab;pointer-events:auto;
-      box-shadow:0 1px 4px rgba(0,0,0,.3);transition:transform .1s;
-      border:2px solid var(--secondary,#fff);color:#fff;font-size:10px;font-weight:700;
-      line-height:18px;text-align:center;white-space:nowrap;user-select:none;}
-    .ldp-slider-thumb:active{cursor:grabbing;transform:translate(-50%,-50%) scale(1.1);}
-    .ldp-slider-tip{position:absolute;right:28px;background:var(--primary,#222);
-      color:var(--secondary,#fff);font-size:12px;font-weight:600;padding:3px 8px;
-      border-radius:4px;white-space:nowrap;transform:translateY(-50%);opacity:0;
-      transition:opacity .15s;pointer-events:none;}
-    .ldp-slider-tip.show{opacity:1;}
-    .ldp-slider-tip::after{content:"";position:absolute;right:-5px;top:50%;
-      transform:translateY(-50%);border:4px solid transparent;
-      border-left-color:var(--primary,#222);}
-
-    /* 底部悬浮操作栏 */
-    .ldp-footer{flex:none;display:flex;align-items:center;justify-content:space-around;
-      padding:12px 24px;border-top:1px solid var(--primary-low,#eee);
-      background:var(--secondary,#fff);}
-    .ldp-fbtn{background:transparent;border:none;cursor:pointer;display:flex;
-      align-items:center;gap:8px;font-size:.95rem;color:var(--primary-medium,#666);
-      padding:8px 16px;border-radius:6px;transition:all .2s ease;font-weight:600;
-      white-space:nowrap;text-decoration:none;}
-    .ldp-fbtn:hover{background:var(--primary-low,#f0f0f0);color:var(--tertiary,#3b82f6);}
-    .ldp-fbtn svg{width:18px;height:18px;fill:currentColor;flex:none;}
-    .ldp-fbtn:disabled{cursor:default;opacity:.5;pointer-events:none;}
-    .ldp-fbtn.loading{opacity:.6;pointer-events:none;}
-    .ldp-fbtn.liked{color:#e74c3c;}
-    .ldp-fbtn.liked svg{fill:#e74c3c;}
-    .ldp-fbtn.bookmarked{color:var(--tertiary,#3b82f6);}
-    .ldp-fbtn.bookmarked svg{fill:var(--tertiary,#3b82f6);}
+    /* 右侧时间轴 */
+    .ldp-timeline{flex:0 0 96px;display:flex;flex-direction:column;align-items:center;
+      gap:8px;padding:12px 10px;
+      background:var(--secondary,#fff);color:var(--primary-medium,#666);}
+    .ldp-tl-date,.ldp-tl-current{border:none;
+      background:transparent;color:inherit;font:inherit;}
+    .ldp-tl-date{cursor:pointer;}
+    .ldp-tl-date{width:100%;min-height:36px;padding:4px 2px;border-radius:6px;
+      font-size:13px;line-height:1.25;text-align:center;}
+    .ldp-tl-date:hover{
+      background:var(--primary-low,#f0f0f0);color:var(--tertiary,#08c);}
+    .ldp-tl-current{width:100%;min-height:58px;padding:5px 2px;border-radius:6px;
+      line-height:1.25;text-align:center;}
+    .ldp-tl-current strong{display:block;font-size:17px;color:var(--primary,#222);}
+    .ldp-tl-current span{display:block;margin-top:3px;font-size:12px;opacity:.7;}
+    .ldp-tl-track{position:relative;flex:1;width:44px;min-height:130px;border:none;
+      padding:0;background:transparent;cursor:pointer;}
+    .ldp-tl-track::before{content:"";position:absolute;top:8px;bottom:8px;left:50%;
+      width:2px;transform:translateX(-50%);background:var(--primary-low,#e6e6e6);}
+    .ldp-tl-fill{position:absolute;top:8px;bottom:8px;left:50%;width:3px;
+      transform:translateX(-50%) scaleY(0);transform-origin:center top;
+      will-change:transform;border-radius:999px;background:var(--tertiary,#08c);}
+    .ldp-tl-thumb{position:absolute;left:50%;top:8px;width:14px;height:14px;
+      transform:translate(-50%,-50%) translateY(0);will-change:transform;
+      border-radius:50%;background:var(--tertiary,#08c);
+      box-shadow:0 0 0 4px rgba(8,132,255,.14);}
+    .ldp-tl-loading .ldp-tl-date,.ldp-tl-loading .ldp-tl-track{opacity:.6;cursor:progress;}
+    .ldp-tl-date:focus-visible,.ldp-tl-track:focus-visible{
+      outline:2px solid var(--tertiary,#08c);outline-offset:2px;}
+    @media (max-width: 760px){
+      .ldp-modal{width:96%;height:92vh;}
+      .ldp-header{padding-left:16px;padding-right:16px;}
+      .ldp-obsidian-label{display:none;}
+      .ldp-obsidian-save{width:32px;padding:0;}
+      .ldp-obsidian-page-actions{margin-top:6px;}
+      .ldp-obsidian-dialog-overlay{padding:10px;}
+      .ldp-obsidian-dialog{max-height:calc(100vh - 20px);padding:18px;}
+      .ldp-body{padding-right:76px;}
+      .ldp-timeline{position:absolute;right:8px;top:8px;bottom:8px;z-index:4;
+        width:58px;flex-basis:auto;padding:8px 6px;border:1px solid var(--primary-low,#eee);
+        border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.14);}
+      .ldp-tl-date{font-size:11px;}
+      .ldp-tl-current strong{font-size:13px;}
+      .ldp-tl-current span{display:none;}
+    }
+    @media (max-width: 420px){
+      .ldp-header{gap:6px;}
+      .ldp-title-lockup{gap:7px;}
+      .ldp-title{font-size:16px;}
+    }
 
     /* 楼主帖自身的点赞/回复按钮已挪到底部操作栏，这里隐藏原位置 */
     .ldp-topic > .ldp-post > .ldp-actions{display:none;}
@@ -119,8 +227,8 @@
     .ldp-sk-head{display:flex;align-items:center;gap:10px;margin:12px 0 10px;}
     .ldp-sk-avatar{width:32px;height:32px;border-radius:50%;flex:none;}
     .ldp-sk-line{height:12px;}
-    .ldp-sk-w30{width:30%;}.ldp-sk-w40{width:40%;}.ldp-sk-w60{width:60%;}
-    .ldp-sk-w80{width:80%;}.ldp-sk-w90{width:90%;}.ldp-sk-w100{width:100%;}
+    .ldp-sk-w30{width:30%;} .ldp-sk-w40{width:40%;} .ldp-sk-w60{width:60%;}
+    .ldp-sk-w80{width:80%;} .ldp-sk-w90{width:90%;} .ldp-sk-w100{width:100%;}
     .ldp-sk-para .ldp-sk-line{margin-bottom:8px;}
     .ldp-sk-divider{height:1px;background:var(--primary-low,#e0e0e0);margin:16px 0 12px;}
     .ldp-sk-comment{display:flex;gap:10px;margin-bottom:18px;}
@@ -131,7 +239,7 @@
     .ldp-topic{padding:4px 0 14px;}
     .ldp-topic .ldp-post{border-bottom:none;}
 
-    /* 评论区分隔 + 左上角"评论"标题 */
+    /* 评论区分隔 + 左上角“评论”标题 */
     .ldp-comments-header{display:flex;align-items:center;gap:8px;
       margin:6px 0 2px;padding-top:14px;border-top:2px solid var(--primary-low,#e0e0e0);
       font-size:16px;font-weight:700;letter-spacing:.5px;}
@@ -141,115 +249,395 @@
     .ldp-comments-empty{padding:18px 0;text-align:center;opacity:.5;font-size:13px;}
 
     .ldp-post{padding:12px 0 12px 12px;border-bottom:1px solid var(--primary-low,#eee);}
+    .ldp-topic > .ldp-post,.ldp-comments > .ldp-post{
+      content-visibility:auto;contain-intrinsic-size:auto 180px;}
     .ldp-post.ldp-flash{animation:ldp-flash-bg 1.6s ease;}
     @keyframes ldp-flash-bg{
       0%{background:rgba(8,132,255,.16);}
       100%{background:transparent;}
     }
     .ldp-post-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
-    .ldp-avatar{width:28px;height:28px;border-radius:50%;}
-    .ldp-user-link{display:inline-flex;align-items:center;gap:8px;color:inherit;
-      text-decoration:none;min-width:0;}
-    .ldp-user-link:hover{color:var(--tertiary,#08c);}
-    .ldp-overlay a.ldp-user-link:visited{color:inherit;}
-    .ldp-overlay a.ldp-user-link:visited:hover{color:var(--tertiary,#08c);}
-    .ldp-user-link .ldp-avatar{transition:opacity .15s,transform .15s;}
-    .ldp-user-link:hover .ldp-avatar{opacity:.82;transform:scale(1.05);}
-
-    /* 用户资料卡 */
-    .ldp-uc{position:fixed;z-index:2147483500;box-sizing:border-box;
-      width:360px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);
-      overflow:auto;background:var(--secondary,#fff);color:var(--primary,#222);
-      border:1px solid var(--primary-low,#ddd);
-      border-radius:var(--d-border-radius-large,12px);
-      box-shadow:var(--shadow-dropdown,0 8px 30px rgba(0,0,0,.22));
-      font-size:14px;line-height:1.5;text-align:left;
-      animation:ldp-uc-in .14s ease;}
-    .ldp-uc:focus{outline:none;}
-    .ldp-uc [hidden]{display:none!important;}
-    @keyframes ldp-uc-in{
-      from{opacity:0;transform:translateY(-4px);}
-      to{opacity:1;transform:none;}
-    }
-    @media (prefers-reduced-motion:reduce){.ldp-uc{animation:none;}}
-    .ldp-uc-head{display:flex;align-items:flex-start;gap:14px;padding:16px 16px 12px;}
-    .ldp-uc-avatar{width:72px;height:72px;border-radius:50%;flex:none;
-      object-fit:cover;background:var(--primary-very-low,#f2f2f2);}
-    .ldp-uc-names{flex:1;min-width:0;padding-top:3px;}
-    .ldp-uc-name{display:block;overflow:hidden;text-overflow:ellipsis;
-      white-space:nowrap;color:var(--primary,#222);font-size:18px;
-      font-weight:700;line-height:1.3;text-decoration:none;}
-    .ldp-uc-name:hover{color:var(--tertiary,#08c);}
-    .ldp-overlay a.ldp-uc-name:visited{color:var(--primary,#222);}
-    .ldp-overlay a.ldp-uc-name:visited:hover{color:var(--tertiary,#08c);}
-    .ldp-uc-username{display:block;overflow:hidden;text-overflow:ellipsis;
-      white-space:nowrap;color:var(--primary-medium,#777);font-size:13px;}
-    .ldp-uc-tags{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px;}
-    .ldp-uc-level{flex:none;padding:1px 6px;border-radius:4px;
-      background:var(--tertiary,#08c);color:#fff;font-size:11px;font-weight:700;}
-    .ldp-uc-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-      color:var(--primary-medium,#777);font-size:12px;}
-    .ldp-uc-section{padding:0 16px 12px;}
-    .ldp-uc-bio{overflow-wrap:anywhere;color:var(--primary-high,#444);font-size:13px;}
-    .ldp-uc-bio p:first-child{margin-top:0;}
-    .ldp-uc-bio p:last-child{margin-bottom:0;}
-    .ldp-uc-bio img{max-width:100%;height:auto;}
-    .ldp-uc-bio a{color:var(--tertiary,#08c);text-decoration:none;}
-    .ldp-uc-bio a:hover{text-decoration:underline;}
-    .ldp-uc-meta{display:flex;flex-wrap:wrap;gap:4px 12px;overflow-wrap:anywhere;
-      color:var(--primary-medium,#777);font-size:12px;}
-    .ldp-uc-meta a{color:var(--tertiary,#08c);text-decoration:none;}
-    .ldp-uc-meta a:hover{text-decoration:underline;}
-    .ldp-uc-stats{display:flex;gap:8px;margin:0 16px 12px;padding:9px 0;
-      border-top:1px solid var(--primary-low,#eee);
-      border-bottom:1px solid var(--primary-low,#eee);}
-    .ldp-uc-stat{flex:1;min-width:0;text-align:center;}
-    .ldp-uc-stat b{display:block;overflow:hidden;text-overflow:ellipsis;
-      white-space:nowrap;color:var(--primary,#222);font-size:13px;}
-    .ldp-uc-stat span{display:block;color:var(--primary-medium,#888);font-size:11px;}
-    .ldp-uc-badges{display:flex;flex-wrap:wrap;gap:6px;}
-    .ldp-uc-badge{display:inline-flex;align-items:center;gap:5px;max-width:100%;
-      padding:3px 8px 3px 4px;border:1px solid var(--primary-low,#e3e3e3);
-      border-radius:999px;background:var(--primary-very-low,#f2f2f2);
-      color:var(--primary,#222);font-size:11px;line-height:1.4;}
-    .ldp-uc-badge img{width:16px;height:16px;object-fit:contain;flex:none;}
-    .ldp-uc-badge span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-    .ldp-uc-loading,.ldp-uc-error{padding:0 16px 12px;font-size:12px;}
-    .ldp-uc-loading{color:var(--primary-medium,#888);}
-    .ldp-uc-error{color:var(--danger,#cc4b4b);}
-    .ldp-uc-footer{display:flex;align-items:center;gap:8px;padding:0 16px 14px;}
-    .ldp-uc-follow{display:inline-flex;align-items:center;justify-content:center;
-      margin-right:auto;padding:5px 13px;border:1px solid var(--primary-low,#ccc);
-      border-radius:6px;background:var(--secondary,#fff);color:var(--primary-high,#444);
-      font:inherit;font-size:13px;font-weight:600;line-height:1.4;cursor:pointer;}
-    .ldp-uc-follow:hover{background:var(--primary-very-low,#f2f2f2);}
-    .ldp-uc-follow:disabled{cursor:default;opacity:.55;}
-    .ldp-uc-follow-error{flex:1;min-width:0;color:var(--danger,#cc4b4b);
-      font-size:12px;line-height:1.4;text-align:right;overflow-wrap:anywhere;}
-    .ldp-uc-profile{display:inline-flex;align-items:center;justify-content:center;
-      padding:6px 14px;border:1px solid var(--tertiary,#08c);border-radius:6px;
-      background:var(--tertiary,#08c);color:#fff;font-size:13px;
-      font-weight:600;text-decoration:none;}
-    .ldp-uc-profile:hover{filter:brightness(1.06);}
-    .ldp-overlay a.ldp-uc-profile:visited{color:#fff;}
-    .ldp-overlay a.ldp-uc-profile:visited:hover{color:#fff;}
-
-    .ldp-boost-avatar-link{display:inline-flex;align-items:center;flex:none;
-      border-radius:50%;line-height:0;}
-    .ldp-boost-avatar-link:hover .ldp-b-avatar{opacity:.82;transform:scale(1.08);}
-    .ldp-b-avatar{transition:opacity .15s,transform .15s;}
+    .ldp-avatar-btn{flex:none;width:28px;height:28px;padding:0;border:none;border-radius:50%;
+      background:transparent;color:inherit;cursor:pointer;position:relative;}
+    .ldp-avatar{width:28px;height:28px;border-radius:50%;display:block;}
+    .ldp-avatar-btn:hover .ldp-avatar{box-shadow:0 0 0 3px rgba(8,132,255,.18);}
+    .ldp-avatar-btn:focus-visible{outline:2px solid var(--tertiary,#08c);outline-offset:2px;}
+    .ldp-user-card{position:fixed;z-index:2147483300;width:min(390px,calc(100vw - 24px));
+      max-height:calc(100vh - 24px);overflow-y:auto;overscroll-behavior:contain;
+      border:1px solid var(--primary-low,#e5e5e5);border-radius:10px;
+      background:var(--secondary,#fff);color:var(--primary,#222);
+      box-shadow:0 18px 50px rgba(0,0,0,.24);font-size:14px;line-height:1.45;}
+    .ldp-user-card-cover{height:82px;background:
+      linear-gradient(135deg,rgba(8,132,255,.18),rgba(128,128,128,.08));background-size:cover;background-position:center;}
+    .ldp-user-card-body{padding:0 14px 14px;}
+    .ldp-user-card-main{display:flex;gap:12px;align-items:flex-end;margin-top:-34px;}
+    .ldp-user-card-avatar{width:76px;height:76px;padding:0;border:3px solid var(--secondary,#fff);
+      border-radius:50%;background:var(--secondary,#fff);cursor:pointer;flex:none;}
+    .ldp-user-card-avatar img{width:100%;height:100%;display:block;border-radius:50%;}
+    .ldp-user-card-avatar:hover{box-shadow:0 0 0 4px rgba(8,132,255,.18);}
+    .ldp-user-card-avatar:focus-visible{outline:2px solid var(--tertiary,#08c);outline-offset:2px;}
+    .ldp-user-card-name{min-width:0;padding-bottom:4px;}
+    .ldp-user-card-name strong{display:block;font-size:22px;line-height:1.1;}
+    .ldp-user-card-name span{display:block;opacity:.68;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+    .ldp-user-card-name .ldp-user-level{display:inline-flex;max-width:100%;margin-top:7px;
+      padding:3px 8px;border:1px solid var(--primary-low,#dfe3e8);border-radius:999px;
+      color:var(--primary-high,#374151);background:var(--primary-very-low,#f6f7f8);
+      font-size:11px;font-weight:700;line-height:1.25;letter-spacing:.01em;opacity:1;}
+    .ldp-user-card-loading,.ldp-user-card-error{padding:16px;opacity:.72;}
+    .ldp-user-card-bio{margin:12px 0 0;color:var(--primary,#222);}
+    .ldp-user-card-meta{display:grid;gap:5px;margin:12px 0 0;font-size:13px;opacity:.82;}
+    .ldp-user-card-meta a{color:var(--tertiary,#08c);text-decoration:none;}
+    .ldp-user-card-meta a:hover{text-decoration:underline;}
+    .ldp-user-card-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;}
+    .ldp-user-card-stat{padding:8px;border-radius:8px;background:var(--primary-very-low,#f6f6f6);text-align:center;}
+    .ldp-user-card-stat strong{display:block;font-size:16px;line-height:1.2;}
+    .ldp-user-card-stat span{display:block;margin-top:2px;font-size:12px;opacity:.65;}
     .ldp-author{font-weight:600;}
     .ldp-op{font-size:11px;font-weight:700;color:#fff;background:var(--tertiary,#08c);
       border-radius:4px;padding:1px 6px;letter-spacing:.5px;}
     .ldp-me{font-size:11px;font-weight:700;color:#fff;background:#3ea66b;
       border-radius:4px;padding:1px 6px;letter-spacing:.5px;}
     .ldp-user{font-size:12px;opacity:.6;}
-    .ldp-level{font-size:11px;opacity:.5;}
     .ldp-time{font-size:12px;opacity:.55;}
     .ldp-floor{font-size:12px;opacity:.5;margin-left:auto;
       padding-left:8px;white-space:nowrap;}
+    .ldp-unread-dot{display:inline-block;visibility:hidden;flex:none;width:8px;height:8px;border-radius:50%;
+      background:#55c7f7;box-shadow:0 0 0 3px rgba(85,199,247,.18);
+      margin-left:2px;}
+    .ldp-post.ldp-unread > .ldp-post-head .ldp-unread-dot{visibility:visible;}
     .ldp-content img{max-width:100%;height:auto;cursor:zoom-in;border-radius:4px;}
+    .ldp-content pre{overflow:auto;background:var(--primary-very-low,#f6f6f6);
+      padding:10px;border-radius:6px;}
+
+    /* Base64 解码 */
+    .ldp-base64-selection-menu{position:fixed;z-index:2147483550;display:block;
+      padding:4px;border:1px solid var(--primary-low,#ddd);border-radius:7px;
+      background:var(--secondary,#fff);color:var(--primary,#222);
+      box-shadow:0 8px 24px rgba(0,0,0,.2);}
+    .ldp-base64-selection-menu[hidden]{display:none;}
+    .ldp-base64-selection-menu button{display:flex;align-items:center;gap:6px;
+      min-height:32px;padding:5px 10px;border:none;border-radius:5px;cursor:pointer;
+      background:transparent;color:inherit;font:inherit;font-size:13px;white-space:nowrap;}
+    .ldp-base64-selection-menu button:hover{background:var(--primary-low,#eee);}
+    .ldp-base64-result{position:relative;margin:8px 0;min-height:42px;
+      overflow:hidden;border:none;border-radius:4px;
+      background:var(--primary-very-low,#f6f6f6);color:var(--primary,#222);}
+    .ldp-base64-result pre{box-sizing:border-box;max-height:420px;min-height:42px;
+      margin:0;padding:11px 78px 11px 14px;overflow:auto;border:none;
+      border-radius:inherit;background:transparent;color:inherit;
+      font-size:13px;line-height:20px;white-space:pre-wrap;overflow-wrap:anywhere;}
+    .ldp-base64-result code{font-family:ui-monospace,SFMono-Regular,Consolas,
+      "Liberation Mono",monospace;}
+    .ldp-base64-toolbar{position:absolute;top:50%;right:7px;z-index:1;
+      display:flex;gap:2px;transform:translateY(-50%);}
+    .ldp-base64-toolbar button{display:grid;min-width:28px;width:28px;height:28px;
+      place-items:center;padding:5px;border:none;border-radius:4px;cursor:pointer;
+      background:transparent;color:var(--primary-medium,#777);
+      font:inherit;font-size:18px;line-height:1;box-shadow:none;}
+    .ldp-base64-toolbar button:hover{color:var(--primary,#222);
+      background:var(--primary-low,#e9e9e9);}
+    .ldp-base64-toolbar button:focus-visible{outline:2px solid var(--tertiary,#08c);
+      outline-offset:1px;}
+    .ldp-base64-toolbar button:disabled{cursor:default;opacity:.65;}
+    .ldp-base64-toolbar button.ldp-base64-copy.copied{width:auto;padding-inline:7px;
+      font-size:12px;white-space:nowrap;}
+    .ldp-base64-toolbar svg{display:block;width:16px;height:16px;fill:currentColor;}
+
+    /* 弹窗正文代码块工具栏（原站会运行组件补按钮，弹窗需自行补齐） */
+    .ldp-codeblock-host{position:relative;}
+    .ldp-codeblock-host > pre{padding-right:48px;}
+    .ldp-codeblock-toolbar{position:absolute;top:6px;right:10px;z-index:2;
+      display:flex;gap:2px;}
+    .ldp-codeblock-toolbar button{display:grid;width:28px;height:28px;place-items:center;
+      padding:5px;border:none;border-radius:4px;cursor:pointer;box-shadow:none;
+      background:transparent;color:var(--primary-medium,#888);}
+    .ldp-codeblock-toolbar button:hover{background:var(--primary-low,#e8e8e8);
+      color:var(--primary,#222);}
+    .ldp-codeblock-toolbar button:focus-visible{outline:2px solid var(--tertiary,#08c);
+      outline-offset:1px;}
+    .ldp-codeblock-toolbar button:disabled{cursor:default;opacity:.65;}
+    .ldp-codeblock-toolbar svg{display:block;width:16px;height:16px;fill:currentColor;}
+    .ldp-children{margin-left:22px;
+      border-left:1px solid var(--tertiary,#08c);}
+    .ldp-actions{display:flex;gap:14px;margin-top:8px;font-size:12px;align-items:center;}
+    .ldp-btn{cursor:pointer;border:none;background:transparent;color:inherit;
+      opacity:.7;display:inline-flex;align-items:center;gap:4px;padding:2px 4px;}
+    .ldp-btn:hover{opacity:1;}
+    .ldp-btn:disabled{cursor:default;opacity:.4;}
+    .ldp-like.liked{color:var(--love,#e25822);opacity:1;font-weight:600;}
+    
+    .ldp-replybox{margin-top:8px;display:none;position:relative;}
+    .ldp-replybox.open{display:block;}
+    .ldp-replybox textarea{width:100%;min-height:90px;box-sizing:border-box;
+      border:1px solid var(--primary-low,#ccc);border-radius:6px;padding:8px;
+      font:inherit;background:var(--secondary,#fff);color:inherit;resize:vertical;}
+    .ldp-replybox textarea.uploading{opacity:0.6;pointer-events:none;}
+    .ldp-send{margin-top:6px;background:var(--tertiary,#08c);color:#fff;border:none;
+      border-radius:6px;padding:6px 14px;cursor:pointer;}
+    .ldp-reply-tip{margin-left:10px;font-size:12px;color:#3ea66b;opacity:0;
+      transition:opacity .25s ease;}
+    .ldp-reply-tip.show{opacity:1;}
+    
+    .ldp-loading-tip{padding:14px 0;text-align:center;font-size:13px;
+      color:var(--primary-medium,#888);display:none;user-select:none;}
+    .ldp-loading-tip.show{display:block;}
+    .ldp-loading-tip .ldp-tip-icon{display:inline-block;margin-right:6px;
+      animation:ldp-spin .9s linear infinite;}
+    @keyframes ldp-spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+
+    .ldp-load-up-tip,.ldp-load-down-tip{display:none;padding:9px 0;text-align:center;
+      font-size:12px;color:var(--primary-medium,#888);user-select:none;}
+    .ldp-load-up-tip.show,.ldp-load-down-tip.show{display:block;}
+    .ldp-load-up-tip .ldp-tip-icon,.ldp-load-down-tip .ldp-tip-icon{
+      display:inline-block;margin-right:5px;animation:ldp-spin .9s linear infinite;}
+    .ldp-top-tip{padding:10px 0;text-align:center;font-size:12px;
+      color:var(--primary-medium,#888);user-select:none;}
+
+    .ldp-bottom-tip{padding:16px 0;text-align:center;font-size:13px;
+      color:var(--primary-medium,#888);user-select:none;}
+
+    /* 灯箱 */
+    .ldp-lightbox{position:fixed;inset:0;z-index:2147483600;display:flex;
+      flex-direction:column;background:rgba(0,0,0,.9);}
+    .ldp-lb-stage{flex:1;overflow:auto;display:flex;align-items:center;
+      justify-content:center;padding:20px;}
+    .ldp-lb-stage img{display:block;max-width:94vw;max-height:88vh;
+      width:auto;height:auto;border-radius:4px;cursor:zoom-out;
+      box-shadow:0 10px 40px rgba(0,0,0,.6);}
+    .ldp-lb-x{position:fixed;top:12px;right:12px;z-index:1;display:grid;
+      width:44px;height:44px;place-items:center;cursor:pointer;
+      border:1px solid rgba(255,255,255,.45);border-radius:4px;
+      background:rgba(0,0,0,.35);color:#fff;font-size:30px;line-height:1;}
+    .ldp-lb-x:hover{background:rgba(255,255,255,.14);}
+    .ldp-lb-x:focus-visible{outline:3px solid #fff;outline-offset:2px;}
+
+    /* 原帖式直属回复折叠 */
+    .ldp-reply-toggle{margin-left:6px;padding:4px 7px;font-size:15px;line-height:1.2;
+      color:var(--primary-medium,#6f7772);font-weight:600;opacity:.88;border-radius:6px;gap:8px;}
+    .ldp-reply-toggle::after{content:"";width:6px;height:6px;flex:none;
+      border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
+      transform:rotate(45deg) translate(-1px,-1px);transition:transform .18s ease;}
+    .ldp-reply-toggle:hover{color:#28724d;background:rgba(62,139,94,.08);opacity:1;}
+    .ldp-reply-toggle[aria-expanded="true"]{color:#28724d;background:rgba(62,139,94,.08);opacity:1;}
+    .ldp-reply-toggle[aria-expanded="true"]::after{transform:rotate(225deg) translate(-1px,-1px);}
+    .ldp-reply-toggle:focus-visible{outline:2px solid #4f9d70;outline-offset:2px;}
+    @media (prefers-reduced-motion:reduce){.ldp-reply-toggle::after{transition:none;}}
+    .ldp-reply-toggle.is-error{color:var(--danger,#c44);}
+
+    /* ============ Boost样式（仿官方 discourse-boosts 插件，独立实现） ============ */
+    /* 气泡列表 */
+    .ldp-boosts-list{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:6px;min-height:0;}
+    /* 单个气泡：胶囊形，与官方 bubble 对齐 */
+    .ldp-boost-bubble{display:inline-flex;align-items:center;gap:4px;
+      padding:3px 8px 3px 4px;border:none;
+      background:rgba(128,128,128,.1);border-radius:50px;
+      font-size:14px;line-height:1.4;cursor:default;position:relative;
+      transition:background .15s;}
+    .ldp-boost-bubble:hover{background:rgba(128,128,128,.18);}
+    /* 气泡内头像 */
+    .ldp-b-avatar{width:18px;height:18px;border-radius:50%;flex:none;display:block;}
+    /* 气泡内文字/表情段落 */
+    .ldp-boost-bubble p{margin:0;display:inline-flex;gap:2px;align-items:center;flex-wrap:wrap;}
+    .ldp-boost-bubble p img.emoji{width:14px;height:14px;margin:0;vertical-align:middle;}
+    /* 删除按钮：hover 气泡时才显示 */
+    .ldp-boost-del{cursor:pointer;margin-left:2px;opacity:0;font-size:13px;
+      color:var(--danger,#cc4b4b);line-height:1;border:none;background:transparent;
+      padding:0 2px;transition:opacity .15s;flex:none;}
+    .ldp-boost-bubble:hover .ldp-boost-del{opacity:.65;}
+    .ldp-boost-del:hover{opacity:1!important;}
+    /* 发射输入框容器：默认隐藏，.open 时展开 */
+    .ldp-boost-input-wrap{display:none;align-items:center;gap:5px;margin-top:6px;
+      padding:4px 6px;border-radius:8px;
+      border:1px solid var(--primary-low,#ddd);
+      background:var(--secondary,#fff);}
+    .ldp-boost-input-wrap.open{display:flex;}
+    /* 输入框本身 */
+    .ldp-boost-input{flex:1;border:none;background:transparent;outline:none;
+      font-size:13px;padding:2px 4px;color:inherit;min-width:0;}
+    .ldp-boost-input::placeholder{color:var(--primary-medium,#999);font-size:12px;}
+    /* 发射确认按钮（绿色圆形） */
+    .ldp-boost-submit{width:22px;height:22px;padding:0;display:flex;flex:none;
+      align-items:center;justify-content:center;border-radius:50%;
+      border:1px solid #3ea66b;background:transparent;color:#3ea66b;
+      cursor:pointer;font-size:14px;line-height:1;transition:all .15s;}
+    .ldp-boost-submit:hover{background:#3ea66b;color:#fff;}
+    .ldp-boost-submit:disabled{opacity:.5;cursor:default;pointer-events:none;}
+    /* 取消按钮（红色圆形） */
+    .ldp-boost-cancel{width:22px;height:22px;padding:0;display:flex;flex:none;
+      align-items:center;justify-content:center;border-radius:50%;
+      border:1px solid var(--danger,#cc4b4b);background:transparent;
+      color:var(--danger,#cc4b4b);cursor:pointer;font-size:16px;line-height:1;
+      transition:all .15s;}
+    .ldp-boost-cancel:hover{background:var(--danger,#cc4b4b);color:#fff;}
+    /* 操作栏里的火箭按钮 */
+    .ldp-btn.ldp-boost-btn{font-size:12px;}
+    .ldp-btn.ldp-boost-btn:disabled{opacity:.35;cursor:default;pointer-events:none;}
+
+    /* 2.0 阅读器：安静的论坛工作台，绿色只表达阅读关系和当前状态 */
+    .ldp-overlay.ldp-v2{padding:4vh 3vw;box-sizing:border-box;background:rgba(18,22,20,.58);backdrop-filter:blur(2px);}
+    .ldp-v2 .ldp-modal{position:relative;width:min(1080px,94vw);max-width:none;height:86vh;
+      border:1px solid var(--primary-low,#dfe4e1);border-radius:8px;background:var(--secondary,#fff);
+      box-shadow:0 24px 70px rgba(15,23,18,.32);}
+    .ldp-v2 .ldp-header{display:block;flex:none;padding:12px 16px 10px;background:var(--secondary,#fff);}
+    .ldp-v2 .ldp-header-line{display:flex;align-items:flex-start;gap:11px;min-width:0;}
+    .ldp-v2 .ldp-header-close{flex:none;margin-left:auto;}
+    .ldp-site-mark{width:34px;height:34px;flex:none;border-radius:7px;object-fit:cover;background:#1f8f58;}
+    .ldp-v2 .ldp-title-lockup{align-items:center;gap:8px;}
+    .ldp-v2 .ldp-title{font-size:17px;line-height:1.35;letter-spacing:0;}
+    .ldp-v2 .ldp-meta{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-top:3px;color:var(--primary-medium,#66706a);opacity:1;}
+    .ldp-topic-taxonomy{display:flex;gap:5px;flex-wrap:wrap;}
+    .ldp-topic-chip{display:inline-flex;align-items:center;min-height:20px;padding:1px 6px;border:1px solid var(--primary-low,#dfe4e1);
+      border-radius:4px;background:var(--primary-very-low,#f5f7f6);font-size:11px;line-height:1.3;color:var(--primary-medium,#5f6963);}
+    .ldp-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px;padding-top:8px;
+      border-top:1px solid var(--primary-low,#e5e9e7);}
+    .ldp-toolbar-group{display:flex;align-items:center;gap:5px;min-width:0;}
+    .ldp-toolbtn,.ldp-v2 .ldp-close,.ldp-v2 .ldp-obsidian-save,.ldp-v2 .ldp-obsidian-copy,.ldp-v2 .ldp-obsidian-settings{
+      display:inline-grid;place-items:center;box-sizing:border-box;width:32px;height:32px;padding:0;border:1px solid var(--primary-low,#dce2df);
+      border-radius:6px;color:var(--primary-medium,#5d6862);background:var(--primary-very-low,#f5f7f6);cursor:pointer;text-decoration:none;}
+    .ldp-toolbtn:hover,.ldp-v2 .ldp-close:hover,.ldp-v2 .ldp-obsidian-save:hover,.ldp-v2 .ldp-obsidian-copy:hover,
+    .ldp-v2 .ldp-obsidian-settings:hover{border-color:#85aa96;color:#176c43;background:#edf6f1;}
+    .ldp-toolbtn.active{border-color:#5f9f7d;color:#176c43;background:#e4f2ea;}
+    .ldp-collections-tool:hover,.ldp-collections-tool.active{border-color:#55998d;color:#12665a;background:#e5f3f0;}
+    .ldp-toolbtn svg,.ldp-v2 .ldp-close svg{width:16px;height:16px;fill:currentColor;}
+    .ldp-tool-separator{width:1px;height:22px;margin:0 2px;background:var(--primary-low,#dfe4e1);}
+    .ldp-v2 .ldp-head-btns{gap:5px;}
+    .ldp-v2 .ldp-settings-host{display:inline-flex;flex:none;}
+    .ldp-v2 .ldp-close{font-size:0;}
+    .ldp-v2 .ldp-shell{background:var(--secondary,#fff);}
+    .ldp-v2 .ldp-shell-host{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden;}
+    .ldp-v2 .ldp-shell-host > .ldp-shell{flex:1;width:100%;min-width:0;min-height:0;}
+    .ldp-v2 .ldp-footer{display:flex;flex:none;align-items:center;justify-content:space-around;padding:10px 22px;
+      border-top:1px solid var(--primary-low,#e2e6e4);background:var(--secondary,#fff);}
+    .ldp-v2 .ldp-footer[hidden]{display:none;}
+    .ldp-v2 .ldp-fbtn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-width:70px;padding:7px 14px;
+      border:0;border-radius:6px;color:var(--primary-medium,#66706a);background:transparent;cursor:pointer;text-decoration:none;
+      font:600 13px/1.25 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+    .ldp-v2 .ldp-fbtn:hover{color:var(--primary,#29312c);background:var(--primary-very-low,#f3f6f4);}
+    .ldp-v2 .ldp-fbtn:disabled{cursor:default;opacity:.42;}
+    .ldp-v2 .ldp-fbtn svg{width:18px;height:18px;fill:currentColor;flex:none;}
+    .ldp-v2 .ldp-fbtn.liked{color:#c64c3d;}
+    .ldp-v2 .ldp-fbtn.bookmarked{color:#9a641c;background:#fff4df;}
+    .ldp-v2 .ldp-body{padding:8px 22px 28px;scrollbar-width:thin;scrollbar-color:var(--primary-low-mid,#c6ccc9) transparent;}
+    .ldp-v2 .ldp-body::-webkit-scrollbar{width:7px;}
+    .ldp-v2 .ldp-body::-webkit-scrollbar-thumb{border-radius:7px;background:var(--primary-low-mid,#c6ccc9);}
+    .ldp-v2 .ldp-timeline{flex-basis:82px;border-left:1px solid var(--primary-low,#e6e9e7);padding-left:8px;padding-right:8px;}
+    .ldp-v2 .ldp-topic{padding:2px 0 8px;}
+    .ldp-v2 .ldp-topic > .ldp-post > .ldp-actions{display:none;}
+    .ldp-v2 .ldp-comments-header{position:sticky;top:0;z-index:3;margin:4px -2px 0;padding:10px 2px 7px;
+      border-top:1px solid var(--primary-low,#dfe4e1);background:var(--secondary,#fff);font-size:13px;}
+    .ldp-v2 .ldp-comments-header::before{content:"";width:3px;height:14px;border-radius:2px;background:#3d8d65;}
+    .ldp-virtual-spacer{width:1px;pointer-events:none;}
+    .ldp-virtual-window{min-height:1px;}
+    .ldp-missing-post{min-height:56px;border-bottom:1px solid var(--primary-low,#e5e7e6);opacity:.35;}
+    .ldp-v2 .ldp-post{padding:12px 10px 11px;border-bottom:1px solid var(--primary-low,#e4e8e6);background:transparent;}
+    .ldp-v2 .ldp-virtual-window > .ldp-post:nth-child(even){background:var(--primary-very-low,#f7f8f7);}
+    .ldp-v2 .ldp-post-head{margin-bottom:7px;}
+    .ldp-v2 .ldp-avatar,.ldp-v2 .ldp-avatar-btn{width:30px;height:30px;}
+    .ldp-v2 .ldp-author{font-size:13px;}
+    .ldp-v2 .ldp-content{font-size:15px;line-height:1.7;}
+    .ldp-v2 .ldp-actions{gap:3px;margin-top:7px;}
+    .ldp-v2 .ldp-btn{min-width:27px;min-height:27px;border-radius:5px;}
+    .ldp-post-bookmark.bookmarked{color:#a46015;background:#fff4df;}
+    .ldp-reaction-btn.reacted{color:#176c43;background:#e7f3ec;}
+    .ldp-reaction-count{margin-left:4px;font-size:11px;font-variant-numeric:tabular-nums;}
+    .ldp-reply-summary{position:relative;}
+    .ldp-reply-summary::before{content:"";position:absolute;left:3px;top:9px;bottom:9px;width:2px;border-radius:2px;background:#79aa90;}
+    .ldp-reply-summary:not(.expanded) > .ldp-content{max-height:5.1em;overflow:hidden;mask-image:linear-gradient(#000 65%,transparent);}
+    .ldp-thread-toggle{margin:0 0 5px 31px;padding:0;border:0;color:#28724d;background:transparent;cursor:pointer;font-size:11px;}
+    .ldp-children{display:none;margin:8px 0 0 31px;border-left:2px solid #74aa8c;}
+    .ldp-children.expanded{display:block;}
+    .ldp-embedded-reply{position:relative;padding:10px 12px;border-bottom:1px solid var(--primary-low,#e1e4e2);
+      background:color-mix(in srgb,var(--secondary,#fff) 93%,var(--primary,#222) 7%);}
+    .ldp-embedded-reply:last-child{border-bottom:0;}
+    .ldp-embedded-head{display:flex;align-items:center;gap:7px;margin-bottom:6px;font-size:12px;min-width:0;}
+    .ldp-embedded-reply .ldp-avatar{width:24px;height:24px;}
+    .ldp-embedded-reply .ldp-content{margin:0;font-size:13px;}
+    .ldp-embedded-jump{margin-left:auto;flex:none;color:var(--primary-medium,#777);font-size:11px;}
+    .ldp-embedded-jump:hover{color:var(--tertiary,#08c);opacity:1;}
+    .ldp-reaction-picker{display:none;align-items:center;gap:4px;width:max-content;margin:5px 0 0 38px;padding:5px;
+      border:1px solid var(--primary-low,#dfe4e1);border-radius:6px;background:var(--secondary,#fff);box-shadow:0 8px 24px rgba(24,35,28,.14);}
+    .ldp-reaction-picker.open{display:flex;}
+    .ldp-reaction-picker button{width:30px;height:28px;border:0;border-radius:4px;background:transparent;cursor:pointer;}
+    .ldp-reaction-picker button:hover,.ldp-reaction-picker button.selected{background:#e7f3ec;}
+    .ldp-reader-panel{position:absolute;z-index:20;right:16px;top:88px;width:min(420px,calc(100% - 32px));height:min(560px,calc(100% - 108px));
+      display:flex;flex-direction:column;border:1px solid var(--primary-low,#dce2df);border-radius:8px;background:var(--secondary,#fff);
+      box-shadow:0 18px 48px rgba(20,30,24,.24);overflow:hidden;}
+    .ldp-panel-head{display:flex;align-items:center;gap:8px;padding:10px 11px;border-bottom:1px solid var(--primary-low,#e3e7e5);}
+    .ldp-panel-head strong{flex:1;font-size:14px;}
+    .ldp-panel-close{width:28px;height:28px;border:0;background:transparent;color:inherit;font-size:20px;cursor:pointer;}
+    .ldp-panel-search{margin:9px 11px 6px;padding:8px 9px;border:1px solid var(--primary-low-mid,#cbd2ce);border-radius:6px;
+      color:inherit;background:var(--secondary,#fff);font:inherit;}
+    .ldp-panel-tabs{display:flex;gap:2px;padding:0 11px 7px;border-bottom:1px solid var(--primary-low,#e4e8e6);}
+    .ldp-panel-tab{flex:1;padding:7px;border:0;border-radius:5px;background:transparent;color:var(--primary-medium,#657069);cursor:pointer;}
+    .ldp-panel-tab.active{color:#176c43;background:#e9f4ee;font-weight:700;}
+    .ldp-panel-list{flex:1;overflow:auto;padding:4px 0;}
+    .ldp-panel-item{display:grid;grid-template-columns:34px minmax(0,1fr) 28px;gap:9px;align-items:center;padding:9px 11px;border-bottom:1px solid var(--primary-low,#edf0ee);}
+    .ldp-panel-item:hover{background:var(--primary-very-low,#f6f8f7);}
+    .ldp-panel-avatar{width:32px;height:32px;border-radius:50%;object-fit:cover;background:var(--primary-low,#e6e9e7);}
+    .ldp-panel-item-main{min-width:0;border:0;padding:0;text-align:left;color:inherit;background:transparent;cursor:pointer;}
+    .ldp-panel-item-title{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:650;}
+    .ldp-panel-item-meta{display:block;margin-top:2px;color:var(--primary-medium,#6b746f);font-size:11px;}
+    .ldp-panel-delete{width:28px;height:28px;border:0;border-radius:4px;color:var(--primary-medium,#6b746f);background:transparent;cursor:pointer;}
+    .ldp-panel-delete:hover{color:var(--danger,#b42318);background:var(--primary-very-low,#f4f5f4);}
+    .ldp-panel-empty,.ldp-panel-loading,.ldp-panel-error{padding:32px 18px;text-align:center;color:var(--primary-medium,#6b746f);font-size:13px;}
+    .ldp-panel-foot{display:flex;align-items:center;justify-content:space-between;padding:8px 11px;border-top:1px solid var(--primary-low,#e3e7e5);font-size:12px;}
+    .ldp-panel-foot button{padding:6px 8px;border:1px solid var(--primary-low,#dce2df);border-radius:5px;color:inherit;background:var(--primary-very-low,#f5f7f6);cursor:pointer;}
+    .ldp-page-collections-button svg{display:block;width:1.15em;height:1.15em;fill:currentColor;}
+    .ldp-page-collections-button[aria-expanded="true"]{color:var(--tertiary,#08c);background:var(--primary-low,#e7e9e8);}
+    .ldp-page-collection-host{position:fixed;inset:0;z-index:2147483500;pointer-events:none;}
+    .ldp-page-collection-host .ldp-reader-panel{position:fixed;z-index:1;pointer-events:auto;
+      width:min(420px,calc(100vw - 16px));height:min(560px,calc(100vh - 72px));}
+    .ldp-new-posts{position:absolute;z-index:8;top:12px;left:50%;transform:translateX(-50%);padding:7px 11px;border:1px solid #70a889;
+      border-radius:6px;color:#155e3b;background:#e9f5ee;box-shadow:0 6px 18px rgba(30,90,57,.15);cursor:pointer;font-size:12px;}
+    .ldp-user-card.ldp-user-card-v2{width:min(420px,calc(100vw - 24px));overflow:hidden;}
+    .ldp-user-card.ldp-user-card-v2.has-cover{width:min(720px,calc(100vw - 24px));}
+    .ldp-user-card-v2 .ldp-user-card-layout{display:grid;grid-template-columns:minmax(310px,1fr) minmax(250px,.9fr);min-height:330px;}
+    .ldp-user-card-v2 .ldp-user-card-layout.ldp-user-card-no-cover{display:block;min-height:0;}
+    .ldp-user-card-v2 .ldp-user-card-layout.ldp-user-card-no-cover .ldp-user-card-cover{display:none;}
+    .ldp-user-card-v2 .ldp-user-card-cover{height:auto;min-height:330px;order:2;background-color:var(--primary-very-low,#eef1ef);background-size:cover;background-position:center;}
+    .ldp-user-card-v2 .ldp-user-card-body{order:1;padding:18px;}
+    .ldp-user-card-v2 .ldp-user-card-main{align-items:center;margin:0;}
+    .ldp-user-card-v2 .ldp-user-card-avatar{width:68px;height:68px;}
+    .ldp-user-card-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px;}
+    .ldp-user-card-actions a,.ldp-user-card-actions button,.ldp-user-notify{padding:7px 9px;border:1px solid var(--primary-low,#dce2df);border-radius:5px;
+      color:inherit;background:var(--primary-very-low,#f5f7f6);text-decoration:none;cursor:pointer;font-size:12px;}
+    .ldp-user-badges{display:flex;gap:5px;flex-wrap:wrap;margin-top:11px;}
+    .ldp-user-badge{padding:3px 6px;border-radius:4px;background:#fff1d6;color:#77511a;font-size:11px;}
+    @media (max-width:760px){
+      .ldp-overlay.ldp-v2{padding:8px;align-items:stretch;}
+      .ldp-v2 .ldp-modal{width:calc(100vw - 16px);height:calc(100vh - 16px);}
+      .ldp-v2 .ldp-header{padding:10px;}
+      .ldp-site-mark{width:30px;height:30px;}
+      .ldp-toolbar{overflow-x:auto;scrollbar-width:none;}
+      .ldp-v2 .ldp-footer{padding:7px 8px;}
+      .ldp-v2 .ldp-fbtn{min-width:42px;width:42px;height:38px;padding:0;}
+      .ldp-v2 .ldp-fbtn span{display:none;}
+      .ldp-v2 .ldp-body{padding:6px 70px 22px 12px;}
+      .ldp-v2 .ldp-timeline{right:6px;top:6px;bottom:6px;}
+      .ldp-v2 .ldp-tl-current strong{font-size:11px;white-space:nowrap;}
+      .ldp-v2 .ldp-time{display:none;}
+      .ldp-reader-panel{top:76px;right:8px;width:calc(100% - 16px);height:calc(100% - 88px);}
+      .ldp-user-card-v2 .ldp-user-card-layout{display:block;min-height:0;}
+      .ldp-user-card-v2 .ldp-user-card-cover{display:none;}
+    }
+
+    /* 脚本 b (1.9.1) 新增能力与 2.0 主题融合样式 */
+    .ldp-user-link{display:inline-flex;align-items:center;gap:6px;color:inherit;text-decoration:none;min-width:0;}
+    .ldp-user-link:hover{color:#176c43;}
+    .ldp-overlay a.ldp-user-link:visited{color:inherit;}
+    .ldp-overlay a.ldp-user-link:visited:hover{color:#176c43;}
+    .ldp-boost-avatar-link{display:inline-flex;align-items:center;flex:none;border-radius:50%;line-height:0;}
+    .ldp-boost-avatar-link:hover .ldp-b-avatar{opacity:.84;transform:scale(1.08);}
+    .ldp-b-avatar{transition:opacity .15s,transform .15s;}
+    .ldp-level{flex:none;font-size:11px;font-weight:600;line-height:1.4;padding:0 5px;border-radius:4px;
+      border:1px solid var(--primary-low,#dfe4e1);background:var(--primary-very-low,#f3f6f4);color:var(--primary-medium,#5f6963);}
+    .ldp-topic-category-chip{border-color:#9fc5b1;background:#edf6f1;color:#176c43;font-weight:600;}
     .ldp-content .ldp-deleted{color:var(--primary-medium,#888);}
+    .ldp-deletebtn:hover{color:var(--danger,#b42318);background:rgba(180,35,24,.08);opacity:1;}
+    .ldp-user-badge{display:inline-flex;align-items:center;gap:4px;}
+    .ldp-user-badge img{width:14px;height:14px;object-fit:contain;flex:none;}
+
+    /* 视频占位播放 */
     .ldp-content .video-placeholder-container{max-width:100%;overflow:hidden;border-radius:6px;}
     .ldp-content .video-placeholder-container[data-video-src]:not(.ldp-video-ready){
       position:relative;background:#000;cursor:pointer;}
@@ -264,180 +652,83 @@
       border-bottom:11px solid transparent;border-left:18px solid #fff;
       pointer-events:none;filter:drop-shadow(0 1px 2px rgba(0,0,0,.45));}
     .ldp-content .video-placeholder-container[data-video-src]:not(.ldp-video-ready):hover::before{
-      background:rgba(8,132,255,.82);transform:translate(-50%,-50%) scale(1.06);}
+      background:rgba(23,108,67,.86);transform:translate(-50%,-50%) scale(1.06);}
     .ldp-content .video-placeholder-container[data-video-src]:not(.ldp-video-ready)
       .video-placeholder-overlay{display:none;}
     .ldp-content .video-placeholder-container.ldp-video-ready{cursor:default!important;background:#000;}
     .ldp-content video{display:block;width:100%;max-width:100%;max-height:70vh;background:#000;}
+
+    /* 模糊剧透 */
     .ldp-content .ldp-spoiler{cursor:pointer;}
     .ldp-content .ldp-spoiler.ldp-spoiler-blurred{
-      filter:blur(8px)!important;-webkit-filter:blur(8px)!important;
-      user-select:none;}
+      filter:blur(8px)!important;-webkit-filter:blur(8px)!important;user-select:none;}
     .ldp-content .ldp-spoiler.ldp-spoiler-expanded{cursor:default;}
-    .ldp-content pre{overflow:auto;background:var(--primary-very-low,#f6f6f6);
-      padding:10px;border-radius:6px;}
+
+    /* 投票 */
     .ldp-content .ldp-poll{display:grid;gap:10px;margin:12px 0;padding:12px;
-      border:1px solid var(--primary-low,#ddd);border-radius:8px;
-      background:var(--primary-very-low,#fafafa);}
+      border:1px solid var(--primary-low,#dce2df);border-radius:8px;
+      background:var(--primary-very-low,#f7f9f8);}
     .ldp-poll-title{margin:0;font-size:15px;font-weight:700;}
-    .ldp-poll-meta{font-size:12px;color:var(--primary-medium,#777);}
+    .ldp-poll-meta{font-size:12px;color:var(--primary-medium,#6b746f);}
     .ldp-poll-options{display:grid;gap:8px;}
     .ldp-poll-option{position:relative;overflow:hidden;width:100%;
       display:flex;flex-direction:column;gap:6px;padding:10px 12px;
-      border:1px solid var(--primary-low,#ddd);border-radius:8px;
+      border:1px solid var(--primary-low,#dce2df);border-radius:8px;
       background:var(--secondary,#fff);color:inherit;font:inherit;
       text-align:left;cursor:pointer;}
     .ldp-poll-option[aria-pressed="true"]{
-      border-color:var(--tertiary,#08c);background:rgba(8,132,255,.08);}
+      border-color:#4f9d70;background:#edf6f1;}
     .ldp-poll-option:disabled{cursor:default;opacity:.65;}
     .ldp-poll-option-content{position:relative;z-index:1;display:flex;
       align-items:baseline;justify-content:space-between;gap:12px;}
     .ldp-poll-option-html{min-width:0;overflow-wrap:anywhere;}
-    .ldp-poll-option-meta{flex:none;font-size:12px;color:var(--primary-medium,#777);}
-    .ldp-poll-bar{position:absolute;left:0;bottom:0;height:3px;
-      background:var(--tertiary,#08c);}
+    .ldp-poll-option-meta{flex:none;font-size:12px;color:var(--primary-medium,#6b746f);}
+    .ldp-poll-bar{position:absolute;left:0;bottom:0;height:3px;background:#3d8d65;}
     .ldp-poll-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;}
-    .ldp-poll-submit,.ldp-poll-remove{border:1px solid var(--primary-low,#ccc);
+    .ldp-poll-submit,.ldp-poll-remove{border:1px solid var(--primary-low,#cbd2ce);
       border-radius:6px;padding:5px 12px;background:var(--secondary,#fff);
       color:var(--primary,#222);font:inherit;font-size:13px;cursor:pointer;}
-    .ldp-poll-submit:disabled,.ldp-poll-remove:disabled{
-      cursor:default;opacity:.5;}
-    .ldp-poll-selected-count{font-size:12px;color:var(--primary-medium,#777);}
-    .ldp-poll-status{min-height:18px;font-size:12px;color:var(--primary-medium,#777);}
-    .ldp-poll-status.ldp-poll-error{color:#d13c3c;}
+    .ldp-poll-submit:hover,.ldp-poll-remove:hover{border-color:#85aa96;color:#176c43;background:#edf6f1;}
+    .ldp-poll-submit:disabled,.ldp-poll-remove:disabled{cursor:default;opacity:.5;}
+    .ldp-poll-selected-count{font-size:12px;color:var(--primary-medium,#6b746f);}
+    .ldp-poll-status{min-height:18px;font-size:12px;color:var(--primary-medium,#6b746f);}
+    .ldp-poll-status.ldp-poll-error{color:var(--danger,#b42318);}
     .ldp-poll[data-loading] .ldp-poll-option,
     .ldp-poll[data-loading] .ldp-poll-submit,
-    .ldp-poll[data-loading] .ldp-poll-remove{
-      cursor:default;opacity:.55;pointer-events:none;}
-    .ldp-children{margin-left:22px;
-      border-left:1px solid var(--tertiary,#08c);}
-    .ldp-actions{display:flex;gap:14px;margin-top:8px;font-size:12px;align-items:center;}
-    .ldp-btn{cursor:pointer;border:none;background:transparent;color:inherit;
-      opacity:.7;display:inline-flex;align-items:center;gap:4px;padding:2px 4px;}
-    .ldp-btn:hover{opacity:1;}
-    .ldp-btn:disabled{cursor:default;opacity:.4;}
-    .ldp-like.liked{color:var(--love,#e25822);opacity:1;font-weight:600;}
+    .ldp-poll[data-loading] .ldp-poll-remove{cursor:default;opacity:.55;pointer-events:none;}
 
-    .ldp-replybox{margin-top:8px;display:none;position:relative;}
-    .ldp-replybox.open{display:block;}
-    .ldp-replybox textarea{width:100%;min-height:90px;box-sizing:border-box;margin-bottom:0px;
-      border:1px solid var(--primary-low,#ccc);border-radius:6px;padding:8px;
-      font:inherit;background:var(--secondary,#fff);color:inherit;resize:vertical;}
-    .ldp-replybox textarea.uploading{opacity:0.6;pointer-events:none;}
+    /* 回复框模板与表情工具栏 */
     .ldp-reply-tools{display:flex;align-items:center;gap:6px;margin-top:6px;}
-    .ldp-insert-wrap{position:relative;}
-    .ldp-insert-menu{position:absolute;top:calc(100% + 4px);left:0;z-index:20;
-      min-width:150px;padding:4px 0;border:1px solid var(--primary-low,#ddd);
+    .ldp-reply-tools .ldp-send{margin-top:0;}
+    .ldp-insert-wrap{position:relative;display:inline-flex;}
+    .ldp-insert-menu{position:absolute;top:calc(100% + 4px);left:0;z-index:25;
+      min-width:150px;padding:4px 0;border:1px solid var(--primary-low,#dce2df);
       border-radius:6px;background:var(--secondary,#fff);
-      box-shadow:0 6px 24px rgba(0,0,0,.18);list-style:none;margin:0;}
+      box-shadow:0 8px 24px rgba(0,0,0,.18);list-style:none;margin:0;}
     .ldp-insert-menu[hidden]{display:none;}
     .ldp-insert-item{display:flex;align-items:center;gap:8px;width:100%;
       padding:7px 10px;border:none;background:transparent;color:inherit;
       font-size:13px;text-align:left;cursor:pointer;white-space:nowrap;}
-    .ldp-insert-item:hover{background:var(--primary-low,#f0f0f0);}
+    .ldp-insert-item:hover{background:var(--primary-very-low,#eff4f1);color:#176c43;}
     .ldp-insert-item svg{width:14px;height:14px;flex:none;fill:currentColor;}
-    .ldp-send{margin-top:6px;background:var(--tertiary,#08c);color:#fff;border:none;
-      border-radius:6px;padding:6px 14px;cursor:pointer;}
-    .ldp-reply-tools .ldp-send{margin-top:0;}
-    .ldp-reply-tip{margin-left:10px;font-size:12px;color:#3ea66b;opacity:0;
-      transition:opacity .25s ease;}
-    .ldp-reply-tip.show{opacity:1;}
 
-    .ldp-loading-tip{padding:14px 0;text-align:center;font-size:13px;
-      color:var(--primary-medium,#888);display:none;user-select:none;}
-    .ldp-loading-tip.show{display:block;}
-    .ldp-loading-tip .ldp-tip-icon{display:inline-block;margin-right:6px;
-      animation:ldp-spin .9s linear infinite;}
-    @keyframes ldp-spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
-
-    /* 上方/下方懒加载触发提示 */
-    .ldp-load-up-tip,.ldp-load-down-tip{
-      padding:10px 0;text-align:center;font-size:12px;
-      color:var(--primary-medium,#999);user-select:none;display:none;}
-    .ldp-load-up-tip.show,.ldp-load-down-tip.show{display:block;}
-    .ldp-load-up-tip .ldp-tip-icon,.ldp-load-down-tip .ldp-tip-icon{
-      display:inline-block;margin-right:4px;animation:ldp-spin .9s linear infinite;}
-
-    .ldp-bottom-tip{padding:16px 0;text-align:center;font-size:13px;
-      color:var(--primary-medium,#888);user-select:none;}
-    .ldp-top-tip{padding:10px 0;text-align:center;font-size:13px;
-      color:var(--primary-medium,#888);user-select:none;}
-
-    /* 灯箱 */
-    .ldp-lightbox{position:fixed;inset:0;z-index:2147483600;display:flex;
-      flex-direction:column;background:rgba(0,0,0,.9);}
-    .ldp-lb-stage{flex:1;overflow:auto;display:flex;align-items:center;
-      justify-content:center;padding:20px;}
-    .ldp-lb-stage img{display:block;max-width:94vw;max-height:88vh;
-      width:auto;height:auto;border-radius:4px;cursor:zoom-out;
-      box-shadow:0 10px 40px rgba(0,0,0,.6);}
-    .ldp-lb-x{position:fixed;top:14px;right:18px;z-index:1;cursor:pointer;border:none;
-      background:transparent;color:#fff;font-size:30px;line-height:1;}
-
-    /* 楼中楼"展示更多回复"按钮 */
-    .ldp-sub-actions{margin-left:22px;padding-left:14px;margin-top:2px;display:none;}
-    .ldp-load-more-replies{font-size:12px;color:var(--tertiary,#08c);font-weight:600;
-      opacity:.9;padding:4px 0;}
-    .ldp-load-more-replies:hover{opacity:1;text-decoration:underline;}
-    .ldp-sub-loading{font-size:12px;opacity:.5;margin-left:22px;padding-left:14px;
-      margin-top:2px;display:none;}
-
-    /* ============ Boost 样式 ============ */
-    .ldp-boosts-list{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:6px;min-height:0;}
-    .ldp-boost-bubble{display:inline-flex;align-items:center;gap:4px;
-      padding:3px 8px 3px 4px;border:none;
-      background:rgba(128,128,128,.1);border-radius:50px;
-      font-size:14px;line-height:1.4;cursor:default;position:relative;
-      transition:background .15s;}
-    .ldp-boost-bubble:hover{background:rgba(128,128,128,.18);}
-    .ldp-b-avatar{width:18px;height:18px;border-radius:50%;flex:none;display:block;}
-    .ldp-boost-bubble p{margin:0;display:inline-flex;gap:2px;align-items:center;flex-wrap:wrap;}
-    .ldp-boost-bubble p img.emoji{width:14px;height:14px;margin:0;vertical-align:middle;}
-    .ldp-boost-del{cursor:pointer;margin-left:2px;opacity:0;font-size:13px;
-      color:var(--danger,#cc4b4b);line-height:1;border:none;background:transparent;
-      padding:0 2px;transition:opacity .15s;flex:none;}
-    .ldp-boost-bubble:hover .ldp-boost-del{opacity:.65;}
-    .ldp-boost-del:hover{opacity:1!important;}
-    .ldp-boost-input-wrap{display:none;align-items:center;gap:5px;margin-top:6px;
-      padding:4px 6px;border-radius:8px;
-      border:1px solid var(--primary-low,#ddd);
-      background:var(--secondary,#fff);}
-    .ldp-boost-input-wrap.open{display:flex;}
-    .ldp-boost-input{flex:1;border:none;background:transparent;outline:none;
-      font-size:13px;padding:2px 4px;color:inherit;min-width:0;}
-    .ldp-boost-input::placeholder{color:var(--primary-medium,#999);font-size:12px;}
-    .ldp-boost-submit{width:22px;height:22px;padding:0;display:flex;flex:none;
+    /* Emoji Picker */
+    .ldp-emoji-btn{width:26px;height:26px;padding:0;display:flex;flex:none;
       align-items:center;justify-content:center;border-radius:50%;
-      border:1px solid #3ea66b;background:transparent;color:#3ea66b;
-      cursor:pointer;font-size:14px;line-height:1;transition:all .15s;}
-    .ldp-boost-submit:hover{background:#3ea66b;color:#fff;}
-    .ldp-boost-submit:disabled{opacity:.5;cursor:default;pointer-events:none;}
-    .ldp-boost-cancel{width:22px;height:22px;padding:0;display:flex;flex:none;
-      align-items:center;justify-content:center;border-radius:50%;
-      border:1px solid var(--danger,#cc4b4b);background:transparent;
-      color:var(--danger,#cc4b4b);cursor:pointer;font-size:16px;line-height:1;
-      transition:all .15s;}
-    .ldp-boost-cancel:hover{background:var(--danger,#cc4b4b);color:#fff;}
-    .ldp-btn.ldp-boost-btn{font-size:12px;}
-    .ldp-btn.ldp-boost-btn:disabled{opacity:.35;cursor:default;pointer-events:none;}
-
-    /* ============ Emoji Picker 样式 ============ */
-    .ldp-emoji-btn{width:22px;height:22px;padding:0;display:flex;flex:none;
-      align-items:center;justify-content:center;border-radius:50%;
-      border:1px solid var(--primary-low,#ccc);background:transparent;
-      color:var(--primary-medium,#666);cursor:pointer;font-size:14px;line-height:1;
+      border:1px solid var(--primary-low,#cbd2ce);background:transparent;
+      color:var(--primary-medium,#66706a);cursor:pointer;font-size:14px;line-height:1;
       transition:all .15s;position:relative;}
-    .ldp-emoji-btn:hover{background:var(--primary-low,#f0f0f0);color:var(--tertiary,#3b82f6);}
-    .ldp-emoji-btn svg{width:14px;height:14px;fill:currentColor;display:block;}
-    .ldp-emoji-panel{position:fixed;z-index:2147483500;width:320px;height:360px;
-      background:var(--secondary,#fff);border:1px solid var(--primary-low,#ddd);
-      border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);
-      display:flex;flex-direction:column;overflow:hidden;font-size:13px;}
-    .ldp-emoji-search{flex:none;padding:6px 8px;border-bottom:1px solid var(--primary-low,#eee);}
-    .ldp-emoji-search input{width:100%;box-sizing:border-box;border:1px solid var(--primary-low,#ccc);
+    .ldp-emoji-btn:hover{background:#edf6f1;border-color:#85aa96;color:#176c43;}
+    .ldp-emoji-btn svg{width:15px;height:15px;fill:currentColor;display:block;}
+    .ldp-emoji-panel{position:fixed;z-index:2147483560;width:320px;height:360px;
+      background:var(--secondary,#fff);border:1px solid var(--primary-low,#dce2df);
+      border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.22);
+      display:flex;flex-direction:column;overflow:hidden;font-size:13px;color:var(--primary,#222);}
+    .ldp-emoji-search{flex:none;padding:6px 8px;border-bottom:1px solid var(--primary-low,#e4e8e6);}
+    .ldp-emoji-search input{width:100%;box-sizing:border-box;border:1px solid var(--primary-low-mid,#cbd2ce);
       border-radius:6px;padding:5px 8px;font-size:12px;outline:none;
       background:var(--secondary,#fff);color:inherit;}
-    .ldp-emoji-tabs{flex:none;display:flex;border-bottom:1px solid var(--primary-low,#eee);
+    .ldp-emoji-tabs{flex:none;display:flex;border-bottom:1px solid var(--primary-low,#e4e8e6);
       overflow-x:auto;padding:0 4px;}
     .ldp-emoji-tabs::-webkit-scrollbar{display:none;}
     .ldp-emoji-tab{flex:none;width:30px;height:30px;padding:0;cursor:pointer;
@@ -446,7 +737,7 @@
       background:none;border-top:none;border-left:none;border-right:none;}
     .ldp-emoji-tab img{width:20px;height:20px;display:block;}
     .ldp-emoji-tab:hover{opacity:.8;}
-    .ldp-emoji-tab.active{opacity:1;border-bottom-color:var(--tertiary,#08c);}
+    .ldp-emoji-tab.active{opacity:1;border-bottom-color:#28724d;}
     .ldp-emoji-grid{flex:1;overflow-y:auto;padding:6px;display:grid;
       grid-template-columns:repeat(8,1fr);gap:2px;align-content:start;}
     .ldp-emoji-grid::-webkit-scrollbar{width:5px;}
@@ -454,32 +745,48 @@
     .ldp-emoji-item{width:100%;aspect-ratio:1;display:flex;align-items:center;
       justify-content:center;border-radius:6px;cursor:pointer;border:none;
       background:transparent;padding:2px;transition:background .1s;}
-    .ldp-emoji-item:hover{background:var(--primary-low,#f0f0f0);}
+    .ldp-emoji-item:hover{background:var(--primary-low,#eff3f1);}
     .ldp-emoji-item img{width:24px;height:24px;display:block;}
     .ldp-emoji-empty{grid-column:1/-1;text-align:center;padding:20px 0;
-      color:var(--primary-medium,#999);font-size:12px;}
+      color:var(--primary-medium,#888);font-size:12px;}
+
+    /* 时间轴圆点拖拽跳转提示 */
+    .ldp-tl-thumb{cursor:grab;touch-action:none;}
+    .ldp-tl-thumb.dragging{cursor:grabbing;box-shadow:0 0 0 6px rgba(8,132,255,.24);}
+    .ldp-tl-drag-tip{position:absolute;right:calc(100% + 4px);top:8px;z-index:6;
+      padding:3px 7px;border-radius:4px;background:var(--primary,#222);color:var(--secondary,#fff);
+      font-size:11px;font-weight:700;line-height:1.3;white-space:nowrap;
+      transform:translateY(-50%);opacity:0;pointer-events:none;transition:opacity .12s;}
+    .ldp-tl-drag-tip.show{opacity:1;}
   `;
   document.head.appendChild(style);
 
   /* 图标 */
   const ICONS = {
+    // 点赞
     like: '<path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>',
+    // 回复
     reply: '<path d="M1024 640q0 94.857143-72.571429 257.714286-1.714286 4-6 13.714286t-7.714286 17.142857-7.428571 12.571429q-6.857143 9.714286-16 9.714286-8.571429 0-13.428571-5.714286t-4.857143-14.285714q0-5.142857 1.428571-15.142857t1.428571-13.428571q2.857143-38.857143 2.857143-70.285714 0-57.714286-10-103.428571t-27.714286-79.142857-45.714286-57.714286-60.285714-39.714286-76-24.285714-88-12.285714-100.285714-3.428571l-128 0 0 146.285714q0 14.857143-10.857143 25.714286t-25.714286 10.857143-25.714286-10.857143l-292.571429-292.571429q-10.857143-10.857143-10.857143-25.714286t10.857143-25.714286l292.571429-292.571429q10.857143-10.857143 25.714286-10.857143t25.714286 10.857143 10.857143 25.714286l0 146.285714 128 0q407.428571 0 500 230.285714 30.285714 76.571429 30.285714 190.285714z"/>',
+    // boost
     boost: '<path d="M1010.092957 38.19946a31.779551 31.779551 0 0 0-24.399655-24.399655C921.294212 0 870.914925 0 820.715635 0c-206.397081 0-330.195331 110.398439-422.574025 255.99638H189.744557A95.998643 95.998643 0 0 0 104.005769 308.975631l-98.838602 197.597206A47.999321 47.999321 0 0 0 48.146559 575.991855h207.537065l-44.939364 44.939365a63.999095 63.999095 0 0 0 0 90.49872l101.79856 101.81856a63.999095 63.999095 0 0 0 90.51872 0L448.000905 768.309136V975.986199a47.999321 47.999321 0 0 0 69.399019 42.979392l197.397208-98.778603a95.818645 95.818645 0 0 0 52.999251-85.798787V625.571154c145.177947-92.598691 255.99638-216.796934 255.99638-422.17403 0.199997-50.399287 0.199997-100.798575-13.699806-165.197664zM767.99638 335.995249a79.998869 79.998869 0 1 1 79.998869-79.998869 79.998869 79.998869 0 0 1-79.998869 79.998869z"/>',
+    // 书签
     bookmark: '<path d="M17 3H7c-1.1 0-1.99.9-1.99 2L5 21l7-3 7 3V5c0-1.1-.9-2-2-2z"/>',
-    newTab: '<path d="M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/>'
+    // 新标签页打开
+    newTab: '<path d="M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/>',
+    // 下载到托盘
+    download: '<path d="M11 3h2v10.17l3.59-3.58L18 11l-6 6-6-6 1.41-1.41L11 13.17V3ZM5 19h14v2H5v-2Z"/>',
+    // Obsidian 水晶与设置
+    obsidian: '<path d="M12 1.8 19.2 7l-1.8 11.1L12 22l-5.4-3.9L4.8 7 12 1.8Zm0 3L8 7.7l1.3 8.8 2.7 2 2.7-2L16 7.7 12 4.8Z"/>',
+    settings: '<path d="M19.4 13a7.8 7.8 0 0 0 .1-1 7.8 7.8 0 0 0-.1-1l2.1-1.6-2-3.4-2.5 1a7.7 7.7 0 0 0-1.7-1L15 3.3h-4L10.6 6a7.7 7.7 0 0 0-1.7 1L6.4 6l-2 3.4L6.5 11a7.8 7.8 0 0 0-.1 1 7.8 7.8 0 0 0 .1 1l-2.1 1.6 2 3.4 2.5-1a7.7 7.7 0 0 0 1.7 1l.4 2.7h4l.4-2.7a7.7 7.7 0 0 0 1.7-1l2.5 1 2-3.4L19.4 13ZM13 15.5A3.5 3.5 0 1 1 13 8a3.5 3.5 0 0 1 0 7.5Z"/>',
+    // 复制
+    copy: '<path d="M16 1H4a2 2 0 0 0-2 2v12h2V3h12V1Zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Zm0 16H8V7h11v14Z"/>'
   };
 
-  /* 表情按钮图标（复用 Discourse 内置 sprite） */
-  const EMOJI_BTN_ICON = '<svg class="fa d-icon d-icon-far-face-smile svg-icon fa-width-auto svg-string" width="1em" height="1em" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><use href="#far-face-smile"></use></svg>';
-  const INSERT_BTN_ICON = '<svg class="fa d-icon d-icon-circle-plus svg-icon fa-width-auto svg-string" width="1em" height="1em" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><use href="#circle-plus"></use></svg>';
-  const DETAILS_ICON = '<svg class="fa d-icon d-icon-angle-right svg-icon fa-width-auto svg-string" width="1em" height="1em" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><use href="#angle-right"></use></svg>';
-  const SPOILER_ICON = '<svg class="fa d-icon d-icon-wand-magic svg-icon fa-width-auto svg-string" width="1em" height="1em" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><use href="#wand-magic"></use></svg>';
-
-  /* ============ 2. 工具函数 ============ */
-  const esc = (s) => (s || '').replace(/[<>&]/g, (c) =>
-      ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
-  const escAttr = (s) => esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const EMOJI_BTN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16Zm-3.5-9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm7 0a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm-7.43 3.5a4.5 4.5 0 0 0 7.86 0h-1.8a2.8 2.8 0 0 1-4.26 0h-1.8Z"/></svg>';
+  const INSERT_BTN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm1 9h4v2h-4v4h-2v-4H7v-2h4V7h2v4Z"/></svg>';
+  const DETAILS_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.4 6.6 5.4 5.4-5.4 5.4L8 16l4-4-4-4 1.4-1.4Z"/></svg>';
+  const SPOILER_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5c-5 0-9.27 3.11-11 7.5C2.73 16.89 7 20 12 20s9.27-3.11 11-7.5C21.27 8.11 17 5 12 5Zm0 12.5a5 5 0 1 1 0-10 5 5 0 0 1 0 10Zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/></svg>';
+  const TRASH_BTN_ICON = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:currentColor;vertical-align:middle;" aria-hidden="true"><path d="M8 3h8l1 2h4v2H3V5h4l1-2Zm-2 6h12l-1 12H7L6 9Zm3 2 .5 8h2L11 11H9Zm4 0-.5 8h2l.5-8h-2Z"/></svg>';
 
   function setSpoilerState(spoiler, blurred) {
     spoiler.classList.add('spoiled');
@@ -494,11 +801,10 @@
   }
 
   function prepareSpoilers(root) {
+    if (!root) return;
     const spoilers = [];
     const selector = '.spoiler, .spoiled, .spoiler-blurred, [data-spoiler-state]';
-    if (root.matches && root.matches(selector)) {
-      spoilers.push(root);
-    }
+    if (root.matches && root.matches(selector)) spoilers.push(root);
     spoilers.push(...root.querySelectorAll(selector));
     spoilers.forEach((spoiler) => {
       spoiler.classList.add('ldp-spoiler');
@@ -508,15 +814,20 @@
     });
   }
 
-  function userProfileUrl(username) {
-    const name = typeof username === 'string' ? username.trim() : '';
-    return name ? `${BASE}/u/${encodeURIComponent(name)}/summary` : '';
+  /* ============ 2. 工具 ============ */
+  const esc = (s) => (s || '').replace(/[<>&]/g, (c) =>
+      ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+  const escAttr = (s) => esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+  function stripHtml(html) {
+    if (!html) return '';
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    return (tmp.textContent || '').trim();
   }
 
-  function userProfileLabel(username, displayName) {
-    const label = typeof displayName === 'string' ? displayName.trim() : '';
-    const account = typeof username === 'string' ? username.trim() : '';
-    return label || (account ? `@${account}` : '查看用户');
+  function resolveAvatar(template, size) {
+    return template ? absoluteUrl(template.replace('{size}', String(size || 96))) : '';
   }
 
   function fmtTime(iso) {
@@ -537,12 +848,217 @@
   const csrfToken = () =>
       (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
 
-  async function fetchJSON(url) {
-    const res = await fetch(url, {
-      credentials: 'include', headers: { 'Accept': 'application/json' },
+  function abortError() {
+    return new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  function throwIfAborted(signal) {
+    if (signal && signal.aborted) throw abortError();
+  }
+
+  function sleep(ms, signal) {
+    if (!(ms > 0)) {
+      throwIfAborted(signal);
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      throwIfAborted(signal);
+      const timer = setTimeout(done, ms);
+      function cleanup() {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+      }
+      function done() { cleanup(); resolve(); }
+      function onAbort() { cleanup(); reject(abortError()); }
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return res.json();
+  }
+
+  function parseRetryAfter(value) {
+    if (!value) return null;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    const date = Date.parse(value);
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
+  }
+
+  function setGlobalCooldown(until, broadcast) {
+    const next = Math.max(globalCooldownUntil, Number(until) || 0);
+    if (next === globalCooldownUntil) return;
+    globalCooldownUntil = next;
+    if (broadcast && cooldownChannel) cooldownChannel.postMessage({ until: next });
+    scheduleRequestPump(Math.max(0, next - Date.now()));
+  }
+
+  if (cooldownChannel) {
+    cooldownChannel.addEventListener('message', (event) => {
+      if (event.data && event.data.until) setGlobalCooldown(event.data.until, false);
+    });
+  }
+
+  async function fetchOnce(url, options, attempt) {
+    const opts = options || {};
+    const signal = opts.signal;
+    const headers = Object.assign({ 'Accept': 'application/json' }, opts.headers || {});
+    const fetchOptions = Object.assign({}, opts, {
+      method: 'GET', credentials: 'include', headers,
+    });
+    delete fetchOptions.priority;
+    delete fetchOptions.dedupeKey;
+
+    throwIfAborted(signal);
+    const res = await fetch(url, fetchOptions);
+    if (res.ok) return res.json();
+    const error = new Error('HTTP ' + res.status);
+    error.status = res.status;
+    error.url = String(url);
+    error.attempt = attempt;
+    if (res.status === 429) {
+      const retryAfter = parseRetryAfter(res.headers.get('Retry-After'));
+      error.retryDelay = retryAfter === null ? RETRY_BASE_DELAY * Math.pow(2, attempt) : retryAfter;
+    }
+    throw error;
+  }
+
+  async function waitForGlobalCooldown(signal) {
+    while (globalCooldownUntil > Date.now()) {
+      await sleep(globalCooldownUntil - Date.now(), signal);
+    }
+  }
+
+  async function fetchWithRetry(url, options) {
+    const opts = options || {};
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await queueRequest(
+          () => fetchOnce(url, opts, attempt), opts.signal, opts.priority
+        );
+      } catch (error) {
+        if (!error || error.status !== 429 || attempt >= RETRY_MAX_ATTEMPTS) throw error;
+        setGlobalCooldown(Date.now() + Math.max(0, Number(error.retryDelay) || 0), true);
+        await waitForGlobalCooldown(opts.signal);
+      }
+    }
+  }
+
+  function scheduleRequestPump(delay) {
+    if (requestPumpTimer) clearTimeout(requestPumpTimer);
+    requestPumpTimer = setTimeout(() => {
+      requestPumpTimer = null;
+      pumpRequestQueue();
+    }, Math.max(0, Number(delay) || 0));
+  }
+
+  function pumpRequestQueue() {
+    if (activeGetRequests >= REQUEST_MAX_CONCURRENCY || !requestQueue.length) return;
+    const cooldownWait = globalCooldownUntil - Date.now();
+    const spacingWait = REQUEST_MIN_INTERVAL - (Date.now() - lastRequestTime);
+    const wait = Math.max(cooldownWait, spacingWait, 0);
+    if (wait > 0) {
+      scheduleRequestPump(wait);
+      return;
+    }
+
+    requestQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+    const item = requestQueue.shift();
+    if (!item) return;
+    if (item.signal && item.signal.aborted) {
+      item.reject(abortError());
+      pumpRequestQueue();
+      return;
+    }
+    activeGetRequests += 1;
+    lastRequestTime = Date.now();
+    item.started = true;
+    item.task().then(item.resolve, item.reject).finally(() => {
+      activeGetRequests -= 1;
+      scheduleRequestPump(0);
+    });
+    if (activeGetRequests < REQUEST_MAX_CONCURRENCY) scheduleRequestPump(REQUEST_MIN_INTERVAL);
+  }
+
+  function queueRequest(task, signal, priority) {
+    return new Promise((resolve, reject) => {
+      const item = {
+        task, signal, resolve, reject, started: false,
+        priority: REQUEST_PRIORITY[priority] ?? REQUEST_PRIORITY.visible,
+        sequence: requestSequence++,
+      };
+      if (signal && signal.aborted) {
+        reject(abortError());
+        return;
+      }
+      const onAbort = () => {
+        if (item.started) return;
+        const index = requestQueue.indexOf(item);
+        if (index >= 0) requestQueue.splice(index, 1);
+        reject(abortError());
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      const finish = (handler) => (value) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        handler(value);
+      };
+      item.resolve = finish(resolve);
+      item.reject = finish(reject);
+      requestQueue.push(item);
+      pumpRequestQueue();
+    });
+  }
+
+  function createSharedGetRequest(key, url, options) {
+    const controller = new AbortController();
+    const record = { key, controller, subscribers: new Set(), settled: false };
+    const opts = Object.assign({}, options || {}, { signal: controller.signal });
+    record.promise = fetchWithRetry(url, opts).then(
+      (value) => {
+        record.settled = true;
+        record.subscribers.forEach((subscriber) => subscriber.resolve(value));
+      },
+      (error) => {
+        record.settled = true;
+        record.subscribers.forEach((subscriber) => subscriber.reject(error));
+      }
+    ).finally(() => {
+      record.subscribers.forEach((subscriber) => subscriber.cleanup());
+      record.subscribers.clear();
+      if (inflightGetRequests.get(key) === record) inflightGetRequests.delete(key);
+    });
+    inflightGetRequests.set(key, record);
+    return record;
+  }
+
+  function subscribeSharedGet(record, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) {
+        reject(abortError());
+        if (!record.subscribers.size && !record.settled) record.controller.abort();
+        return;
+      }
+      const subscriber = {
+        resolve, reject, signal, cleanup: () => {
+          if (signal) signal.removeEventListener('abort', onAbort);
+        },
+      };
+      const onAbort = () => {
+        if (!record.subscribers.delete(subscriber)) return;
+        subscriber.cleanup();
+        reject(abortError());
+        if (!record.subscribers.size && !record.settled) record.controller.abort();
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      record.subscribers.add(subscriber);
+    });
+  }
+
+  function fetchJSON(url, options) {
+    const opts = options || {};
+    const key = opts.dedupeKey || String(url);
+    let record = inflightGetRequests.get(key);
+    if (!record || record.settled || record.controller.signal.aborted) {
+      record = createSharedGetRequest(key, url, opts);
+    }
+    return subscribeSharedGet(record, opts.signal);
   }
 
   async function apiSend(url, method, params, extraHeaders) {
@@ -567,7 +1083,7 @@
         const value = params[key];
         if (Array.isArray(value)) {
           value.forEach((item) => body.append(`${key}[]`, item));
-        } else {
+        } else if (value !== undefined && value !== null) {
           body.append(key, value);
         }
       });
@@ -579,133 +1095,340 @@
       try {
         const data = await res.json();
         const errors = Array.isArray(data.errors)
-            ? data.errors.map((item) =>
-                typeof item === 'string' ? item : item && item.message)
-                .filter((item) => typeof item === 'string' && item.trim())
-            : [];
+          ? data.errors.map((item) => typeof item === 'string' ? item : (item && item.message))
+              .filter((item) => typeof item === 'string' && item.trim())
+          : [];
         const candidate = errors.join(' ') || data.error || data.message;
         if (typeof candidate === 'string' && candidate.trim()) message = candidate.trim();
-      } catch (e) { /* keep the HTTP fallback when the response is not JSON */ }
-      throw new Error(message);
+      } catch (e) { /* keep HTTP status fallback */ }
+      const error = new Error(message);
+      error.status = res.status;
+      throw error;
     }
     return res.json().catch(() => ({}));
   }
 
-  async function ensureMe() {
-    if (ME_USERNAME !== null) return ME_USERNAME;
+  async function ensureMe(signal) {
+    if (ME_STATE !== 'unknown') return ME_USERNAME || '';
     try {
-      const s = await fetchJSON(`${BASE}/session/current.json`);
-      ME_USERNAME = (s.current_user && s.current_user.username) || '';
-    } catch (e) { ME_USERNAME = ''; }
+      const s = await fetchJSON(`${BASE}/session/current.json`, { signal });
+      ME_USER = s && s.current_user ? s.current_user : null;
+      ME_USERNAME = (ME_USER && ME_USER.username) || '';
+      ME_STATE = ME_USER ? 'authenticated' : 'guest';
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      throw e;
+    }
     return ME_USERNAME;
   }
 
-  /* ============ 2.5 嵌套树 API 封装 ============ */
-  /**
-   * fetchNestedTree：获取话题的嵌套树形结构（权威树 API）。
-   * @param {number} topicId - 话题 ID
-   * @param {number} page - 分页号（0 表示第一页）
-   * @returns {Promise<{roots: Array, has_more_roots: boolean, page: number, topic: object, opPost: object}>}
-   */
-  async function fetchNestedTree(topicId, page = 0) {
-    let url = `${BASE}/n/-/${topicId}.json?sort=old`;
-    if (page > 0) url += `&page=${page}`;
-    return await fetchJSON(url);
+  let readerDbPromise = null;
+  function openReaderDb() {
+    if (!('indexedDB' in window)) return Promise.resolve(null);
+    if (readerDbPromise) return readerDbPromise;
+    readerDbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('topics')) {
+          const store = db.createObjectStore('topics', { keyPath: 'key' });
+          store.createIndex('updatedAt', 'updatedAt');
+          store.createIndex('scope', 'scope');
+        }
+        if (!db.objectStoreNames.contains('collections')) {
+          const store = db.createObjectStore('collections', { keyPath: 'key' });
+          store.createIndex('updatedAt', 'updatedAt');
+          store.createIndex('scope', 'scope');
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('IndexedDB 初始化失败'));
+    }).catch(() => null);
+    return readerDbPromise;
   }
 
-  function standardTopicToNestedTree(data) {
-    const posts = Array.isArray(data.post_stream?.posts) ? data.post_stream.posts : [];
-    const opPost = posts.find((post) => post.post_number === 1);
-    if (!opPost) return null;
-
-    // Discourse 会把私信的嵌套树接口重定向到标准话题接口。
-    // 标准接口没有树形数据，这里转为顶层扁平结构以复用现有渲染流程。
-    const roots = posts
-        .filter((post) => post !== opPost)
-        .map((post) => ({ ...post, children: [], direct_reply_count: 0 }));
-
-    return {
-      roots,
-      op_post: opPost,
-      topic: {
-        id: data.id,
-        title: data.title,
-        category_id: data.category_id,
-        tags: data.tags,
-        posts_count: data.posts_count,
-        highest_post_number: data.highest_post_number || data.posts_count || 1,
-        bookmarked: data.bookmarked,
-        bookmark_id: data.bookmark_id,
-      },
-      has_more_roots: false,
-      page: 0,
-    };
+  function dbRequest(request) {
+    return new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('IndexedDB 操作失败'));
+    });
   }
 
-  /**
-   * fetchNestedChildren：获取指定帖子的所有直接回复（用于"展示更多"按钮）。
-   * @param {number} topicId - 话题 ID
-   * @param {number} postNumber - 帖子楼号
-   * @returns {Promise<{children: Array, has_more: boolean, page: number}>}
-   */
-  async function fetchNestedChildren(topicId, postNumber, page = 0) {
-    const url = `${BASE}/n/-/${topicId}/children/${postNumber}.json?sort=old&page=${page}&depth=1`;
-    return await fetchJSON(url);
+  async function readerScope(signal) {
+    const username = await ensureMe(signal);
+    if (ME_STATE === 'unknown') throw new Error('用户身份尚未确认');
+    return `${BASE}|${username || 'guest'}`;
   }
 
-  /**
-   * fetchAllNestedChildren：读取指定父楼层的全部直接回复分页。
-   * children API 会同时携带每条直接回复当前可用的下级 children，后续定位时
-   * 再沿目标祖先链逐层补全，因此无需一次请求无限深度的整棵树。
-   */
-  async function fetchAllNestedChildren(topicId, postNumber) {
-    const children = [];
-    const seenIds = new Set();
-    let page = 0;
+  async function readDbRecord(storeName, key) {
+    const db = await openReaderDb();
+    if (!db) return null;
+    return dbRequest(db.transaction(storeName, 'readonly').objectStore(storeName).get(key)).catch(() => null);
+  }
 
-    for (let guard = 0; guard < 100; guard++) {
-      const response = await fetchNestedChildren(topicId, postNumber, page);
-      const batch = Array.isArray(response.children) ? response.children : [];
-      let added = 0;
-      batch.forEach((post) => {
-        if (seenIds.has(post.id)) return;
-        seenIds.add(post.id);
-        children.push(post);
-        added++;
-      });
+  async function writeDbRecord(storeName, value) {
+    const db = await openReaderDb();
+    if (!db) return;
+    await dbRequest(db.transaction(storeName, 'readwrite').objectStore(storeName).put(value)).catch(() => {});
+  }
 
-      if (!response.has_more) return children;
-      if (added === 0) throw new Error(`楼层 #${postNumber} 的子回复分页没有继续推进`);
+  async function deleteDbRecord(storeName, key) {
+    const db = await openReaderDb();
+    if (!db) return;
+    await dbRequest(db.transaction(storeName, 'readwrite').objectStore(storeName).delete(key)).catch(() => {});
+  }
 
-      const responsePage = Number(response.page);
-      page = Number.isFinite(responsePage) ? responsePage + 1 : page + 1;
+  async function topicCacheKey(topicId, signal) {
+    let scope;
+    try { scope = await readerScope(signal); }
+    catch (error) {
+      if (error && error.name === 'AbortError') throw error;
+      return null;
     }
-
-    throw new Error(`楼层 #${postNumber} 的子回复分页超过安全上限`);
+    return { scope, key: `${scope}|topic|${topicId}` };
   }
 
-  /**
-   * indexTree：递归将嵌套树数据索引到 idToPost Map。
-   * @param {Array} posts - 帖子数组（可能包含 children）
-   */
-  function indexTree(posts) {
-    if (!posts || !posts.length) return;
-    posts.forEach(post => {
-      idToPost.set(post.id, post);
-      if (post.children && post.children.length > 0) {
-        indexTree(post.children);
-      }
+  async function readTopicSnapshot(topicId, signal) {
+    const pendingWrite = TOPIC_SNAPSHOT_WRITES.get(String(topicId));
+    if (pendingWrite) await pendingWrite.catch(() => {});
+    const identity = await topicCacheKey(topicId, signal);
+    if (!identity) return null;
+    const record = await readDbRecord('topics', identity.key);
+    if (!record || Date.now() - record.updatedAt > TOPIC_CACHE_STALE_MS) return null;
+    return Object.assign({}, record, { fresh: Date.now() - record.updatedAt <= TOPIC_CACHE_FRESH_MS });
+  }
+
+  async function pruneTopicSnapshots(scope) {
+    const db = await openReaderDb();
+    if (!db) return;
+    const records = await dbRequest(db.transaction('topics', 'readonly').objectStore('topics').getAll()).catch(() => []);
+    const scoped = records.filter((item) => item.scope === scope)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    let bytes = 0;
+    const expiredKeys = [];
+    scoped.forEach((record, index) => {
+      bytes += Number(record.bytes) || 0;
+      if (index >= TOPIC_CACHE_MAX_COUNT || bytes > TOPIC_CACHE_MAX_BYTES) expiredKeys.push(record.key);
+    });
+    if (!expiredKeys.length) return;
+    const transaction = db.transaction('topics', 'readwrite');
+    const store = transaction.objectStore('topics');
+    expiredKeys.forEach((key) => store.delete(key));
+  }
+
+  async function writeTopicSnapshot(topicId, topic, posts, signal) {
+    const identity = await topicCacheKey(topicId, signal);
+    if (!identity) return;
+    const payload = { schemaVersion: 2, topic, posts: Array.from(posts || []) };
+    let bytes = 0;
+    try { bytes = new Blob([JSON.stringify(payload)]).size; } catch (error) { /* 忽略估算失败 */ }
+    await writeDbRecord('topics', {
+      key: identity.key, scope: identity.scope, topicId: String(topicId),
+      updatedAt: Date.now(), bytes, payload,
+    });
+    pruneTopicSnapshots(identity.scope).catch(() => {});
+  }
+
+  async function invalidateTopicSnapshot(topicId) {
+    const identity = await topicCacheKey(topicId);
+    if (!identity) return;
+    return deleteDbRecord('topics', identity.key);
+  }
+
+  let historyStoreMemory = null;
+  let historyWriteTimer = 0;
+  let historyDirty = false;
+  let lastRememberedHistoryKey = '';
+
+  function readHistoryStore() {
+    if (historyStoreMemory) return historyStoreMemory;
+    try {
+      const value = JSON.parse(localStorage.getItem(HISTORY_KEY) || '{}');
+      historyStoreMemory = value && typeof value === 'object' ? value : {};
+    } catch (error) { historyStoreMemory = {}; }
+    return historyStoreMemory;
+  }
+
+  function historyScope() {
+    if (ME_STATE === 'unknown') return null;
+    return `${BASE}|${ME_USERNAME || 'guest'}`;
+  }
+
+  function getHistoryEntries() {
+    const scope = historyScope();
+    if (!scope) return [];
+    const cutoff = Date.now() - 365 * 24 * 60 * 60 * 1000;
+    return (readHistoryStore()[scope] || [])
+      .filter((item) => item && item.lastViewedAt >= cutoff)
+      .sort((a, b) => b.lastViewedAt - a.lastViewedAt)
+      .slice(0, 500);
+  }
+
+  function flushHistoryEntries() {
+    if (historyWriteTimer) clearTimeout(historyWriteTimer);
+    historyWriteTimer = 0;
+    if (!historyDirty || !historyStoreMemory) return;
+    historyDirty = false;
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(historyStoreMemory)); } catch (error) { /* 配额不足时不阻断阅读 */ }
+  }
+
+  function saveHistoryEntries(entries, immediate) {
+    const scope = historyScope();
+    if (!scope) return;
+    const store = readHistoryStore();
+    store[scope] = entries.slice(0, 500);
+    historyDirty = true;
+    if (immediate) flushHistoryEntries();
+    else {
+      if (historyWriteTimer) clearTimeout(historyWriteTimer);
+      historyWriteTimer = setTimeout(flushHistoryEntries, 750);
+    }
+  }
+
+  function rememberTopicHistory(topic, postNumber) {
+    if (!topic || !topic.id || ME_STATE === 'unknown') return;
+    const normalizedPostNumber = Math.max(1, Number(postNumber) || 1);
+    const memoryKey = `${historyScope()}|${topic.id}|${normalizedPostNumber}`;
+    if (memoryKey === lastRememberedHistoryKey) return;
+    lastRememberedHistoryKey = memoryKey;
+    const entries = getHistoryEntries().filter((item) => String(item.topicId) !== String(topic.id));
+    const op = topic._opPost || {};
+    entries.unshift({
+      topicId: String(topic.id), title: topic.title || `主题 ${topic.id}`,
+      username: topic._opUsername || op.username || '', avatar: resolveAvatar(op.avatar_template, 48),
+      lastViewedAt: Date.now(), lastPostNumber: normalizedPostNumber,
+      lastReadPostNumber: Number(topic.last_read_post_number) || 0,
+    });
+    saveHistoryEntries(entries);
+  }
+
+  async function collectionCacheIdentity(name, signal) {
+    let scope;
+    try { scope = await readerScope(signal); }
+    catch (error) {
+      if (error && error.name === 'AbortError') throw error;
+      return null;
+    }
+    return { scope, key: `${scope}|collection|${name}` };
+  }
+
+  async function readCollectionCache(name, maxAge, signal) {
+    const identity = await collectionCacheIdentity(name, signal);
+    if (!identity) return null;
+    const record = await readDbRecord('collections', identity.key);
+    if (!record || Date.now() - record.updatedAt > (maxAge || TOPIC_CACHE_FRESH_MS)) return null;
+    return record.payload;
+  }
+
+  async function writeCollectionCache(name, payload, signal) {
+    const identity = await collectionCacheIdentity(name, signal);
+    if (!identity) return;
+    return writeDbRecord('collections', {
+      key: identity.key, scope: identity.scope, name, updatedAt: Date.now(), payload,
     });
   }
 
-  function indexPostsByNumber(posts, ctx) {
-    if (!posts || !posts.length || !ctx.postMap) return;
-    posts.forEach((post) => {
-      ctx.postMap.set(post.post_number, post);
-      if (post.children && post.children.length > 0) {
-        indexPostsByNumber(post.children, ctx);
+  async function invalidateCollectionCache(name) {
+    const identity = await collectionCacheIdentity(name);
+    if (!identity) return;
+    return deleteDbRecord('collections', identity.key);
+  }
+
+  window.addEventListener('pagehide', flushHistoryEntries);
+
+  async function loadBookmarksCollection(signal) {
+    const cached = await readCollectionCache('bookmarks', TOPIC_CACHE_FRESH_MS, signal);
+    if (cached) return cached;
+    const username = await ensureMe(signal);
+    if (!username) return [];
+    const items = [];
+    const seenIds = new Set();
+    const seenUrls = new Set();
+    let page = 0;
+    let nextUrl = `${BASE}/u/${encodeURIComponent(username)}/bookmarks.json?page=0`;
+    while (nextUrl && !seenUrls.has(nextUrl)) {
+      seenUrls.add(nextUrl);
+      const data = await fetchJSON(nextUrl, {
+        signal, priority: page === 0 ? 'visible' : 'background',
+      });
+      const root = data.user_bookmark_list || data;
+      const batch = root.bookmarks || data.bookmarks || [];
+      let added = 0;
+      batch.forEach((item) => {
+        const key = String(item.id || item.bookmark_id);
+        if (!seenIds.has(key)) { seenIds.add(key); items.push(item); added += 1; }
+      });
+      page += 1;
+      nextUrl = root.more_bookmarks_url
+        ? new URL(root.more_bookmarks_url, BASE).href
+        : (batch.length >= 20 && added ? `${BASE}/u/${encodeURIComponent(username)}/bookmarks.json?page=${page}` : '');
+    }
+    await writeCollectionCache('bookmarks', items, signal);
+    return items;
+  }
+
+  async function loadResponsesCollection(signal) {
+    const cached = await readCollectionCache('responses', TOPIC_CACHE_FRESH_MS, signal);
+    if (cached) return cached;
+    const username = await ensureMe(signal);
+    if (!username) return [];
+    const likesPromise = (async () => {
+      const items = [], seen = new Set();
+      let offset = 0;
+      while (true) {
+        const data = await fetchJSON(`${BASE}/user_actions.json?username=${encodeURIComponent(username)}&filter=1&offset=${offset}&limit=60`, {
+          signal, priority: offset ? 'background' : 'visible',
+        });
+        const batch = data.user_actions || [];
+        let added = 0;
+        batch.forEach((item) => {
+          const key = String(item.id || item.post_id);
+          if (!seen.has(key)) { seen.add(key); items.push(Object.assign({ _reactionType: 'like' }, item)); added += 1; }
+        });
+        if (batch.length < 60 || !added) break;
+        offset += batch.length;
       }
+      return items;
+    })();
+    const reactionsPromise = (async () => {
+      const items = [], seenRecords = new Set(), seenCursors = new Set();
+      let cursor = 0;
+      while (true) {
+        const suffix = cursor ? `&before_reaction_user_id=${cursor}` : '';
+        const data = await fetchJSON(`${BASE}/discourse-reactions/posts/reactions.json?username=${encodeURIComponent(username)}${suffix}`, {
+          signal, priority: cursor ? 'background' : 'visible',
+        });
+        REACTIONS_AVAILABLE = true;
+        const batch = data.reactions || data.post_reactions || [];
+        let nextCursor = 0;
+        batch.forEach((item) => {
+          const id = Number(item.id) || 0;
+          if (id && (!nextCursor || id < nextCursor)) nextCursor = id;
+          const key = String(item.id || `${item.post_id}:${item.reaction_value || ''}`);
+          if (!seenRecords.has(key)) { seenRecords.add(key); items.push(Object.assign({ _reactionType: 'reaction' }, item)); }
+        });
+        if (!batch.length || !nextCursor || seenCursors.has(nextCursor)) break;
+        seenCursors.add(nextCursor); cursor = nextCursor;
+      }
+      return items;
+    })().catch((error) => {
+      if (error && error.name === 'AbortError') throw error;
+      if (error && error.status === 404) {
+        REACTIONS_AVAILABLE = false;
+        document.querySelectorAll('.ldp-v2 .ldp-reaction-btn,.ldp-v2 .ldp-reaction-picker').forEach((node) => node.remove());
+      }
+      return [];
     });
+    const items = (await Promise.all([likesPromise, reactionsPromise])).flat()
+      .sort((a, b) => Date.parse(b.created_at || b.acted_at || 0) - Date.parse(a.created_at || a.acted_at || 0));
+    await writeCollectionCache('responses', items, signal);
+    return items;
+  }
+
+  function collectionItemTarget(item) {
+    const topicId = item.topic_id || (item.topic && item.topic.id) || item.bookmarkable_id;
+    const postNumber = item.post_number || (item.post && item.post.post_number) || 1;
+    return { topicId: topicId && String(topicId), postNumber: Number(postNumber) || 1 };
   }
 
   function likeInfo(p) {
@@ -713,55 +1436,835 @@
     return { count: like.count || 0, acted: !!like.acted, canAct: !!like.can_act };
   }
 
-  /* ============ 2.5 通知链接解析 ============ */
-  /**
-   * 解析当前页面 URL 或传入的 href，提取 topicId 和可选的 targetPostNumber。
-   * 支持格式：
-   *   /t/slug/123           → topicId=123, target=null（首次/已读跳转）
-   *   /t/slug/123/456       → topicId=123, target=456
-   *   /t/123                → topicId=123
-   *   /t/123/456            → topicId=123, target=456
-   */
-  function parseTopicHref(href) {
-    if (!href) return null;
-    // 带 slug：/t/slug/id  或  /t/slug/id/postNumber
-    let m = href.match(/\/t\/[^/]+\/(\d+)(?:\/(\d+))?/);
-    if (m) return { topicId: m[1], targetPostNumber: m[2] ? +m[2] : null };
-    // 无 slug：/t/id  或  /t/id/postNumber
-    m = href.match(/\/t\/(\d+)(?:\/(\d+))?/);
-    if (m) return { topicId: m[1], targetPostNumber: m[2] ? +m[2] : null };
-    return null;
+  const REACTION_LABELS = {
+    heart: '❤', '+1': '👍', laughing: '😄', tada: '🎉',
+    open_mouth: '😮', cry: '😢', angry: '😠', confused: '😕',
+    rocket: '🚀', eyes: '👀', fire: '🔥', clap: '👏', thinking: '🤔',
+  };
+
+  function reactionLabel(id) {
+    return REACTION_LABELS[String(id || '')] || `:${String(id || '')}:`;
   }
 
+  function validReactionIds(topic, post) {
+    const source = topic && Array.isArray(topic.valid_reactions) ? topic.valid_reactions
+      : (post && Array.isArray(post.reactions) ? post.reactions.map((item) => item.id) : []);
+    return source.map((item) => String(typeof item === 'string' ? item : (item && (item.id || item.name)) || ''))
+      .filter(Boolean);
+  }
+
+  function parseTopicHref(href) {
+    if (!href) return null;
+    let pathname;
+    try { pathname = new URL(href, location.origin).pathname; }
+    catch (err) { return null; }
+    const parts = pathname.split('/').filter(Boolean);
+    if (parts[0] !== 't' || !parts[1]) return null;
+    const hasSlug = !/^\d+$/.test(parts[1]);
+    const topicPart = hasSlug ? parts[2] : parts[1];
+    const postPart = hasSlug ? parts[3] : parts[2];
+    if (!topicPart || !/^\d+$/.test(topicPart)) return null;
+    return {
+      topicId: topicPart,
+      targetPostNumber: postPart && /^\d+$/.test(postPart) ? Number(postPart) : null,
+    };
+  }
+
+  function resolveInitialTarget(topic, requestedTarget) {
+    const requested = Number(requestedTarget) || 0;
+    if (requested > 0) return requested;
+    const lastRead = Number(topic && topic.last_read_post_number) || 0;
+    const highest = Number(topic && topic.highest_post_number)
+        || Number(topic && topic.posts_count)
+        || 1;
+    return lastRead > 0 && lastRead < highest ? lastRead + 1 : 1;
+  }
+
+  /* ============ 2.5 保存首帖快照到 Obsidian ============ */
+  // Markdown 转换与写入流程移植并改编自 zsq 的 MIT 脚本：
+  // https://greasyfork.org/zh-CN/scripts/587200-linux-do-%E5%B8%96%E5%AD%90%E4%BF%9D%E5%AD%98%E5%88%B0-obsidian
+  const OBSIDIAN_SETTINGS_KEY = 'ldp-obsidian-settings-v1';
+  const OBSIDIAN_TOPIC_PATHS_KEY = 'ldp-obsidian-topic-paths-v2';
+  const OBSIDIAN_DEFAULT_SETTINGS = {
+    mode: 'rest',
+    apiUrl: 'http://127.0.0.1:27123',
+    apiKey: '',
+    vaultName: '',
+    baseFolder: '论坛收藏',
+  };
+  let OBSIDIAN_SAVING = false;
+  let OBSIDIAN_SAVE_TEXT = '保存到 Obsidian';
+  let CURRENT_OBSIDIAN_DIALOG_CLOSE = null;
+  let OBSIDIAN_PAGE_ACTIONS_RAF = 0;
+  let CATEGORY_SITE_CACHE = null;
+
+  function getGMMethod(name) {
+    if (typeof GM !== 'undefined' && GM && typeof GM[name] === 'function') {
+      return GM[name].bind(GM);
+    }
+    throw new Error('当前脚本管理器不支持所需的 GM.' + name + ' 接口');
+  }
+
+  async function loadObsidianSettings() {
+    const stored = await getGMMethod('getValue')(OBSIDIAN_SETTINGS_KEY, {});
+    const value = stored && typeof stored === 'object' ? stored : {};
+    const settings = Object.assign({}, OBSIDIAN_DEFAULT_SETTINGS, value);
+    if (settings.mode !== 'rest' && settings.mode !== 'uri') settings.mode = 'rest';
+    return settings;
+  }
+
+  async function persistObsidianSettings(settings) {
+    await getGMMethod('setValue')(OBSIDIAN_SETTINGS_KEY, settings);
+  }
+
+  function obsidianErrorMessage(error) {
+    if (error && error.name === 'AbortError') return '操作已取消';
+    return error instanceof Error ? error.message : String(error || '未知错误');
+  }
+
+  function showObsidianToast(message, type, duration) {
+    document.querySelectorAll('.ldp-obsidian-toast').forEach((node) => node.remove());
+    const toast = document.createElement('div');
+    toast.className = 'ldp-obsidian-toast';
+    toast.dataset.type = type || 'info';
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), duration || (type === 'error' ? 8000 : 5500));
+  }
+
+  function setObsidianSaveState(text, busy) {
+    OBSIDIAN_SAVE_TEXT = text;
+    OBSIDIAN_SAVING = !!busy;
+    document.querySelectorAll('[data-ldp-obsidian-save]').forEach((button) => {
+      const label = button.querySelector('.ldp-obsidian-label');
+      if (label) label.textContent = text;
+      button.disabled = !!busy;
+      button.setAttribute('aria-busy', busy ? 'true' : 'false');
+    });
+    document.querySelectorAll('[data-ldp-obsidian-settings]').forEach((button) => {
+      button.disabled = !!busy;
+    });
+  }
+
+  async function copyTopicUrl(topicId) {
+    const topicUrl = `${BASE}/t/${encodeURIComponent(String(topicId))}`;
+    try {
+      await copyText(topicUrl);
+      showObsidianToast('帖子链接已复制', 'success');
+    } catch (error) {
+      showObsidianToast('复制失败，请检查浏览器剪贴板权限', 'error');
+    }
+  }
+
+  function createObsidianActionGroup(topicId, topicProvider, extraClass) {
+    const group = document.createElement('div');
+    group.className = 'ldp-obsidian-actions' + (extraClass ? ` ${extraClass}` : '');
+    group.dataset.topicId = String(topicId);
+    group.innerHTML = `
+      <button type="button" class="ldp-obsidian-save" data-ldp-obsidian-save
+        title="将楼主首帖保存为新的 Obsidian 快照" aria-label="保存到 Obsidian">
+        <svg viewBox="0 0 24 24" aria-hidden="true">${ICONS.download}</svg>
+        <span class="ldp-obsidian-label"></span>
+      </button>
+      <button type="button" class="ldp-obsidian-copy" data-ldp-obsidian-copy
+        title="复制帖子链接" aria-label="复制帖子链接">
+        <svg viewBox="0 0 24 24" aria-hidden="true">${ICONS.copy}</svg>
+      </button>
+      <button type="button" class="ldp-obsidian-settings" data-ldp-obsidian-settings
+        title="设置 Obsidian 连接" aria-label="设置 Obsidian 连接">
+        <svg viewBox="0 0 24 24" aria-hidden="true">${ICONS.settings}</svg>
+      </button>`;
+    const saveButton = group.querySelector('[data-ldp-obsidian-save]');
+    const copyButton = group.querySelector('[data-ldp-obsidian-copy]');
+    const settingsButton = group.querySelector('[data-ldp-obsidian-settings]');
+    saveButton.querySelector('.ldp-obsidian-label').textContent = OBSIDIAN_SAVE_TEXT;
+    saveButton.disabled = OBSIDIAN_SAVING;
+    saveButton.setAttribute('aria-busy', OBSIDIAN_SAVING ? 'true' : 'false');
+    settingsButton.disabled = OBSIDIAN_SAVING;
+    saveButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const suppliedTopic = typeof topicProvider === 'function' ? topicProvider() : null;
+      saveTopicToObsidian(topicId, suppliedTopic);
+    });
+    copyButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      copyTopicUrl(topicId);
+    });
+    settingsButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      showObsidianSettings();
+    });
+    return group;
+  }
+
+  function validateObsidianApiUrl(value) {
+    let url;
+    try { url = new URL(String(value || '').trim()); }
+    catch (error) { throw new Error('REST API 地址格式不正确'); }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error('REST API 只支持 HTTP 或 HTTPS');
+    }
+    if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost') {
+      throw new Error('为保护 API Key，REST API 地址只允许 localhost 或 127.0.0.1');
+    }
+    if (url.username || url.password || url.search || url.hash) {
+      throw new Error('REST API 地址不能包含账号、查询参数或锚点');
+    }
+    return url.origin;
+  }
+
+  function obsidianGMRequest(options) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (handler) => (value) => {
+        if (settled) return;
+        settled = true;
+        handler(value);
+      };
+      const onResolve = finish(resolve);
+      const onReject = finish(reject);
+      const requestOptions = Object.assign({}, options, {
+        timeout: 20000,
+        onload: onResolve,
+        onerror: () => onReject(new Error('无法连接 Obsidian Local REST API')),
+        ontimeout: () => onReject(new Error('连接 Obsidian Local REST API 超时')),
+        onabort: () => onReject(new Error('Obsidian 请求已取消')),
+      });
+      try {
+        const request = getGMMethod('xmlHttpRequest')(requestOptions);
+        if (request && typeof request.then === 'function') request.then(onResolve, onReject);
+      } catch (error) {
+        onReject(error);
+      }
+    });
+  }
+
+  async function testObsidianRest(apiUrl, apiKey) {
+    const origin = validateObsidianApiUrl(apiUrl);
+    if (!String(apiKey || '').trim()) throw new Error('请先填写 Local REST API Key');
+    const response = await obsidianGMRequest({
+      method: 'GET',
+      url: origin + '/',
+      headers: { Authorization: `Bearer ${String(apiKey).trim()}` },
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error('服务响应异常：HTTP ' + response.status);
+    }
+  }
+
+  async function saveObsidianWithRest(markdown, vaultPath, settings) {
+    const origin = validateObsidianApiUrl(settings.apiUrl);
+    const apiKey = String(settings.apiKey || '').trim();
+    if (!apiKey) throw new Error('请先填写 Local REST API Key');
+    const encodedPath = vaultPath.split('/').map(encodeURIComponent).join('/');
+    const response = await obsidianGMRequest({
+      method: 'PUT',
+      url: `${origin}/vault/${encodedPath}`,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'text/markdown; charset=utf-8',
+      },
+      data: markdown,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error('Obsidian 写入失败：HTTP ' + response.status);
+    }
+  }
+
+  async function inspectObsidianRestPath(settings, vaultPath, topicId) {
+    const origin = validateObsidianApiUrl(settings.apiUrl);
+    const apiKey = String(settings.apiKey || '').trim();
+    if (!apiKey) throw new Error('请先填写 Local REST API Key');
+    const encodedPath = vaultPath.split('/').map(encodeURIComponent).join('/');
+    const response = await obsidianGMRequest({
+      method: 'GET',
+      url: `${origin}/vault/${encodedPath}`,
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (response.status === 404) return 'available';
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error('检查 Obsidian 笔记失败：HTTP ' + response.status);
+    }
+    const content = String(response.responseText || '');
+    const escapedTopicId = String(topicId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const isSameTopic = new RegExp(`(?:\\*\\*帖子 ID\\*\\*：|topic_id:\\s*)${escapedTopicId}(?:\\s|$)`).test(content);
+    return isSameTopic ? 'same-topic' : 'occupied';
+  }
+
+  async function saveObsidianWithUri(markdown, vaultPath, settings, overwrite) {
+    await getGMMethod('setClipboard')(markdown, 'text');
+    const params = new URLSearchParams();
+    const vaultName = String(settings.vaultName || '').trim();
+    if (vaultName) params.set('vault', vaultName);
+    params.set('file', vaultPath);
+    params.set('clipboard', 'true');
+    if (overwrite) params.set('overwrite', 'true');
+    const link = document.createElement('a');
+    link.href = `obsidian://new?${params.toString()}`;
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  async function showObsidianSettings() {
+    if (CURRENT_OBSIDIAN_DIALOG_CLOSE) CURRENT_OBSIDIAN_DIALOG_CLOSE(false);
+    const settings = await loadObsidianSettings();
+    const returnFocus = document.activeElement;
+    return new Promise((resolve) => {
+      let closed = false;
+      const overlay = document.createElement('div');
+      overlay.className = 'ldp-obsidian-dialog-overlay';
+      overlay.innerHTML = `
+        <form class="ldp-obsidian-dialog" role="dialog" aria-modal="true" aria-labelledby="ldp-obsidian-dialog-title">
+          <div class="ldp-obsidian-dialog-head">
+            <div>
+              <h2 id="ldp-obsidian-dialog-title">保存到 Obsidian</h2>
+              <p class="ldp-obsidian-dialog-subtitle">同一帖子再次保存时更新原笔记，不创建重复文件</p>
+            </div>
+            <button type="button" class="ldp-obsidian-dialog-close" title="关闭" aria-label="关闭设置">×</button>
+          </div>
+          <p class="ldp-obsidian-dialog-note">REST 模式不会切换窗口，但需要 Obsidian 正在运行并启用 Local REST API；URI 模式无需插件，会打开 Obsidian 并使用剪贴板。</p>
+          <label for="ldp-obsidian-mode">写入方式</label>
+          <select id="ldp-obsidian-mode">
+            <option value="rest">直接写入 Vault（推荐）</option>
+            <option value="uri">Obsidian URI（会打开 Obsidian）</option>
+          </select>
+          <div data-ldp-rest-fields>
+            <label for="ldp-obsidian-api-url">Local REST API 地址</label>
+            <input id="ldp-obsidian-api-url" type="url" inputmode="url" autocomplete="off">
+            <label for="ldp-obsidian-api-key">API Key</label>
+            <input id="ldp-obsidian-api-key" type="password" autocomplete="off">
+            <p class="ldp-obsidian-dialog-help">Key 只保存在油猴私有存储，并且只能发送到本机地址。</p>
+            <button type="button" class="ldp-obsidian-test">测试连接</button>
+          </div>
+          <div data-ldp-uri-fields>
+            <label for="ldp-obsidian-vault">Vault 名称</label>
+            <input id="ldp-obsidian-vault" type="text" placeholder="留空则使用当前 Vault">
+            <p class="ldp-obsidian-dialog-help">保存时会复制 Markdown，并调用 obsidian://new。</p>
+          </div>
+          <label for="ldp-obsidian-folder">基础目录</label>
+          <input id="ldp-obsidian-folder" type="text" placeholder="论坛收藏">
+          <p class="ldp-obsidian-dialog-help">实际路径会自动追加站点和帖子标题；同一帖子始终复用原路径。</p>
+          <div class="ldp-obsidian-dialog-status" aria-live="polite"></div>
+          <div class="ldp-obsidian-dialog-actions">
+            <button type="button" class="ldp-obsidian-secondary" data-action="cancel">取消</button>
+            <button type="submit" class="ldp-obsidian-primary">保存设置</button>
+          </div>
+        </form>`;
+      document.body.appendChild(overlay);
+      const form = overlay.querySelector('form');
+      const modeInput = overlay.querySelector('#ldp-obsidian-mode');
+      const apiUrlInput = overlay.querySelector('#ldp-obsidian-api-url');
+      const apiKeyInput = overlay.querySelector('#ldp-obsidian-api-key');
+      const vaultInput = overlay.querySelector('#ldp-obsidian-vault');
+      const folderInput = overlay.querySelector('#ldp-obsidian-folder');
+      const restFields = overlay.querySelector('[data-ldp-rest-fields]');
+      const uriFields = overlay.querySelector('[data-ldp-uri-fields]');
+      const status = overlay.querySelector('.ldp-obsidian-dialog-status');
+      const testButton = overlay.querySelector('.ldp-obsidian-test');
+      modeInput.value = settings.mode;
+      apiUrlInput.value = settings.apiUrl;
+      apiKeyInput.value = settings.apiKey;
+      vaultInput.value = settings.vaultName;
+      folderInput.value = settings.baseFolder;
+
+      function updateModeFields() {
+        restFields.hidden = modeInput.value !== 'rest';
+        uriFields.hidden = modeInput.value !== 'uri';
+      }
+      function setStatus(message, type) {
+        status.textContent = message || '';
+        status.dataset.type = type || 'info';
+      }
+      function close(result) {
+        if (closed) return;
+        closed = true;
+        overlay.remove();
+        document.removeEventListener('keydown', onKeyDown, true);
+        if (CURRENT_OBSIDIAN_DIALOG_CLOSE === close) CURRENT_OBSIDIAN_DIALOG_CLOSE = null;
+        if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+          returnFocus.focus({ preventScroll: true });
+        }
+        resolve(result);
+      }
+      function onKeyDown(event) {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        close(false);
+      }
+      CURRENT_OBSIDIAN_DIALOG_CLOSE = close;
+      modeInput.addEventListener('change', updateModeFields);
+      updateModeFields();
+      overlay.querySelector('.ldp-obsidian-dialog-close').addEventListener('click', () => close(false));
+      overlay.querySelector('[data-action="cancel"]').addEventListener('click', () => close(false));
+      overlay.addEventListener('click', (event) => { if (event.target === overlay) close(false); });
+      document.addEventListener('keydown', onKeyDown, true);
+      testButton.addEventListener('click', async () => {
+        testButton.disabled = true;
+        setStatus('正在测试连接…');
+        try {
+          await testObsidianRest(apiUrlInput.value, apiKeyInput.value);
+          setStatus('服务连接成功。', 'success');
+        } catch (error) {
+          setStatus(obsidianErrorMessage(error), 'error');
+        } finally {
+          testButton.disabled = false;
+        }
+      });
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        try {
+          const nextSettings = {
+            mode: modeInput.value,
+            apiUrl: apiUrlInput.value.trim(),
+            apiKey: apiKeyInput.value.trim(),
+            vaultName: vaultInput.value.trim(),
+            baseFolder: folderInput.value.trim() || OBSIDIAN_DEFAULT_SETTINGS.baseFolder,
+          };
+          if (nextSettings.mode === 'rest') {
+            nextSettings.apiUrl = validateObsidianApiUrl(nextSettings.apiUrl);
+            if (!nextSettings.apiKey) throw new Error('请填写 Local REST API Key');
+          }
+          await persistObsidianSettings(nextSettings);
+          close(true);
+        } catch (error) {
+          setStatus(obsidianErrorMessage(error), 'error');
+        }
+      });
+      modeInput.focus({ preventScroll: true });
+    });
+  }
+
+  function confirmObsidianUpdate(vaultPath) {
+    if (CURRENT_OBSIDIAN_DIALOG_CLOSE) CURRENT_OBSIDIAN_DIALOG_CLOSE(false);
+    const returnFocus = document.activeElement;
+    return new Promise((resolve) => {
+      let closed = false;
+      const overlay = document.createElement('div');
+      overlay.className = 'ldp-obsidian-dialog-overlay';
+      overlay.innerHTML = `
+        <div class="ldp-obsidian-dialog ldp-obsidian-confirm" role="dialog" aria-modal="true"
+          aria-labelledby="ldp-obsidian-confirm-title">
+          <div class="ldp-obsidian-confirm-icon" aria-hidden="true">↻</div>
+          <h2 id="ldp-obsidian-confirm-title">检测到已保存的帖子</h2>
+          <p class="ldp-obsidian-confirm-copy">此帖子已经保存到 Obsidian。继续后会更新原笔记，不会创建重复文件。</p>
+          <code class="ldp-obsidian-confirm-path"></code>
+          <div class="ldp-obsidian-dialog-actions">
+            <button type="button" class="ldp-obsidian-secondary" data-action="cancel">取消</button>
+            <button type="button" class="ldp-obsidian-primary" data-action="update">更新原笔记</button>
+          </div>
+        </div>`;
+      document.body.appendChild(overlay);
+      overlay.querySelector('.ldp-obsidian-confirm-path').textContent = vaultPath;
+      const updateButton = overlay.querySelector('[data-action="update"]');
+
+      function close(result) {
+        if (closed) return;
+        closed = true;
+        overlay.remove();
+        document.removeEventListener('keydown', onKeyDown, true);
+        if (CURRENT_OBSIDIAN_DIALOG_CLOSE === close) CURRENT_OBSIDIAN_DIALOG_CLOSE = null;
+        if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+          returnFocus.focus({ preventScroll: true });
+        }
+        resolve(result);
+      }
+      function onKeyDown(event) {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        close(false);
+      }
+      CURRENT_OBSIDIAN_DIALOG_CLOSE = close;
+      overlay.querySelector('[data-action="cancel"]').addEventListener('click', () => close(false));
+      updateButton.addEventListener('click', () => close(true));
+      overlay.addEventListener('click', (event) => { if (event.target === overlay) close(false); });
+      document.addEventListener('keydown', onKeyDown, true);
+      updateButton.focus({ preventScroll: true });
+    });
+  }
+
+  function makeObsidianAbsoluteUrl(value) {
+    if (!value || /^(?:#|data:|mailto:|obsidian:)/i.test(value)) return value;
+    try { return new URL(value, BASE + '/').href; }
+    catch (error) { return value; }
+  }
+
+  function normalizeObsidianCodeLanguage(language, value) {
+    const normalized = String(language || '').toLowerCase();
+    if (normalized && normalized !== 'auto') return normalized;
+    if (/\b(?:irm|invoke-restmethod)\b|\|\s*iex\b|\$env:/i.test(value)) return 'powershell';
+    if (/^\s*(?:#!.*\b(?:bash|sh)|(?:sudo\s+)?(?:bash|sh|curl|wget)\b)/im.test(value)) return 'bash';
+    const trimmed = String(value || '').trim();
+    if (trimmed && /^[\[{]/.test(trimmed)) {
+      try { JSON.parse(trimmed); return 'json'; }
+      catch (error) { /* 继续按纯文本处理 */ }
+    }
+    return 'text';
+  }
+
+  function quoteObsidianMarkdown(markdown, prefix) {
+    const actualPrefix = prefix || '> ';
+    return String(markdown || '').split('\n')
+        .map((line) => line ? actualPrefix + line : actualPrefix.trimEnd()).join('\n');
+  }
+
+  function cookedHtmlToObsidianMarkdown(cooked) {
+    const container = document.createElement('div');
+    container.innerHTML = cooked || '';
+    container.querySelectorAll('script,style,iframe,object,embed,form,button,.lightbox-wrapper .meta')
+        .forEach((node) => node.remove());
+    container.querySelectorAll('img.emoji').forEach((image) => {
+      image.replaceWith(document.createTextNode(image.getAttribute('alt') || ''));
+    });
+    container.querySelectorAll('a.anchor').forEach((anchor) => anchor.remove());
+    const codeBlocks = new Map();
+    let codeBlockIndex = 0;
+
+    function renderChildren(element) {
+      return Array.from(element.childNodes).map((node) => renderNode(node)).join('');
+    }
+    function renderList(element, ordered) {
+      const items = Array.from(element.children).filter((child) => child.tagName === 'LI');
+      return items.map((item, index) => {
+        const nestedLists = Array.from(item.children).filter((child) => child.tagName === 'UL' || child.tagName === 'OL');
+        const body = Array.from(item.childNodes).filter((node) => !nestedLists.includes(node))
+            .map((node) => renderNode(node)).join('').trim().replace(/\n{2,}/g, '\n');
+        const marker = ordered ? `${index + 1}. ` : '- ';
+        const renderedBody = body.split('\n')
+            .map((line, lineIndex) => lineIndex === 0 ? marker + line : '  ' + line).join('\n');
+        const renderedNested = nestedLists.map((nested) => renderNode(nested).trim()).filter(Boolean)
+            .map((nested) => nested.split('\n').map((line) => '  ' + line).join('\n')).join('\n');
+        return [renderedBody, renderedNested].filter(Boolean).join('\n');
+      }).join('\n') + '\n\n';
+    }
+    function renderTable(element) {
+      const rows = Array.from(element.rows || []);
+      if (!rows.length) return '';
+      const values = rows.map((row) => Array.from(row.cells).map((cell) => renderChildren(cell)
+          .trim().replace(/\|/g, '\\|').replace(/\s*\n+\s*/g, ' / ')));
+      const width = Math.max(...values.map((row) => row.length));
+      const normalized = values.map((row) => row.concat(Array.from({ length: width - row.length }, () => '')));
+      return [
+        `| ${normalized[0].join(' | ')} |`,
+        `| ${Array.from({ length: width }, () => '---').join(' | ')} |`,
+        ...normalized.slice(1).map((row) => `| ${row.join(' | ')} |`),
+        '',
+      ].join('\n');
+    }
+    function renderNode(node) {
+      if (node.nodeType === Node.TEXT_NODE) return String(node.nodeValue || '').replace(/[\t\r\n ]+/g, ' ');
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+      const element = node;
+      const tag = element.tagName;
+      const body = () => renderChildren(element).trim();
+      if (tag === 'BR') return '\n';
+      if (/^H[1-6]$/.test(tag)) return `${'#'.repeat(Math.min(Number(tag.slice(1)) + 2, 6))} ${body()}\n\n`;
+      if (['P', 'DIV', 'SECTION', 'ARTICLE', 'FIGURE', 'FIGCAPTION'].includes(tag)) {
+        const content = body();
+        return content ? content + '\n\n' : '';
+      }
+      if (tag === 'STRONG' || tag === 'B') return `**${body()}**`;
+      if (tag === 'EM' || tag === 'I') return `*${body()}*`;
+      if (tag === 'DEL' || tag === 'S' || tag === 'STRIKE') return `~~${body()}~~`;
+      if (tag === 'MARK') return `==${body()}==`;
+      if (tag === 'A') {
+        const href = makeObsidianAbsoluteUrl(element.getAttribute('href') || '');
+        const label = body() || href;
+        return href ? `[${label}](${href})` : label;
+      }
+      if (tag === 'IMG') {
+        const source = element.getAttribute('data-orig-src') || element.getAttribute('data-large-uri')
+            || element.getAttribute('data-src') || element.getAttribute('src');
+        if (!source) return element.getAttribute('alt') || '';
+        const alt = String(element.getAttribute('alt') || '图片').replace(/[\[\]]/g, '');
+        return `![${alt}](<${makeObsidianAbsoluteUrl(source)}>)`;
+      }
+      if (tag === 'PRE') {
+        const code = element.querySelector('code');
+        const value = String((code && code.textContent) || element.textContent || '').replace(/^\n|\n$/g, '');
+        const className = (code && code.className) || element.className || '';
+        const match = className.match(/(?:lang(?:uage)?-)([\w+-]+)/i);
+        const language = match && match[1];
+        const runs = Array.from(value.matchAll(/`+/g), (item) => item[0].length + 1);
+        const fence = '`'.repeat(Math.max(3, ...runs));
+        const token = `LDP_OBSIDIAN_CODE_${codeBlockIndex}_PLACEHOLDER`;
+        codeBlockIndex += 1;
+        codeBlocks.set(token, `${fence}${normalizeObsidianCodeLanguage(language, value)}\n${value}\n${fence}`);
+        return `\n\n${token}\n\n`;
+      }
+      if (tag === 'CODE') {
+        const value = element.textContent || '';
+        const runs = Array.from(value.matchAll(/`+/g), (item) => item[0].length + 1);
+        const fence = '`'.repeat(Math.max(1, ...runs));
+        return `${fence}${value}${fence}`;
+      }
+      if (tag === 'ASIDE' && element.classList.contains('quote')) {
+        const titleElement = element.querySelector('.quote-title__text-content a')
+            || element.querySelector('.title a') || element.querySelector('.title');
+        const title = String((titleElement && titleElement.textContent) || '引用').replace(/\s+/g, ' ').trim();
+        const quoted = element.querySelector('blockquote');
+        const content = quoted ? renderChildren(quoted).trim() : body();
+        return [`> [!quote] ${title}`, quoteObsidianMarkdown(content), ''].join('\n') + '\n';
+      }
+      if (tag === 'BLOCKQUOTE') return quoteObsidianMarkdown(body()) + '\n\n';
+      if (tag === 'UL') return renderList(element, false);
+      if (tag === 'OL') return renderList(element, true);
+      if (tag === 'TABLE') return renderTable(element);
+      if (tag === 'HR') return '\n---\n\n';
+      if (tag === 'KBD') return `\`${element.textContent || ''}\``;
+      return renderChildren(element);
+    }
+
+    let markdown = renderChildren(container).replace(/\u00a0/g, ' ').replace(/[ \t]+\n/g, '\n')
+        .replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    for (const [token, codeBlock] of codeBlocks) markdown = markdown.replace(token, codeBlock);
+    return markdown;
+  }
+
+  function formatObsidianDateTime(value) {
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) return String(value || '');
+    return new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+      second: '2-digit', hour12: false,
+    }).format(date).replaceAll('/', '-');
+  }
+
+  function sanitizeObsidianPathSegment(value, fallback) {
+    const sanitized = String(value || '').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+        .replace(/\.{2,}/g, '.').replace(/\s+/g, ' ').replace(/[. ]+$/g, '').trim();
+    return (sanitized || fallback || '').slice(0, 90);
+  }
+
+  function obsidianSiteInfo() {
+    if (location.hostname === 'idcflare.com') {
+      return { directory: 'IDC Flare', source: 'idcflare.com', tag: 'idc-flare' };
+    }
+    return { directory: 'LINUX DO', source: 'linux.do', tag: 'linux-do' };
+  }
+
+  async function getObsidianCategoryName(topic) {
+    const direct = String((topic.category && topic.category.name) || topic.category_name || '').trim();
+    if (direct) return direct;
+    if (!topic.category_id) return '未分类';
+    try {
+      if (!CATEGORY_SITE_CACHE) {
+        CATEGORY_SITE_CACHE = await fetchJSON(`${BASE}/site.json`, { cache: 'force-cache' });
+      }
+      const categories = CATEGORY_SITE_CACHE.categories || [];
+      const category = categories.find((item) => Number(item.id) === Number(topic.category_id));
+      return String((category && category.name) || '').trim() || '未分类';
+    } catch (error) {
+      return '未分类';
+    }
+  }
+
+  async function loadObsidianTopic(topicId, suppliedTopic) {
+    let topic = suppliedTopic && String(suppliedTopic.id) === String(topicId) ? suppliedTopic : null;
+    if (!topic) topic = await fetchJSON(`${BASE}/t/${topicId}.json`, { cache: 'no-store' });
+    let firstPost = topic._opPost || ((topic.post_stream && topic.post_stream.posts) || [])
+        .find((post) => Number(post.post_number) === 1);
+    if (!firstPost) {
+      const anchor = await fetchJSON(`${BASE}/t/${topicId}.json?post_number=1`, { cache: 'no-store' });
+      firstPost = ((anchor.post_stream && anchor.post_stream.posts) || [])
+          .find((post) => Number(post.post_number) === 1);
+    }
+    if (!firstPost || !firstPost.cooked) throw new Error('没有读取到楼主首帖，可能是帖子权限不足');
+    topic._obsidianFirstPost = firstPost;
+    topic._obsidianCategoryName = await getObsidianCategoryName(topic);
+    return topic;
+  }
+
+  function buildObsidianVaultPath(settings, topic, duplicateIndex) {
+    const baseSegments = String(settings.baseFolder || OBSIDIAN_DEFAULT_SETTINGS.baseFolder).split('/')
+        .map((segment) => sanitizeObsidianPathSegment(segment, '')).filter(Boolean);
+    const site = obsidianSiteInfo();
+    const title = sanitizeObsidianPathSegment(topic.title, '未命名主题');
+    const suffix = duplicateIndex > 1 ? `-${duplicateIndex}` : '';
+    const filename = `${title}${suffix}.md`;
+    return baseSegments.concat(site.directory, filename).join('/');
+  }
+
+  async function resolveObsidianVaultTarget(settings, topic) {
+    const stored = await getGMMethod('getValue')(OBSIDIAN_TOPIC_PATHS_KEY, {});
+    const topicPaths = stored && typeof stored === 'object' ? stored : {};
+    const baseFolderKey = String(settings.baseFolder || OBSIDIAN_DEFAULT_SETTINGS.baseFolder).split('/')
+        .map((segment) => sanitizeObsidianPathSegment(segment, '')).filter(Boolean).join('/');
+    const site = obsidianSiteInfo();
+    const key = `${site.source}|${baseFolderKey}|${topic.id}`;
+    if (typeof topicPaths[key] === 'string' && topicPaths[key]) {
+      return { key, path: topicPaths[key], topicPaths, isUpdate: true, shouldRemember: false };
+    }
+
+    const occupiedPaths = new Set(Object.values(topicPaths).filter((value) => typeof value === 'string'));
+    let duplicateIndex = 1;
+    let path = buildObsidianVaultPath(settings, topic, duplicateIndex);
+    while (true) {
+      if (!occupiedPaths.has(path) && settings.mode === 'rest') {
+        const pathState = await inspectObsidianRestPath(settings, path, topic.id);
+        if (pathState === 'same-topic') {
+          return { key, path, topicPaths, isUpdate: true, shouldRemember: true };
+        }
+        if (pathState === 'available') break;
+      } else if (!occupiedPaths.has(path)) {
+        break;
+      }
+      duplicateIndex += 1;
+      path = buildObsidianVaultPath(settings, topic, duplicateIndex);
+    }
+    return { key, path, topicPaths, isUpdate: false, shouldRemember: true };
+  }
+
+  async function rememberObsidianVaultTarget(target) {
+    if (!target.shouldRemember) return;
+    target.topicPaths[target.key] = target.path;
+    await getGMMethod('setValue')(OBSIDIAN_TOPIC_PATHS_KEY, target.topicPaths);
+  }
+
+  function buildObsidianMarkdown(topic, snapshotDate) {
+    const firstPost = topic._obsidianFirstPost;
+    const site = obsidianSiteInfo();
+    const sourceUrl = `${BASE}/t/${topic.slug || 'topic'}/${topic.id}`;
+    const sourceTags = Array.isArray(topic.tags)
+      ? topic.tags.map((tag) => typeof tag === 'string' ? tag : tag && tag.name).filter(Boolean)
+      : [];
+    const tags = Array.from(new Set([site.tag].concat(sourceTags)));
+    const author = firstPost.username || firstPost.display_username || 'unknown';
+    const tagLine = tags.map((tag) => {
+      const normalized = String(tag || '').trim().replace(/^#+/, '').replace(/\s+/g, '-');
+      return normalized ? `#${normalized}` : '';
+    }).filter(Boolean).join(' ');
+    const body = cookedHtmlToObsidianMarkdown(firstPost.cooked);
+    const information = [
+      '> [!info] 帖子信息',
+      `> - **原帖链接**：[打开原帖](${sourceUrl})`,
+      `> - **站点**：${site.directory}`,
+      `> - **帖子 ID**：${topic.id}`,
+      `> - **分类**：${topic._obsidianCategoryName || '未分类'}`,
+      `> - **楼主**：@${author}`,
+      `> - **发布时间**：${formatObsidianDateTime(firstPost.created_at || topic.created_at)}`,
+      `> - **更新时间**：${formatObsidianDateTime(firstPost.updated_at || firstPost.created_at)}`,
+      `> - **保存时间**：${formatObsidianDateTime(snapshotDate.toISOString())}`,
+    ].join('\n');
+    return [information, '', `**标签**： ${tagLine}`, '', '## 主帖', '', body, '',
+      `— [返回原帖](${sourceUrl})`, ''].join('\n');
+  }
+
+  async function saveTopicToObsidian(topicId, suppliedTopic) {
+    if (OBSIDIAN_SAVING) return;
+    setObsidianSaveState('准备中…', true);
+    try {
+      let settings = await loadObsidianSettings();
+      if (settings.mode === 'rest' && !String(settings.apiKey || '').trim()) {
+        setObsidianSaveState('等待配置…', true);
+        const configured = await showObsidianSettings();
+        if (!configured) return;
+        settings = await loadObsidianSettings();
+      }
+      setObsidianSaveState('读取首帖…', true);
+      const topic = await loadObsidianTopic(topicId, suppliedTopic);
+      setObsidianSaveState('转换 Markdown…', true);
+      const snapshotDate = new Date();
+      const markdown = buildObsidianMarkdown(topic, snapshotDate);
+      const vaultTarget = await resolveObsidianVaultTarget(settings, topic);
+      const vaultPath = vaultTarget.path;
+      if (vaultTarget.isUpdate) {
+        setObsidianSaveState('等待确认…', true);
+        const shouldUpdate = await confirmObsidianUpdate(vaultPath);
+        if (!shouldUpdate) {
+          showObsidianToast('已取消更新 Obsidian 笔记', 'info');
+          return;
+        }
+      }
+      if (settings.mode === 'rest') {
+        setObsidianSaveState('写入 Obsidian…', true);
+        await saveObsidianWithRest(markdown, vaultPath, settings);
+        await rememberObsidianVaultTarget(vaultTarget);
+        showObsidianToast(`${vaultTarget.isUpdate ? '已更新' : '已保存'} Obsidian 笔记：${vaultPath}`, 'success');
+      } else {
+        setObsidianSaveState('打开 Obsidian…', true);
+        await saveObsidianWithUri(markdown, vaultPath, settings, vaultTarget.isUpdate);
+        await rememberObsidianVaultTarget(vaultTarget);
+        showObsidianToast(`Markdown 已复制，正在${vaultTarget.isUpdate ? '更新' : '创建'} Obsidian 笔记：${vaultPath}`, 'success');
+      }
+    } catch (error) {
+      showObsidianToast(obsidianErrorMessage(error), 'error');
+    } finally {
+      setObsidianSaveState('保存到 Obsidian', false);
+    }
+  }
+
+  function syncObsidianPageActions() {
+    const parsed = parseTopicHref(location.href);
+    const existing = document.querySelector('.ldp-obsidian-page-actions');
+    if (!parsed) {
+      if (existing) existing.remove();
+      return;
+    }
+    const title = document.querySelector('#topic-title h1, #topic-title .fancy-title, .topic-title h1');
+    if (!title) return;
+    const host = title.closest('.title-wrapper') || title.parentElement;
+    if (!host) return;
+    if (existing && existing.parentElement === host && existing.dataset.topicId === String(parsed.topicId)) return;
+    if (existing) existing.remove();
+    host.appendChild(createObsidianActionGroup(parsed.topicId, null, 'ldp-obsidian-page-actions'));
+  }
+
+  function scheduleObsidianPageActions() {
+    if (OBSIDIAN_PAGE_ACTIONS_RAF) return;
+    OBSIDIAN_PAGE_ACTIONS_RAF = requestAnimationFrame(() => {
+      OBSIDIAN_PAGE_ACTIONS_RAF = 0;
+      syncObsidianPageActions();
+    });
+  }
+
+  function startObsidianPageActions() {
+    scheduleObsidianPageActions();
+    const observer = new MutationObserver(scheduleObsidianPageActions);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    window.addEventListener('popstate', scheduleObsidianPageActions);
+    window.addEventListener('hashchange', scheduleObsidianPageActions);
+  }
+
+  /* ============ 2.6 Boosts 气泡渲染辅助 ============ */
   /* ============ 2.55 Emoji Picker ============ */
   const EMOJI_CACHE_KEY = 'ldp_recent_emojis';
   const EMOJI_RECENT_MAX = 10;
+  const EMOJI_CDN_BASE = location.hostname === 'linux.do' ? 'https://cdn.ldstatic.com' : BASE;
   let emojiDataCache = null;
   let emojiDataLoading = null;
-
-  function getRecentEmojis() {
-    try { return JSON.parse(localStorage.getItem(EMOJI_CACHE_KEY)) || []; }
-    catch { return []; }
-  }
-  function addRecentEmoji(name) {
-    let list = getRecentEmojis().filter(n => n !== name);
-    list.unshift(name);
-    if (list.length > EMOJI_RECENT_MAX) list = list.slice(0, EMOJI_RECENT_MAX);
-    localStorage.setItem(EMOJI_CACHE_KEY, JSON.stringify(list));
-  }
-
   let _emojiSet = 'twemoji';
   (function detectEmojiSet() {
     const img = document.querySelector('img.emoji[src*="/images/emoji/"]');
-    if (img) { const m = img.src.match(/\/images\/emoji\/([^/]+)\//); if (m) _emojiSet = m[1]; }
+    if (img) {
+      const m = img.src.match(/\/images\/emoji\/([^/]+)\//);
+      if (m) _emojiSet = m[1];
+    }
   })();
-
-  /** emojiUrlMap: name -> url (populated by fetchEmojiData) */
   const emojiUrlMap = new Map();
+
+  function getRecentEmojis() {
+    try { return JSON.parse(localStorage.getItem(EMOJI_CACHE_KEY)) || []; }
+    catch (e) { return []; }
+  }
+
+  function addRecentEmoji(name) {
+    let list = getRecentEmojis().filter((n) => n !== name);
+    list.unshift(name);
+    if (list.length > EMOJI_RECENT_MAX) list = list.slice(0, EMOJI_RECENT_MAX);
+    try { localStorage.setItem(EMOJI_CACHE_KEY, JSON.stringify(list)); } catch (e) {}
+  }
 
   function emojiUrl(name) {
     if (emojiUrlMap.has(name)) return emojiUrlMap.get(name);
-    return `https://cdn.ldstatic.com/images/emoji/${_emojiSet}/${name}.png`;
+    return `${EMOJI_CDN_BASE}/images/emoji/${_emojiSet}/${name}.png`;
   }
 
   async function fetchEmojiData() {
@@ -769,7 +2272,7 @@
     if (emojiDataLoading) return emojiDataLoading;
     emojiDataLoading = (async () => {
       const CACHE_NAME = 'ldp-emoji-v2';
-      const CACHE_URL  = `${BASE}/emojis.json`;
+      const CACHE_URL = `${BASE}/emojis.json`;
       let raw;
       try {
         const cache = await caches.open(CACHE_NAME);
@@ -781,23 +2284,24 @@
           cached = res;
         }
         raw = await cached.json();
-      } catch {
-        // Cache API unavailable (e.g. non-secure context): fall back to plain fetch
+      } catch (e) {
         const res = await fetch(CACHE_URL, { credentials: 'include' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         raw = await res.json();
       }
-      // Parse: { group: [ {name, url, tonable}, ... ] }
       const groups = {};
-      for (const [gKey, arr] of Object.entries(raw)) {
+      for (const [gKey, arr] of Object.entries(raw || {})) {
         if (!Array.isArray(arr)) continue;
-        groups[gKey] = arr.map(e => {
-          const name = (e && e.name) ? e.name : String(e);
-          if (e && e.url) {
-            let url = e.url;
-            if (url.startsWith('//')) url = 'https:' + url;          // protocol-relative (custom emoji on S3)
-            else if (!url.startsWith('http')) url = BASE + url;      // site-relative (standard emoji)
-            emojiUrlMap.set(name, url.replace('https://linux.do', 'https://cdn.ldstatic.com'));
+        groups[gKey] = arr.map((entry) => {
+          const name = (entry && entry.name) ? entry.name : String(entry);
+          if (entry && entry.url) {
+            let url = entry.url;
+            if (url.startsWith('//')) url = 'https:' + url;
+            else if (!url.startsWith('http')) url = BASE + url;
+            if (location.hostname === 'linux.do') {
+              url = url.replace('https://linux.do', 'https://cdn.ldstatic.com');
+            }
+            emojiUrlMap.set(name, url);
           }
           return name;
         });
@@ -805,7 +2309,7 @@
       emojiDataCache = groups;
       emojiDataLoading = null;
       return groups;
-    })().catch(err => { emojiDataLoading = null; throw err; });
+    })().catch((err) => { emojiDataLoading = null; throw err; });
     return emojiDataLoading;
   }
 
@@ -816,7 +2320,7 @@
     searchWrap.className = 'ldp-emoji-search';
     const searchInput = document.createElement('input');
     searchInput.type = 'text';
-    searchInput.placeholder = '\u641C\u7D22\u8868\u60C5\u2026';
+    searchInput.placeholder = '搜索表情…';
     searchWrap.appendChild(searchInput);
     panel.appendChild(searchWrap);
     const tabsWrap = document.createElement('div');
@@ -831,55 +2335,50 @@
       grid.innerHTML = '';
       if (!names || !names.length) {
         grid.innerHTML = '<div class="ldp-emoji-empty">' +
-          (groupKey === 'recent' ? '\u6682\u65E0\u6700\u8FD1\u4F7F\u7528\u7684\u8868\u60C5' : '\u6CA1\u6709\u627E\u5230\u8868\u60C5') + '</div>';
+          (groupKey === 'recent' ? '暂无最近使用的表情' : '没有找到表情') + '</div>';
         return;
       }
       const frag = document.createDocumentFragment();
       for (const name of names) {
         const btn = document.createElement('button');
+        btn.type = 'button';
         btn.className = 'ldp-emoji-item';
         btn.title = ':' + name + ':';
-        btn.innerHTML = `<img src="${emojiUrl(name)}" alt="${esc(name)}" loading="lazy">`;
-        btn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); addRecentEmoji(name); onPick(':' + name + ':'); });
+        btn.innerHTML = `<img src="${escAttr(emojiUrl(name))}" alt="${escAttr(name)}" loading="lazy">`;
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          addRecentEmoji(name);
+          onPick(':' + name + ':');
+        });
         frag.appendChild(btn);
       }
       grid.appendChild(frag);
     }
     function switchTab(groupKey) {
       currentGroup = groupKey;
-      tabsWrap.querySelectorAll('.ldp-emoji-tab').forEach(t => t.classList.toggle('active', t.dataset.group === groupKey));
-      if (groupKey === 'recent') { renderGrid(getRecentEmojis(), 'recent'); }
-      else if (allGroups && allGroups[groupKey]) { renderGrid(allGroups[groupKey], groupKey); }
+      tabsWrap.querySelectorAll('.ldp-emoji-tab').forEach((t) => t.classList.toggle('active', t.dataset.group === groupKey));
+      if (groupKey === 'recent') renderGrid(getRecentEmojis(), 'recent');
+      else if (allGroups && allGroups[groupKey]) renderGrid(allGroups[groupKey], groupKey);
     }
     function doSearch(q) {
       if (!allGroups) return;
       q = q.toLowerCase().trim();
       if (!q) { switchTab(currentGroup); return; }
-      tabsWrap.querySelectorAll('.ldp-emoji-tab').forEach(t => t.classList.remove('active'));
+      tabsWrap.querySelectorAll('.ldp-emoji-tab').forEach((t) => t.classList.remove('active'));
       const results = [];
       for (const [gk, names] of Object.entries(allGroups)) {
-        for (const n of names) { if (n.toLowerCase().includes(q)) results.push({ name: n, group: gk }); }
+        for (const n of names) {
+          if (n.toLowerCase().includes(q)) results.push({ name: n, group: gk });
+        }
       }
-      grid.innerHTML = '';
-      if (!results.length) { grid.innerHTML = '<div class="ldp-emoji-empty">\u6CA1\u6709\u627E\u5230\u8868\u60C5</div>'; return; }
-      const frag = document.createDocumentFragment();
-      for (const r of results) {
-        const btn = document.createElement('button');
-        btn.className = 'ldp-emoji-item';
-        btn.title = ':' + r.name + ':';
-        btn.innerHTML = `<img src="${emojiUrl(r.name)}" alt="${esc(r.name)}" loading="lazy">`;
-        btn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); addRecentEmoji(r.name); onPick(':' + r.name + ':'); });
-        frag.appendChild(btn);
-      }
-      grid.appendChild(frag);
+      renderGrid(results.map((r) => r.name), 'search');
     }
-    grid.innerHTML = '<div class="ldp-emoji-empty">\u52A0\u8F7D\u4E2D\u2026</div>';
-    fetchEmojiData().then(groups => {
+    grid.innerHTML = '<div class="ldp-emoji-empty">加载中…</div>';
+    fetchEmojiData().then((groups) => {
       allGroups = groups;
-      // Build tabs entirely from the API groups, with "recent" pinned first.
-      // Each tab icon is the group's first emoji for a recognizable visual.
-      const RECENT_ICON = 'https://cdn.ldstatic.com/images/emoji/twemoji/star.png?v=15';
-      const tabList = [{ key: 'recent', label: '\u6700\u8FD1', iconUrl: RECENT_ICON }];
+      const RECENT_ICON = `${EMOJI_CDN_BASE}/images/emoji/twemoji/star.png?v=15`;
+      const tabList = [{ key: 'recent', label: '最近', iconUrl: RECENT_ICON }];
       for (const gKey of Object.keys(groups)) {
         if (!groups[gKey].length) continue;
         tabList.push({ key: gKey, label: gKey, first: groups[gKey][0] });
@@ -887,6 +2386,7 @@
       tabsWrap.innerHTML = '';
       for (const g of tabList) {
         const tab = document.createElement('button');
+        tab.type = 'button';
         tab.className = 'ldp-emoji-tab' + (g.key === 'recent' ? ' active' : '');
         tab.dataset.group = g.key;
         tab.title = g.label;
@@ -895,19 +2395,44 @@
         img.alt = g.label;
         img.loading = 'lazy';
         tab.appendChild(img);
-        tab.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); searchInput.value = ''; switchTab(g.key); });
+        tab.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          searchInput.value = '';
+          switchTab(g.key);
+        });
         tabsWrap.appendChild(tab);
       }
       switchTab('recent');
-    }).catch(() => { grid.innerHTML = '<div class="ldp-emoji-empty">\u8868\u60C5\u52A0\u8F7D\u5931\u8D25</div>'; });
+    }).catch(() => {
+      grid.innerHTML = '<div class="ldp-emoji-empty">表情加载失败</div>';
+    });
     let searchTimer = null;
-    searchInput.addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => doSearch(searchInput.value), 200); });
+    searchInput.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => doSearch(searchInput.value), 200);
+    });
     return panel;
+  }
+
+  function closeEmojiPanels() {
+    let closed = false;
+    document.querySelectorAll('.ldp-emoji-panel').forEach((panel) => {
+      if (panel._ownerBtn) panel._ownerBtn._ldpEmojiPanel = null;
+      panel.remove();
+      closed = true;
+    });
+    return closed;
   }
 
   function toggleEmojiPanel(triggerBtn, inputEl) {
     const existing = triggerBtn._ldpEmojiPanel;
-    if (existing && existing.parentNode) { existing.remove(); triggerBtn._ldpEmojiPanel = null; return; }
+    if (existing && existing.parentNode) {
+      existing.remove();
+      triggerBtn._ldpEmojiPanel = null;
+      return;
+    }
+    closeEmojiPanels();
     const panel = buildEmojiPanel((code) => {
       if (inputEl.tagName === 'TEXTAREA' || inputEl.tagName === 'INPUT') {
         const start = inputEl.selectionStart || 0;
@@ -915,9 +2440,7 @@
         const val = inputEl.value;
         const before = val.substring(0, start);
         const prev = before.slice(-1);
-        const insertion = prev && !/[\s\u200b\p{P}]/u.test(prev)
-          ? ' ' + code
-          : code;
+        const insertion = prev && !/[\s\u200b\p{P}]/u.test(prev) ? ' ' + code : code;
         inputEl.value = before + insertion + val.substring(end);
         inputEl.selectionStart = inputEl.selectionEnd = start + insertion.length;
         inputEl.focus();
@@ -925,573 +2448,453 @@
       panel.remove();
       triggerBtn._ldpEmojiPanel = null;
     });
-    // Use fixed positioning so the panel isn't clipped by overflow:hidden ancestors
+    panel._ownerBtn = triggerBtn;
     panel.style.position = 'fixed';
     document.body.appendChild(panel);
     triggerBtn._ldpEmojiPanel = panel;
     const panelW = 320, panelH = 360, gap = 6;
     const btnRect = triggerBtn.getBoundingClientRect();
-    // Find the modal container to constrain within it
     const modal = triggerBtn.closest('.ldp-modal');
     const bounds = modal ? modal.getBoundingClientRect()
-                         : { top: 0, left: 0, bottom: window.innerHeight, right: window.innerWidth };
-    // Vertical: prefer above the button, fall back to below
-    let top;
-    if (btnRect.top - panelH - gap >= bounds.top) {
-      top = btnRect.top - panelH - gap;
-    } else {
-      top = btnRect.bottom + gap;
-    }
-    // Clamp vertically within bounds
+      : { top: 8, left: 8, bottom: window.innerHeight - 8, right: window.innerWidth - 8 };
+    let top = (btnRect.top - panelH - gap >= bounds.top) ? (btnRect.top - panelH - gap) : (btnRect.bottom + gap);
     if (top + panelH > bounds.bottom) top = bounds.bottom - panelH;
     if (top < bounds.top) top = bounds.top;
-    // Horizontal: align right edge to button right edge
     let left = btnRect.right - panelW;
     if (left < bounds.left) left = bounds.left;
     if (left + panelW > bounds.right) left = bounds.right - panelW;
     panel.style.top = top + 'px';
     panel.style.left = left + 'px';
     setTimeout(() => {
-      const closer = (e) => { if (panel.contains(e.target) || e.target === triggerBtn) return; panel.remove(); triggerBtn._ldpEmojiPanel = null; document.removeEventListener('mousedown', closer, true); };
+      const closer = (e) => {
+        if (panel.contains(e.target) || triggerBtn.contains(e.target)) return;
+        panel.remove();
+        triggerBtn._ldpEmojiPanel = null;
+        document.removeEventListener('mousedown', closer, true);
+      };
       document.addEventListener('mousedown', closer, true);
     }, 0);
     const si = panel.querySelector('.ldp-emoji-search input');
     if (si) setTimeout(() => si.focus(), 50);
   }
 
-  /* ============ 2.6 Boosts 气泡渲染辅助 ============ */
   function renderBoosts(boosts) {
     if (!boosts || !boosts.length) return '';
     return boosts.map((b) => {
-      const bAvatar = b.user && b.user.avatar_template
-          ? BASE + b.user.avatar_template.replace('{size}', '36') : '';
-      const bProfileUrl = userProfileUrl(b.user && b.user.username);
-      const bProfileLabel = userProfileLabel(b.user && b.user.username, b.user && (b.user.name || b.user.display_name));
+      const bAvatar = b.user && resolveAvatar(b.user.avatar_template, 36);
       const bUsername = (b.user && b.user.username) || '';
-      const bCardName = String(
-          (b.user && (b.user.name || b.user.display_name)) || bUsername || ''
-      );
-      const bCardAttrs = bUsername
-          ? ` data-username="${escAttr(bUsername)}" data-name="${escAttr(bCardName)}"`
-          : '';
+      const bName = (b.user && (b.user.name || b.user.display_name)) || bUsername;
+      const bProfileUrl = bUsername ? userProfileUrl(bUsername) : '';
       const canDel = !!b.can_delete;
+      const avatarHtml = bAvatar ? (bProfileUrl
+        ? `<a class="ldp-boost-avatar-link" href="${escAttr(bProfileUrl)}" target="_blank" rel="noopener noreferrer" title="${escAttr(bName || '@' + bUsername)}" data-username="${escAttr(bUsername)}"><img class="ldp-b-avatar" src="${escAttr(bAvatar)}" alt="" data-username="${escAttr(bUsername)}"></a>`
+        : `<img class="ldp-b-avatar" src="${escAttr(bAvatar)}" alt="">`) : '';
       return `<div class="ldp-boost-bubble" data-boost-id="${b.id}">` +
-          (bAvatar ? (bProfileUrl
-            ? `<a class="ldp-boost-avatar-link" href="${bProfileUrl}" target="_blank" rel="noopener noreferrer" title="${escAttr(bProfileLabel)}"${bCardAttrs}><img class="ldp-b-avatar" src="${bAvatar}" alt=""${bCardAttrs}></a>`
-            : `<img class="ldp-b-avatar" src="${bAvatar}" alt=""${bCardAttrs}>`) : '') +
+          avatarHtml +
           `<p>${b.cooked || ''}</p>` +
           (canDel ? `<button class="ldp-boost-del" title="删除此Boost">×</button>` : '') +
           `</div>`;
     }).join('');
   }
 
-  /* ============ 2.7 用户资料卡 ============ */
-  const userCardCache = new Map();
-  let CURRENT_USER_CARD = null;
-
-  function resolveUserCardAvatar(template, size = 96) {
-    if (typeof template !== 'string' || !template.trim()) return '';
-    const value = template.trim().replace('{size}', String(size));
-    if (/^https?:\/\//i.test(value)) return value;
-    if (value.startsWith('//')) return 'https:' + value;
-    return value.startsWith('/') ? BASE + value : BASE + '/' + value;
-  }
-
-  function resolveUserCardAsset(url) {
-    if (typeof url !== 'string' || !url.trim()) return '';
-    const value = url.trim();
-    if (/^https?:\/\//i.test(value)) return value;
-    if (value.startsWith('//')) return 'https:' + value;
-    return value.startsWith('/') ? BASE + value : BASE + '/' + value;
-  }
-
-  function safeWebsiteUrl(url) {
-    if (typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) return '';
-    try { return new URL(url.trim()).href; } catch { return ''; }
-  }
-
-  function fmtMonth(iso) {
-    if (!iso) return '';
-    const date = new Date(iso);
-    if (Number.isNaN(date.getTime())) return '';
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-  }
-
-  function fmtReadDuration(seconds) {
-    const value = Number(seconds);
-    if (!Number.isFinite(value) || value <= 0) return '';
-    if (value < 3600) return `${Math.max(1, Math.round(value / 60))} 分钟`;
-    const hours = Math.round(value / 3600);
-    if (hours < 48) return `${hours} 小时`;
-    return `${Math.round(hours / 24)} 天`;
-  }
-
-  function loadUserCard(username) {
-    if (!userCardCache.has(username)) {
-      const request = fetchJSON(`${BASE}/u/${encodeURIComponent(username)}/card.json`)
-          .then((data) => {
-            const user = data && (data.user || data);
-            if (!user || typeof user !== 'object') throw new Error('用户资料为空');
-            if (data && data.user) {
-              if ((!Array.isArray(user.user_badges) || !user.user_badges.length)
-                  && Array.isArray(data.user_badges)) {
-                user.user_badges = data.user_badges;
-              }
-              if ((!Array.isArray(user.badges) || !user.badges.length)
-                  && Array.isArray(data.badges)) {
-                user.badges = data.badges;
-              }
-            }
-            return user;
-          })
-          .catch((err) => {
-            userCardCache.delete(username);
-            throw err;
-          });
-      userCardCache.set(username, request);
-    }
-    return userCardCache.get(username);
-  }
-
-  function collectUserCardBadges(data) {
-    const userBadges = Array.isArray(data.user_badges) ? data.user_badges : [];
-    const badgeDefs = Array.isArray(data.badges) ? data.badges : [];
-    const badgeById = new Map();
-    badgeDefs.forEach((badge) => {
-      if (badge && badge.id != null) badgeById.set(String(badge.id), badge);
-    });
-    userBadges.forEach((userBadge) => {
-      if (userBadge && userBadge.badge && userBadge.badge.id != null) {
-        badgeById.set(String(userBadge.badge.id), userBadge.badge);
-      }
-    });
-
-    const result = [];
-    const seen = new Set();
-    const addBadge = (badge) => {
-      if (!badge || (!badge.name && badge.id == null)) return;
-      const key = badge.id != null ? `id:${badge.id}` : `name:${badge.name}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      result.push(badge);
-    };
-    const addUserBadge = (userBadge) => {
-      if (!userBadge) return;
-      const badgeId = userBadge.badge_id != null
-          ? userBadge.badge_id
-          : (userBadge.badge && userBadge.badge.id);
-      const badge = badgeId != null ? badgeById.get(String(badgeId)) : null;
-      if (badge) addBadge(badge);
-      else if (userBadge.badge) addBadge(userBadge.badge);
-      else if (userBadge.name) addBadge(userBadge);
-    };
-
-    const featuredIds = Array.isArray(data.featured_user_badge_ids)
-        ? data.featured_user_badge_ids : [];
-    featuredIds.forEach((id) => {
-      const userBadge = userBadges.find((item) => item && String(item.id) === String(id));
-      if (userBadge) addUserBadge(userBadge);
-      else {
-        const badge = badgeById.get(String(id));
-        if (badge) addBadge(badge);
-      }
-    });
-
-    const featured = Array.isArray(data.featured_user_badges)
-        ? data.featured_user_badges : [];
-    featured.forEach((item) => {
-      if (typeof item === 'number' || typeof item === 'string') {
-        const hit = userBadges.find((userBadge) => userBadge && String(userBadge.id) === String(item));
-        if (hit) addUserBadge(hit);
-        else {
-          const badge = badgeById.get(String(item));
-          if (badge) addBadge(badge);
-        }
-        return;
-      }
-      addUserBadge(item);
-    });
-    if (result.length) return result.slice(0, 4);
-
-    userBadges.forEach(addUserBadge);
-    if (result.length) return result.slice(0, 4);
-    badgeDefs.forEach(addBadge);
-    return result.slice(0, 4);
-  }
-
-  function createUserCard(info) {
-    const displayName = info.name || info.username;
-    const profileUrl = userProfileUrl(info.username);
-    const card = document.createElement('div');
-    card.className = 'ldp-uc';
-    card.tabIndex = -1;
-    card.setAttribute('role', 'dialog');
-    card.setAttribute('aria-label', `用户资料：${displayName}`);
-    card.innerHTML = `
-      <div class="ldp-uc-head">
-        ${info.avatar
-          ? `<img class="ldp-uc-avatar" src="${escAttr(info.avatar)}" alt="" loading="lazy" decoding="async">`
-          : '<div class="ldp-uc-avatar"></div>'}
-        <div class="ldp-uc-names">
-          <a class="ldp-uc-name" href="${escAttr(profileUrl)}" target="_blank" rel="noopener noreferrer">${esc(displayName)}</a>
-          <span class="ldp-uc-username">@${esc(info.username)}</span>
-          <div class="ldp-uc-tags">
-            ${Number.isFinite(info.trustLevel)
-              ? `<span class="ldp-uc-level">Lv.${escAttr(String(info.trustLevel))}</span>` : ''}
-            <span class="ldp-uc-title" hidden></span>
-          </div>
-        </div>
-      </div>
-      <div class="ldp-uc-bio ldp-uc-section" hidden></div>
-      <div class="ldp-uc-meta ldp-uc-section" hidden></div>
-      <div class="ldp-uc-stats" hidden></div>
-      <div class="ldp-uc-section ldp-uc-badges-wrap" hidden>
-        <div class="ldp-uc-badges"></div>
-      </div>
-      <div class="ldp-uc-loading">正在加载用户资料…</div>
-      <div class="ldp-uc-error" hidden></div>
-      <div class="ldp-uc-footer">
-        <button class="ldp-uc-follow" type="button" aria-pressed="false" hidden>关注</button>
-        <span class="ldp-uc-follow-error" role="status" hidden></span>
-        <a class="ldp-uc-profile" href="${escAttr(profileUrl)}" target="_blank" rel="noopener noreferrer">查看资料</a>
-      </div>`;
-    return card;
-  }
-
-  function updateUserCardFollow(card, data) {
-    const button = card.querySelector('.ldp-uc-follow');
-    if (!button) return;
-    const followed = data.is_followed === true;
-    button.hidden = !(followed || data.can_follow === true);
-    button.textContent = followed ? '取消关注' : '关注';
-    button.setAttribute('aria-pressed', followed ? 'true' : 'false');
-  }
-
-  function applyUserCardData(card, data, basic) {
-    const username = String(data.username || basic.username || '').trim();
-    const displayName = String(
-        data.name || data.display_name || basic.name || username || ''
-    ).trim();
-    const profileUrl = userProfileUrl(username);
-
-    const avatar = resolveUserCardAvatar(data.avatar_template, 96);
-    const avatarEl = card.querySelector('.ldp-uc-avatar');
-    if (avatar && avatarEl) {
-      if (avatarEl.tagName === 'IMG') {
-        avatarEl.src = avatar;
-      } else {
-        const img = document.createElement('img');
-        img.className = 'ldp-uc-avatar';
-        img.src = avatar;
-        img.alt = '';
-        img.loading = 'lazy';
-        img.decoding = 'async';
-        avatarEl.replaceWith(img);
-      }
-    }
-
-    const nameEl = card.querySelector('.ldp-uc-name');
-    if (nameEl) {
-      nameEl.textContent = displayName || username;
-      if (profileUrl) nameEl.href = profileUrl;
-    }
-    const usernameEl = card.querySelector('.ldp-uc-username');
-    if (usernameEl) usernameEl.textContent = '@' + username;
-    const profileEl = card.querySelector('.ldp-uc-profile');
-    if (profileEl && profileUrl) profileEl.href = profileUrl;
-    card.setAttribute('aria-label', `用户资料：${displayName || username}`);
-    card.dataset.username = username;
-
-    const followButton = card.querySelector('.ldp-uc-follow');
-    const followError = card.querySelector('.ldp-uc-follow-error');
-    followButton.addEventListener('click', async () => {
-      const target = String(data.username || username).trim();
-      if (!target || followButton.disabled) return;
-      const wasFollowed = data.is_followed === true;
-      followButton.disabled = true;
-      followButton.setAttribute('aria-busy', 'true');
-      followError.hidden = true;
-      try {
-        await apiSend(
-            `${BASE}/follow/${encodeURIComponent(target)}.json`,
-            wasFollowed ? 'DELETE' : 'PUT'
-        );
-        data.is_followed = !wasFollowed;
-        const current = CURRENT_USER_CARD;
-        if (current && current.el && current.el.dataset.username === target) {
-          updateUserCardFollow(current.el, data);
-        }
-      } catch (err) {
-        if (!card.isConnected) return;
-        followError.textContent = `${wasFollowed ? '取消关注' : '关注'}失败：${err.message}`;
-        followError.hidden = false;
-        const current = CURRENT_USER_CARD;
-        if (current && current.el === card) positionUserCard(card, current.trigger);
-      } finally {
-        followButton.disabled = false;
-        followButton.removeAttribute('aria-busy');
-      }
-    });
-    updateUserCardFollow(card, data);
-
-    const tagsEl = card.querySelector('.ldp-uc-tags');
-    let levelEl = card.querySelector('.ldp-uc-level');
-    const trustValue = data.trust_level != null ? Number(data.trust_level) : basic.trustLevel;
-    if (Number.isFinite(trustValue)) {
-      if (!levelEl) {
-        levelEl = document.createElement('span');
-        levelEl.className = 'ldp-uc-level';
-        tagsEl.prepend(levelEl);
-      }
-      levelEl.textContent = `Lv.${trustValue}`;
-    } else if (levelEl) {
-      levelEl.remove();
-    }
-
-    const title = typeof data.title === 'string' ? data.title.trim() : '';
-    const titleEl = card.querySelector('.ldp-uc-title');
-    titleEl.textContent = title;
-    titleEl.hidden = !title;
-
-    const bioEl = card.querySelector('.ldp-uc-bio');
-    const bio = typeof data.bio_excerpt === 'string' ? data.bio_excerpt.trim() : '';
-    if (bio) {
-      bioEl.innerHTML = bio;
-      bioEl.querySelectorAll('a[href]').forEach((link) => {
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-      });
-      bioEl.hidden = false;
-    } else {
-      bioEl.textContent = '';
-      bioEl.hidden = true;
-    }
-
-    const metaEl = card.querySelector('.ldp-uc-meta');
-    metaEl.textContent = '';
-    const location = typeof data.location === 'string' ? data.location.trim() : '';
-    if (location) {
-      const item = document.createElement('span');
-      item.textContent = `所在地：${location}`;
-      metaEl.appendChild(item);
-    }
-    const website = safeWebsiteUrl(data.website);
-    if (website) {
-      const item = document.createElement('span');
-      item.textContent = '网站：';
-      const link = document.createElement('a');
-      link.href = website;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      link.textContent = (typeof data.website_name === 'string' && data.website_name.trim())
-          || website.replace(/^https?:\/\//i, '');
-      item.appendChild(link);
-      metaEl.appendChild(item);
-    }
-    metaEl.hidden = !metaEl.children.length;
-
-    const statsEl = card.querySelector('.ldp-uc-stats');
-    statsEl.textContent = '';
-    const stats = [
-      ['加入', fmtMonth(data.created_at)],
-      ['最近活跃', fmtTime(data.last_seen_at)],
-      ['阅读', fmtReadDuration(data.time_read)],
-    ].filter((entry) => entry[1]);
-    stats.forEach(([label, value]) => {
-      const item = document.createElement('div');
-      item.className = 'ldp-uc-stat';
-      const strong = document.createElement('b');
-      strong.textContent = value;
-      const span = document.createElement('span');
-      span.textContent = label;
-      item.appendChild(strong);
-      item.appendChild(span);
-      statsEl.appendChild(item);
-    });
-    statsEl.hidden = !stats.length;
-
-    const badges = collectUserCardBadges(data);
-    const badgesWrap = card.querySelector('.ldp-uc-badges-wrap');
-    const badgesEl = card.querySelector('.ldp-uc-badges');
-    badgesEl.textContent = '';
-    badges.forEach((badge) => {
-      const item = document.createElement('span');
-      item.className = 'ldp-uc-badge';
-      const image = resolveUserCardAsset(badge.image_url);
-      if (image) {
-        const img = document.createElement('img');
-        img.src = image;
-        img.alt = '';
-        img.loading = 'lazy';
-        item.appendChild(img);
-      }
-      const label = document.createElement('span');
-      label.textContent = badge.name || '徽章';
-      item.appendChild(label);
-      badgesEl.appendChild(item);
-    });
-    badgesWrap.hidden = !badges.length;
-
-    card.querySelector('.ldp-uc-loading').hidden = true;
-    card.querySelector('.ldp-uc-error').hidden = true;
-  }
-
-  function positionUserCard(card, trigger) {
-    if (!card || !trigger || !trigger.isConnected) return;
-    const modal = trigger.closest('.ldp-modal');
-    const bounds = modal ? modal.getBoundingClientRect() : {
-      top: 0, left: 0, right: window.innerWidth, bottom: window.innerHeight,
-    };
-    const rect = trigger.getBoundingClientRect();
-    const margin = 8;
-    const gap = 8;
-    const width = Math.max(200, Math.min(360, bounds.width - margin * 2));
-    card.style.width = `${width}px`;
-    card.style.maxHeight = `${Math.max(180, bounds.height - margin * 2)}px`;
-
-    const cardWidth = card.offsetWidth;
-    const cardHeight = card.offsetHeight;
-    let left = Math.min(
-        Math.max(rect.left, bounds.left + margin),
-        bounds.right - margin - cardWidth
-    );
-    if (left < bounds.left + margin) left = bounds.left + margin;
-
-    const below = rect.bottom + gap;
-    const above = rect.top - gap - cardHeight;
-    let top;
-    if (below + cardHeight <= bounds.bottom - margin) {
-      top = below;
-    } else if (above >= bounds.top + margin) {
-      top = above;
-    } else {
-      top = Math.max(bounds.top + margin, bounds.bottom - margin - cardHeight);
-    }
-    card.style.left = `${Math.round(left)}px`;
-    card.style.top = `${Math.round(top)}px`;
-  }
-
-  function getUserCardInfo(trigger) {
-    const username = (trigger.dataset.username || '').trim();
-    if (!username) return null;
-    const avatarEl = trigger.matches('img') ? trigger : trigger.querySelector('img');
-    const trustText = trigger.dataset.trustLevel;
-    const trustValue = trustText != null && trustText !== '' ? Number(trustText) : NaN;
-    return {
-      username,
-      name: (trigger.dataset.name || '').trim(),
-      avatar: avatarEl ? (avatarEl.getAttribute('src') || '') : '',
-      trustLevel: Number.isFinite(trustValue) ? trustValue : null,
-    };
-  }
-
-  function closeUserCard() {
-    const current = CURRENT_USER_CARD;
-    if (!current) return;
-    CURRENT_USER_CARD = null;
-    current.cleanup();
-    current.el.remove();
-  }
-
-  function openUserCard(trigger, info) {
-    if (!info || !info.username) return;
-    if (CURRENT_USER_CARD && CURRENT_USER_CARD.trigger === trigger) {
-      closeUserCard();
-      return;
-    }
-    closeUserCard();
-
-    const overlay = trigger.closest('.ldp-overlay');
-    if (!overlay) return;
-    const card = createUserCard(info);
-    overlay.appendChild(card);
-    positionUserCard(card, trigger);
-
-    const body = trigger.closest('.ldp-body');
-    const onOutside = (event) => {
-      if (!CURRENT_USER_CARD || CURRENT_USER_CARD.el !== card) return;
-      if (card.contains(event.target) || trigger.contains(event.target)) return;
-      closeUserCard();
-    };
-    const onEsc = (event) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      event.stopPropagation();
-      closeUserCard();
-      if (trigger.isConnected) trigger.focus({ preventScroll: true });
-    };
-    const onScroll = () => closeUserCard();
-    const onResize = () => closeUserCard();
-    document.addEventListener('mousedown', onOutside, true);
-    document.addEventListener('keydown', onEsc, true);
-    if (body) body.addEventListener('scroll', onScroll, { passive: true });
-    window.addEventListener('resize', onResize);
-
-    const cleanup = () => {
-      document.removeEventListener('mousedown', onOutside, true);
-      document.removeEventListener('keydown', onEsc, true);
-      if (body) body.removeEventListener('scroll', onScroll);
-      window.removeEventListener('resize', onResize);
-    };
-    CURRENT_USER_CARD = { el: card, trigger, cleanup };
-    card.focus({ preventScroll: true });
-
-    loadUserCard(info.username).then((data) => {
-      if (!CURRENT_USER_CARD || CURRENT_USER_CARD.el !== card) return;
-      applyUserCardData(card, data, info);
-      positionUserCard(card, trigger);
-    }).catch(() => {
-      if (!CURRENT_USER_CARD || CURRENT_USER_CARD.el !== card) return;
-      const loading = card.querySelector('.ldp-uc-loading');
-      if (loading) loading.hidden = true;
-      const error = card.querySelector('.ldp-uc-error');
-      if (error) {
-        error.textContent = '暂时无法加载更多资料';
-        error.hidden = false;
-      }
-      positionUserCard(card, trigger);
-    });
-  }
-
   /* ============ 3. 单图灯箱 ============ */
   function openLightbox(src) {
     if (!src) return;
+    const returnFocus = document.activeElement;
     const lb = document.createElement('div');
     lb.className = 'ldp-lightbox';
+    lb.setAttribute('role', 'dialog');
+    lb.setAttribute('aria-modal', 'true');
+    lb.setAttribute('aria-label', '图片预览');
     lb.innerHTML = `
-      <button class="ldp-lb-x" title="关闭（Esc）">×</button>
+      <button type="button" class="ldp-lb-x" title="关闭（Esc）" aria-label="关闭图片预览">×</button>
       <div class="ldp-lb-stage"><img alt=""></div>`;
     const stage = lb.querySelector('.ldp-lb-stage');
     const img = lb.querySelector('.ldp-lb-stage img');
+    const closeBtn = lb.querySelector('.ldp-lb-x');
     img.src = src;
-    const close = () => { lb.remove(); document.removeEventListener('keydown', onKey); };
+    const close = () => {
+      lb.remove();
+      document.removeEventListener('keydown', onKey);
+      if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+        returnFocus.focus({ preventScroll: true });
+      }
+    };
     function onKey(e) { if (e.key === 'Escape') close(); }
-    lb.querySelector('.ldp-lb-x').addEventListener('click', close);
+    closeBtn.addEventListener('click', close);
     img.addEventListener('click', (e) => { e.stopPropagation(); close(); });
     stage.addEventListener('click', (e) => { if (e.target === stage) close(); });
     document.addEventListener('keydown', onKey);
     document.body.appendChild(lb);
+    closeBtn.focus({ preventScroll: true });
   }
 
-  function resolveOriginalSrc(imgEl) {
-    const a = imgEl.closest('a.lightbox, a[href]');
-    if (a && a.getAttribute('href')) {
-      const href = a.getAttribute('href');
-      if (/\.(png|jpe?g|gif|webp|bmp|avif)(\?|#|$)/i.test(href) || a.classList.contains('lightbox')) {
-        return href;
-      }
+  function absoluteUrl(url) {
+    if (!url) return '';
+    if (/^https?:\/\//i.test(url)) return url;
+    if (url.startsWith('//')) return `${location.protocol}${url}`;
+    return BASE + (url.startsWith('/') ? url : `/${url}`);
+  }
+
+  function userProfileUrl(username) {
+    return `${BASE}/u/${encodeURIComponent(username || '')}`;
+  }
+
+  function openUserProfile(username) {
+    if (!username) return;
+    window.open(userProfileUrl(username), '_blank', 'noopener');
+  }
+
+  function closeUserCard() {
+    if (!CURRENT_USER_CARD) return;
+    const { el, cleanup } = CURRENT_USER_CARD;
+    CURRENT_USER_CARD = null;
+    if (typeof cleanup === 'function') cleanup();
+    el.remove();
+  }
+
+  function positionUserCard(card, anchor) {
+    if (!card || !anchor) return;
+    if (!anchor.isConnected) {
+      closeUserCard();
+      return;
     }
-    return imgEl.getAttribute('data-large-src') || imgEl.currentSrc || imgEl.src;
+    const rect = anchor.getBoundingClientRect();
+    const gap = 8;
+    const margin = 12;
+    const width = card.offsetWidth || 390;
+    const height = card.offsetHeight || 280;
+    let left = rect.left;
+    let top = rect.bottom + gap;
+    if (left + width > window.innerWidth - margin) left = window.innerWidth - width - margin;
+    if (top + height > window.innerHeight - margin) top = rect.top - height - gap;
+    card.style.left = `${Math.max(margin, left)}px`;
+    card.style.top = `${Math.max(margin, top)}px`;
+  }
+
+  function formatCount(n) {
+    const num = Number(n);
+    if (!Number.isFinite(num)) return '';
+    if (num >= 10000) return `${(num / 1000).toFixed(num >= 100000 ? 0 : 1)}k`;
+    return String(num);
+  }
+
+  function userCardStat(label, value) {
+    const text = formatCount(value);
+    return text ? `<div class="ldp-user-card-stat"><strong>${esc(text)}</strong><span>${esc(label)}</span></div>` : '';
+  }
+
+  const TRUST_LEVEL_LABELS = {
+    0: '新用户',
+    1: '基本用户',
+    2: '成员',
+    3: '活跃用户',
+    4: '领导者',
+  };
+
+  function userTrustLevelText(user) {
+    const rawLevel = user && user.trust_level;
+    const numericLevel = rawLevel === null || rawLevel === undefined || rawLevel === ''
+      ? null : Number(rawLevel);
+    const level = Number.isInteger(numericLevel) && numericLevel >= 0 ? numericLevel : null;
+    const suppliedLabel = String(
+      (user && (user.trust_level_name || user.trust_level_label || user.trust_level_title)) || ''
+    ).trim();
+    const label = suppliedLabel || (level !== null ? TRUST_LEVEL_LABELS[level] : '') || '';
+    return [level !== null ? `Lv${level}` : '', label].filter(Boolean).join(' · ');
+  }
+
+  function fmtReadDuration(seconds) {
+    const total = Math.floor(Number(seconds) || 0);
+    if (total <= 0) return '';
+    const days = Math.floor(total / 86400);
+    const hours = Math.floor((total % 86400) / 3600);
+    const mins = Math.max(1, Math.round((total % 3600) / 60));
+    if (days >= 1) return `${days} 天` + (hours ? ` ${hours} 小时` : '');
+    if (hours >= 1) return `${hours} 小时`;
+    return `${mins} 分钟`;
+  }
+
+  function renderUserCardV2(user, summaryData, badgeData, username, loading) {
+    const summary = (summaryData && (summaryData.user_summary || summaryData.summary)) || summaryData || {};
+    const badges = (badgeData && badgeData.user_badges) || [];
+    const profileUsername = user.username || username;
+    const avatar = user._instantAvatar || resolveAvatar(user.avatar_template, 160);
+    const cover = absoluteUrl(user.card_background_upload_url || user.profile_background_upload_url || '');
+    const name = user.name || profileUsername;
+    const bio = stripHtml(user.bio_excerpt || user.bio_cooked || user.bio_raw || '');
+    const trust = userTrustLevelText(user);
+    const website = user.website || user.website_name || '';
+    const websiteUrl = website && (/^https?:\/\//i.test(website) ? website : `https://${website}`);
+    const canFollow = ME_STATE === 'authenticated' && profileUsername !== ME_USERNAME && user.can_follow !== false;
+    const badgeMap = new Map(((badgeData && badgeData.badges) || []).map((b) => [Number(b.id), b]));
+    const badgeHtml = badges.slice(0, 6).map((entry) => {
+      const badge = entry.badge || badgeMap.get(Number(entry.badge_id)) || entry;
+      const imgUrl = absoluteUrl(badge.image_url || '');
+      return `<span class="ldp-user-badge" title="${escAttr(badge.description || '')}">${imgUrl ? `<img src="${escAttr(imgUrl)}" alt="" loading="lazy">` : ''}<span>${esc(badge.name || '徽章')}</span></span>`;
+    }).join('');
+    const readTimeText = fmtReadDuration(summary.time_read);
+    const statsHtml = [
+      userCardStat('帖子', summary.post_count ?? user.post_count),
+      userCardStat('主题', summary.topic_count ?? user.topic_count),
+      userCardStat('获赞', summary.likes_received ?? user.likes_received),
+    ].filter(Boolean).join('');
+    return `<div class="ldp-user-card-layout${cover ? '' : ' ldp-user-card-no-cover'}">
+      <div class="ldp-user-card-body">
+        <div class="ldp-user-card-main">
+          <button type="button" class="ldp-user-card-avatar" data-profile-username="${escAttr(profileUsername)}" title="打开用户主页">
+            ${avatar ? `<img src="${escAttr(avatar)}" alt="">` : ''}
+          </button>
+          <div class="ldp-user-card-name">
+            <strong>${esc(name)}</strong><span>@${esc(profileUsername)}</span>
+            ${trust ? `<span class="ldp-user-level">${esc(trust)}</span>` : ''}
+          </div>
+        </div>
+        ${bio ? `<div class="ldp-user-card-bio">${esc(bio.slice(0, 180))}${bio.length > 180 ? '…' : ''}</div>` : ''}
+        <div class="ldp-user-card-meta">
+          ${user.title ? `<div>头衔：${esc(user.title)}</div>` : ''}
+          ${user.location ? `<div>位置：${esc(user.location)}</div>` : ''}
+          ${website ? `<div>网站：<a href="${escAttr(websiteUrl)}" target="_blank" rel="noopener">${esc(website.replace(/^https?:\/\//i, ''))}</a></div>` : ''}
+          ${user.last_seen_at ? `<div>活跃：${esc(fmtTime(user.last_seen_at))}${readTimeText ? ` · 阅读 ${esc(readTimeText)}` : ''}</div>` : (readTimeText ? `<div>阅读：${esc(readTimeText)}</div>` : '')}
+          ${user.created_at ? `<div>加入：${esc(fmtTime(user.created_at))}</div>` : ''}
+          ${loading ? '<div class="ldp-user-card-phase">正在补充资料与统计…</div>' : ''}
+        </div>
+        ${statsHtml ? `<div class="ldp-user-card-stats">${statsHtml}</div>` : ''}
+        ${badgeHtml ? `<div class="ldp-user-badges">${badgeHtml}</div>` : ''}
+        <div class="ldp-user-card-actions">
+          <a href="${escAttr(userProfileUrl(profileUsername))}" target="_blank" rel="noopener">主页</a>
+          ${ME_STATE === 'authenticated' && profileUsername !== ME_USERNAME ? `<a href="${BASE}/new-message?username=${encodeURIComponent(profileUsername)}" target="_blank" rel="noopener">私信</a>` : ''}
+          ${canFollow ? `<button type="button" data-user-action="follow">${user.is_followed ? '取消关注' : '关注'}</button>` : ''}
+          ${ME_STATE === 'authenticated' && ME_USER && ME_USER.id && profileUsername !== ME_USERNAME ? `<select class="ldp-user-notify" data-user-action="notify" aria-label="通知设置">
+            <option value="normal"${!user.muted && !user.ignored ? ' selected' : ''}>常规</option>
+            <option value="mute"${user.muted ? ' selected' : ''}>免打扰</option>
+            <option value="ignore"${user.ignored ? ' selected' : ''}>忽略 30 天</option>
+          </select>` : ''}
+          <a href="${BASE}/u/${encodeURIComponent(profileUsername)}/badges" target="_blank" rel="noopener">徽章</a>
+        </div>
+      </div>
+      <div class="ldp-user-card-cover"${cover ? ` style="background-image:url('${escAttr(cover)}')"` : ''}></div>
+    </div>`;
+  }
+
+  async function openUserCardV2(username, anchor) {
+    if (!username || !anchor) return;
+    closeUserCard();
+    const cacheKey = String(username).toLowerCase();
+    const cached = USER_CARD_CACHE.get(cacheKey);
+    const cacheFresh = !!(cached && cached.complete && cached.updatedAt
+      && Date.now() - cached.updatedAt < USER_CARD_CACHE_TTL);
+    const controller = new AbortController();
+    const card = document.createElement('div');
+    card.className = 'ldp-user-card ldp-user-card-v2';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-label', `${username} 的个人详情`);
+    const instantAvatar = (anchor.querySelector('img') || {}).src || '';
+    let user = Object.assign({ username, _instantAvatar: instantAvatar }, cached && cached.user);
+    let summary = (cached && cached.summary) || null;
+    let badges = (cached && cached.badges) || null;
+    let renderRaf = 0;
+    let positionRaf = 0;
+    let pendingRequests = cacheFresh ? 0 : 3;
+    let profileLoaded = !!(cached && cached.user);
+    let summaryLoaded = !!(cached && cached.summary);
+    let badgesLoaded = !!(cached && cached.badges);
+    card.innerHTML = renderUserCardV2(user, summary, badges, username, pendingRequests > 0);
+    card.classList.toggle('has-cover', !!(user.card_background_upload_url || user.profile_background_upload_url));
+    document.body.appendChild(card);
+    positionUserCard(card, anchor);
+
+    const closeOnOutside = (event) => {
+      if (!card.contains(event.target) && !anchor.contains(event.target)) closeUserCard();
+    };
+    const closeOnEsc = (event) => { if (event.key === 'Escape') closeUserCard(); };
+    const reposition = () => {
+      if (positionRaf) return;
+      positionRaf = requestAnimationFrame(() => {
+        positionRaf = 0;
+        if (CURRENT_USER_CARD && CURRENT_USER_CARD.el === card) positionUserCard(card, anchor);
+      });
+    };
+    let outsideTimer = 0;
+    const cleanup = () => {
+      controller.abort();
+      if (outsideTimer) clearTimeout(outsideTimer);
+      outsideTimer = 0;
+      cancelAnimationFrame(renderRaf);
+      cancelAnimationFrame(positionRaf);
+      document.removeEventListener('click', closeOnOutside, true);
+      document.removeEventListener('keydown', closeOnEsc);
+      window.removeEventListener('resize', reposition);
+      window.removeEventListener('scroll', reposition, true);
+    };
+    CURRENT_USER_CARD = { el: card, cleanup };
+    outsideTimer = setTimeout(() => {
+      outsideTimer = 0;
+      if (CURRENT_USER_CARD && CURRENT_USER_CARD.el === card) {
+        document.addEventListener('click', closeOnOutside, true);
+      }
+    }, 0);
+    document.addEventListener('keydown', closeOnEsc);
+    window.addEventListener('resize', reposition);
+    window.addEventListener('scroll', reposition, true);
+
+    const render = () => {
+      if (!CURRENT_USER_CARD || CURRENT_USER_CARD.el !== card) return;
+      card.classList.toggle('has-cover', !!(user.card_background_upload_url || user.profile_background_upload_url));
+      card.innerHTML = renderUserCardV2(user, summary, badges, username, pendingRequests > 0);
+      reposition();
+    };
+    const scheduleRender = () => {
+      if (renderRaf || controller.signal.aborted) return;
+      renderRaf = requestAnimationFrame(() => {
+        renderRaf = 0;
+        render();
+      });
+    };
+    const finishRequest = () => {
+      pendingRequests = Math.max(0, pendingRequests - 1);
+      scheduleRender();
+    };
+
+    card.addEventListener('click', async (event) => {
+      const avatarButton = event.target.closest('.ldp-user-card-avatar');
+      if (avatarButton) {
+        openUserProfile(username);
+        closeUserCard();
+        return;
+      }
+      const follow = event.target.closest('[data-user-action="follow"]');
+      if (!follow) return;
+      follow.disabled = true;
+      try {
+        await apiSend(`${BASE}/follow/${encodeURIComponent(username)}.json`, user.is_followed ? 'DELETE' : 'PUT');
+        user.is_followed = !user.is_followed;
+        const entry = USER_CARD_CACHE.get(cacheKey) || {};
+        USER_CARD_CACHE.set(cacheKey, Object.assign({}, entry, { user: Object.assign({}, user) }));
+        render();
+      } catch (error) { alert('关注操作失败：' + error.message); }
+      finally { if (follow.isConnected) follow.disabled = false; }
+    });
+    card.addEventListener('change', async (event) => {
+      const select = event.target.closest('[data-user-action="notify"]');
+      if (!select) return;
+      select.disabled = true;
+      const level = select.value;
+      const params = { notification_level: level, acting_user_id: (ME_USER && ME_USER.id) || '' };
+      if (level === 'ignore') params.expiring_at = new Date(Date.now() + 30 * 86400000).toISOString();
+      try {
+        await apiSend(`${BASE}/u/${encodeURIComponent(username)}/notification_level.json`, 'PUT', params);
+        user.muted = level === 'mute'; user.ignored = level === 'ignore';
+      } catch (error) { alert('通知设置失败：' + error.message); }
+      finally { select.disabled = false; }
+    });
+
+    if (cacheFresh) return;
+    const encoded = encodeURIComponent(username);
+    const requestOptions = (priority) => ({ priority, signal: controller.signal });
+    const profilePromise = fetchJSON(`${BASE}/u/${encoded}.json`, requestOptions('target'))
+      .then((data) => { user = Object.assign(user, data.user || data); profileLoaded = true; scheduleRender(); })
+      .catch((error) => { if (!error || error.name !== 'AbortError') console.warn('[LinuxDo Reader] 用户资料读取失败', error); })
+      .finally(finishRequest);
+    const summaryPromise = fetchJSON(`${BASE}/u/${encoded}/summary.json`, requestOptions('visible'))
+      .then((data) => { summary = data; summaryLoaded = true; scheduleRender(); })
+      .catch((error) => { if (!error || error.name !== 'AbortError') console.warn('[LinuxDo Reader] 用户统计读取失败', error); })
+      .finally(finishRequest);
+    const badgesPromise = fetchJSON(`${BASE}/user-badges/${encoded}.json`, requestOptions('background'))
+      .then((data) => { badges = data; badgesLoaded = true; scheduleRender(); })
+      .catch((error) => { if (!error || error.name !== 'AbortError') console.warn('[LinuxDo Reader] 用户徽章读取失败', error); })
+      .finally(finishRequest);
+    await Promise.allSettled([profilePromise, summaryPromise, badgesPromise]);
+    if (controller.signal.aborted) return;
+    USER_CARD_CACHE.set(cacheKey, {
+      user: Object.assign({}, user), summary, badges, updatedAt: Date.now(),
+      complete: profileLoaded && summaryLoaded && badgesLoaded,
+    });
+    render();
+  }
+
+  function isElement(node) {
+    return node && node.nodeType === Node.ELEMENT_NODE;
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    return `${d.getMonth() + 1}月 ${d.getDate()}日`;
+  }
+
+  function closestElement(node, selector) {
+    const el = isElement(node) ? node : node && node.parentElement;
+    return el ? el.closest(selector) : null;
+  }
+
+  function isImageAnchor(anchor) {
+    if (!anchor) return false;
+    const href = anchor.getAttribute('href') || anchor.getAttribute('data-download-href') || '';
+    return anchor.classList.contains('lightbox') ||
+      anchor.hasAttribute('data-download-href') ||
+      /\.(png|jpe?g|gif|webp|bmp|avif)(\?|#|$)/i.test(href);
+  }
+
+  function resolveOriginalSrc(sourceEl) {
+    const anchorSelector = 'a[href], a[data-download-href]';
+    const anchor = sourceEl.matches(anchorSelector) ? sourceEl : sourceEl.closest(anchorSelector);
+    const imgEl = sourceEl.matches('img') ? sourceEl :
+      (anchor && anchor.querySelector('img'));
+    if (isImageAnchor(anchor)) {
+      const href = anchor.getAttribute('href') || anchor.getAttribute('data-download-href');
+      if (href) return href;
+    }
+    return imgEl && (imgEl.getAttribute('data-large-src') || imgEl.currentSrc || imgEl.src);
+  }
+
+  function findImagePreviewSource(target, root) {
+    const content = closestElement(target, '.ldp-content');
+    if (!content || !root.contains(content)) return null;
+    if (closestElement(target, '.ldp-spoiler.ldp-spoiler-blurred')) return null;
+    if (closestElement(target, '.video-placeholder-container[data-video-src]')) return null;
+    if (closestElement(target, '.ldp-poll')) return null;
+
+    const anchor = closestElement(target, 'a[href], a[data-download-href]');
+    if (anchor && content.contains(anchor) && isImageAnchor(anchor)) return anchor;
+
+    const img = closestElement(target, 'img');
+    if (img && content.contains(img)) {
+      if (img.classList && img.classList.contains('emoji')) return null;
+      return img;
+    }
+
+    const wrapper = closestElement(target, '.lightbox-wrapper, .image-wrapper, .image-container, .lazyYT-container');
+    if (!wrapper || !content.contains(wrapper)) return null;
+
+    const wrapperAnchor = wrapper.querySelector('a.lightbox, a[data-download-href], a[href]');
+    if (isImageAnchor(wrapperAnchor)) return wrapperAnchor;
+
+    const wrapperImg = wrapper.querySelector('img');
+    if (wrapperImg && wrapperImg.classList && wrapperImg.classList.contains('emoji')) return null;
+    return wrapperImg;
+  }
+
+  function interceptImagePreviewClick(e, root) {
+    const source = findImagePreviewSource(e.target, root);
+    if (!source) return false;
+    const src = resolveOriginalSrc(source);
+    if (!src) return false;
+
+    e.preventDefault();
+    e.stopPropagation();
+    if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    openLightbox(src);
+    return true;
   }
 
   function activateVideoPlaceholder(container) {
     if (!container) return null;
     const existingVideo = container.querySelector('video');
     if (existingVideo) return existingVideo;
-
     const src = container.dataset.videoSrc;
     if (!src) return null;
-
     const video = document.createElement('video');
     video.src = src;
     video.controls = true;
@@ -1501,14 +2904,359 @@
     video.style.width = '100%';
     video.style.maxHeight = '70vh';
     video.style.background = '#000';
-
     container.classList.add('video-container', 'ldp-video-ready');
     container.style.cursor = '';
     container.replaceChildren(video);
-
     const playPromise = video.play();
-    if (playPromise?.catch) playPromise.catch(() => {});
+    if (playPromise && playPromise.catch) playPromise.catch(() => {});
     return video;
+  }
+
+  /* ============ 3.5 Base64 解码 ============ */
+  function decodeBase64ToUnicode(raw) {
+    const normalized = String(raw || '').trim().replace(/\s+/g, '');
+    if (!normalized) return null;
+    try {
+      const binary = atob(normalized);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new TextDecoder('utf-8').decode(bytes);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise((resolve, reject) => {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      Object.assign(textarea.style, {
+        position: 'fixed', left: '-9999px', top: '0', opacity: '0',
+      });
+      document.body.appendChild(textarea);
+      textarea.select();
+      try {
+        if (!document.execCommand('copy')) throw new Error('copy failed');
+        resolve();
+      } catch (e) {
+        reject(e);
+      } finally {
+        textarea.remove();
+      }
+    });
+  }
+
+  function createDecodedBlock(decodedText) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'md-codeblock ldp-base64-result';
+    wrapper.setAttribute('data-base64-decoded', 'true');
+
+    const pre = document.createElement('pre');
+    const code = document.createElement('code');
+    code.textContent = decodedText;
+    pre.appendChild(code);
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'codeblock-button-wrapper ldp-base64-toolbar';
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'btn nohighlight btn-flat ldp-base64-copy';
+    const copyIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v12h2V3h12V1Zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Zm0 16H8V7h11v14Z"/></svg>';
+    copyBtn.innerHTML = copyIcon;
+    copyBtn.title = '复制解码文本';
+    copyBtn.setAttribute('aria-label', '复制解码文本');
+    copyBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      copyBtn.disabled = true;
+      try {
+        await copyText(decodedText);
+        copyBtn.textContent = '已复制';
+        copyBtn.classList.add('copied');
+        copyBtn.title = '已复制';
+        setTimeout(() => {
+          if (!copyBtn.isConnected) return;
+          copyBtn.innerHTML = copyIcon;
+          copyBtn.classList.remove('copied');
+          copyBtn.title = '复制解码文本';
+          copyBtn.disabled = false;
+        }, 2000);
+      } catch (err) {
+        copyBtn.disabled = false;
+        alert('复制失败，请手动复制');
+      }
+    });
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'btn nohighlight btn-flat ldp-base64-close';
+    closeBtn.textContent = '×';
+    closeBtn.title = '关闭';
+    closeBtn.setAttribute('aria-label', '关闭解码结果');
+    closeBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      wrapper.remove();
+    });
+
+    toolbar.append(copyBtn, closeBtn);
+    wrapper.append(pre, toolbar);
+    return wrapper;
+  }
+
+  function enhanceCodeBlocks(root) {
+    if (!root) return;
+    root.querySelectorAll('.ldp-content pre').forEach((pre) => {
+      if (pre.closest('.ldp-base64-result')) return;
+      if (pre.parentElement && pre.parentElement.querySelector(':scope > .codeblock-button-wrapper')) return;
+
+      const code = pre.querySelector('code');
+      const codeText = (code || pre).textContent || '';
+      let host = pre.parentElement;
+      if (!host || (!host.classList.contains('md-codeblock') && !host.classList.contains('highlight'))) {
+        host = document.createElement('div');
+        pre.insertAdjacentElement('beforebegin', host);
+        host.appendChild(pre);
+      }
+      host.classList.add('ldp-codeblock-host');
+
+      const toolbar = document.createElement('div');
+      toolbar.className = 'codeblock-button-wrapper ldp-codeblock-toolbar';
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'btn nohighlight btn-flat ldp-code-copy';
+      copyBtn.title = '复制代码';
+      copyBtn.setAttribute('aria-label', '复制代码');
+      const copyIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v12h2V3h12V1Zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Zm0 16H8V7h11v14Z"/></svg>';
+      const copiedIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 16.2-3.5-3.5-1.4 1.4L9 19 20.3 7.7l-1.4-1.4L9 16.2Z"/></svg>';
+      copyBtn.innerHTML = copyIcon;
+      copyBtn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        copyBtn.disabled = true;
+        try {
+          await copyText(codeText);
+          copyBtn.innerHTML = copiedIcon;
+          copyBtn.title = '已复制';
+          setTimeout(() => {
+            if (!copyBtn.isConnected) return;
+            copyBtn.innerHTML = copyIcon;
+            copyBtn.title = '复制代码';
+            copyBtn.disabled = false;
+          }, 2000);
+        } catch (err) {
+          copyBtn.disabled = false;
+          alert('复制失败，请手动复制');
+        }
+      });
+
+      toolbar.appendChild(copyBtn);
+      host.appendChild(toolbar);
+    });
+  }
+
+  function insertDecodedBlock(decodedText, range) {
+    if (!range || !range.commonAncestorContainer || !range.commonAncestorContainer.isConnected) return null;
+    const wrapper = createDecodedBlock(decodedText);
+    const endEl = isElement(range.endContainer) ? range.endContainer : range.endContainer.parentElement;
+    const contentRoot = endEl && endEl.closest('.ldp-content, .topic-post .cooked, article .cooked');
+    const block = endEl && endEl.closest('p, pre, blockquote');
+
+    if (contentRoot && block && contentRoot.contains(block)) {
+      block.insertAdjacentElement('afterend', wrapper);
+    } else if (contentRoot) {
+      let anchor = endEl;
+      while (anchor && anchor.parentElement && anchor.parentElement !== contentRoot) {
+        anchor = anchor.parentElement;
+      }
+      if (anchor && anchor.parentElement === contentRoot) {
+        if (anchor.tagName === 'LI') anchor.appendChild(wrapper);
+        else anchor.insertAdjacentElement('afterend', wrapper);
+      } else {
+        contentRoot.appendChild(wrapper);
+      }
+    } else {
+      const insertionRange = range.cloneRange();
+      insertionRange.collapse(false);
+      insertionRange.insertNode(wrapper);
+    }
+
+    const selection = window.getSelection();
+    if (selection) selection.removeAllRanges();
+    wrapper.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return wrapper;
+  }
+
+  function getSelectionSnapshot(requiredRoot) {
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount || selection.isCollapsed) return null;
+    const raw = selection.toString().trim();
+    if (!raw) return null;
+    const range = selection.getRangeAt(0);
+    if (requiredRoot) {
+      const startEl = isElement(range.startContainer) ? range.startContainer : range.startContainer.parentElement;
+      const endEl = isElement(range.endContainer) ? range.endContainer : range.endContainer.parentElement;
+      const startContent = startEl && startEl.closest('.ldp-content');
+      const endContent = endEl && endEl.closest('.ldp-content');
+      if (!startContent || startContent !== endContent || !requiredRoot.contains(startContent)) return null;
+    }
+    return { raw, range: range.cloneRange() };
+  }
+
+  function decodeSelectionSnapshot(snapshot) {
+    if (!snapshot) {
+      alert('请先选中一段 Base64 文本');
+      return false;
+    }
+    const decoded = decodeBase64ToUnicode(snapshot.raw);
+    if (decoded === null) {
+      alert('解码失败，请确认内容是有效的 Base64 编码');
+      return false;
+    }
+    return !!insertDecodedBlock(decoded, snapshot.range);
+  }
+
+  function addBase64DecodeButton(menu) {
+    if (!menu) return;
+    const existingButton = Array.from(menu.querySelectorAll('button')).find((button) =>
+      button.classList.contains('ldp-base64-decode-btn') ||
+      button.title === 'Base64 解码' ||
+      (button.querySelector('.d-button-label') || {}).textContent === 'Base64解码'
+    );
+    if (existingButton) {
+      menu.dataset.base64DecodeAdded = 'true';
+      return;
+    }
+    const buttons = menu.querySelector('.quote-button .buttons') || menu.querySelector('.buttons');
+    if (!buttons) return;
+
+    menu.dataset.base64DecodeAdded = 'true';
+    const decodeBtn = document.createElement('button');
+    decodeBtn.type = 'button';
+    decodeBtn.className = 'btn btn-icon-text btn-flat ldp-base64-decode-btn';
+    decodeBtn.title = 'Base64 解码';
+    decodeBtn.innerHTML = '<span class="fa d-icon" aria-hidden="true">🔓</span><span class="d-button-label">Base64解码</span>';
+
+    let snapshot = null;
+    decodeBtn.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      snapshot = getSelectionSnapshot();
+    });
+    decodeBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      decodeSelectionSnapshot(snapshot || getSelectionSnapshot());
+      snapshot = null;
+    });
+    buttons.appendChild(decodeBtn);
+  }
+
+  function startBase64MenuObserver() {
+    const portal = document.getElementById('d-menu-portals');
+    if (!portal) {
+      setTimeout(startBase64MenuObserver, 500);
+      return;
+    }
+
+    portal.querySelectorAll('div.fk-d-menu').forEach(addBase64DecodeButton);
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        mutation.addedNodes.forEach((node) => {
+          if (!isElement(node)) return;
+          const parentMenu = node.matches('div.fk-d-menu') ? node : node.closest('div.fk-d-menu');
+          if (parentMenu) addBase64DecodeButton(parentMenu);
+          node.querySelectorAll('div.fk-d-menu').forEach(addBase64DecodeButton);
+        });
+      });
+    });
+    observer.observe(portal, { childList: true, subtree: true });
+  }
+
+  function bindModalBase64Selection(modal) {
+    const menu = document.createElement('div');
+    menu.className = 'ldp-base64-selection-menu';
+    menu.hidden = true;
+    menu.innerHTML = '<button type="button" title="Base64 解码"><span aria-hidden="true">🔓</span><span>Base64解码</span></button>';
+    document.body.appendChild(menu);
+
+    const button = menu.querySelector('button');
+    const scrollRoot = modal.querySelector('.ldp-body');
+    let snapshot = null;
+    let frame = 0;
+
+    const hide = () => {
+      menu.hidden = true;
+      snapshot = null;
+    };
+    const show = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const current = getSelectionSnapshot(modal);
+        if (!current) {
+          hide();
+          return;
+        }
+        snapshot = current;
+        const rect = current.range.getBoundingClientRect();
+        if (!rect || (!rect.width && !rect.height)) {
+          hide();
+          return;
+        }
+        menu.hidden = false;
+        const width = menu.offsetWidth;
+        const height = menu.offsetHeight;
+        const left = Math.max(8, Math.min(window.innerWidth - width - 8,
+          rect.left + (rect.width / 2) - (width / 2)));
+        let top = rect.top - height - 8;
+        if (top < 8) top = Math.min(window.innerHeight - height - 8, rect.bottom + 8);
+        menu.style.left = `${left}px`;
+        menu.style.top = `${Math.max(8, top)}px`;
+      });
+    };
+    const onPointerDown = (e) => {
+      if (menu.contains(e.target)) return;
+      hide();
+    };
+    const onKeyDown = (e) => {
+      if (e.key !== 'Escape' || menu.hidden) return;
+      e.preventDefault();
+      e.stopPropagation();
+      hide();
+    };
+    const onKeyUp = (e) => {
+      if (e.shiftKey || e.key.startsWith('Arrow') || e.key === 'Home' || e.key === 'End') show();
+    };
+
+    button.addEventListener('pointerdown', (e) => e.preventDefault());
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const current = snapshot;
+      hide();
+      decodeSelectionSnapshot(current);
+    });
+    modal.addEventListener('mouseup', show);
+    modal.addEventListener('keyup', onKeyUp);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('resize', hide);
+    if (scrollRoot) scrollRoot.addEventListener('scroll', hide, { passive: true });
+
+    return () => {
+      cancelAnimationFrame(frame);
+      menu.remove();
+      modal.removeEventListener('mouseup', show);
+      modal.removeEventListener('keyup', onKeyUp);
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('resize', hide);
+      if (scrollRoot) scrollRoot.removeEventListener('scroll', hide);
+    };
   }
 
   /* ============ 4. 已读追踪器 ============ */
@@ -1516,6 +3264,7 @@
     const dwell = new Map();
     const reported = new Map();
     const visible = new Set();
+    let readWaterline = 1;
     let lastTick = Date.now();
     let tickTimer = null, flushTimer = null;
 
@@ -1537,9 +3286,14 @@
       }
     };
 
-    const markRead = (pn) => {
-      const node = scrollRoot.querySelector(`.ldp-post[data-post-number="${pn}"]`);
-      if (node) node.classList.add('ldp-read');
+    const markReadThrough = (pn) => {
+      readWaterline = Math.max(readWaterline, Number(pn) || 1);
+      scrollRoot.querySelectorAll('.ldp-post[data-post-number]').forEach((node) => {
+        const nodePn = +node.dataset.postNumber;
+        if (!nodePn || nodePn > readWaterline) return;
+        node.classList.add('ldp-read');
+        node.classList.remove('ldp-unread');
+      });
     };
 
     const flush = async () => {
@@ -1558,10 +3312,12 @@
       params.topic_time = total;
       try {
         await apiSend(`${BASE}/topics/timings`, 'POST', params, { 'X-SILENCE-LOGGER': 'true' });
+        let maxReadPostNumber = 0;
         Object.keys(params).forEach((k) => {
           const m = k.match(/^timings\[(\d+)\]$/);
-          if (m) markRead(+m[1]);
+          if (m) maxReadPostNumber = Math.max(maxReadPostNumber, +m[1]);
         });
+        if (maxReadPostNumber) markReadThrough(maxReadPostNumber);
       } catch (e) {
         Object.keys(params).forEach((k) => {
           const m = k.match(/^timings\[(\d+)\]$/);
@@ -1571,7 +3327,10 @@
     };
 
     return {
+      getReadWaterline() { return readWaterline; },
+      setReadWaterline(pn) { readWaterline = Math.max(1, Number(pn) || 0); },
       observe(node) { if (node) io.observe(node); },
+      unobserve(node) { if (node) { io.unobserve(node); visible.delete(+node.dataset.postNumber); } },
       start() {
         lastTick = Date.now();
         tickTimer = setInterval(tick, 1000);
@@ -1587,57 +3346,7 @@
     };
   }
 
-
-  /* ============ 6. 树形递归渲染 ============ */
-  /**
-   * renderNestedTree：递归渲染嵌套树结构。
-   * @param {Array} posts - 帖子数组（可能包含 children）
-   * @param {HTMLElement} container - DOM 容器
-   * @param {object} ctx - 全局上下文
-   * @param {number} depth - 当前树深度（用于缩进）
-   */
-  function renderNestedTree(posts, container, ctx, depth = 0) {
-    if (!posts || !posts.length) return;
-
-    posts.forEach(post => {
-      if (ctx.postMap) ctx.postMap.set(post.post_number, post);
-      const node = renderPost(post, depth > 0, ctx, depth);
-      container.appendChild(node);
-      ctx.tracker.observe(node);
-      ctx.nodeMap.set(post.post_number, node);
-
-      // 递归渲染子回复
-      if (post.children && post.children.length > 0) {
-        const childrenEl = node.querySelector('.ldp-children');
-        renderNestedTree(post.children, childrenEl, ctx, depth + 1);
-      }
-
-      // 渲染"展示更多"按钮
-      const remaining = (post.direct_reply_count || 0) - (post.children?.length || 0);
-      if (remaining > 0) {
-        renderLoadMoreButton(post, node, remaining, depth);
-      }
-    });
-  }
-
-  /**
-   * renderLoadMoreButton：渲染"展示更多回复"按钮。
-   * @param {object} post - 父帖子数据
-   * @param {HTMLElement} node - 父帖子 DOM 节点
-   * @param {number} remaining - 剩余未加载数量
-   * @param {number} depth - 树深度
-   */
-  function renderLoadMoreButton(post, node, remaining, depth) {
-    const actionsEl = node.querySelector(':scope > .ldp-sub-actions');
-    if (!actionsEl) return;
-
-    actionsEl.style.display = 'block';
-    const btn = actionsEl.querySelector('.ldp-load-more-replies');
-    if (btn) {
-      btn.textContent = `展示更多回复（还剩 ${remaining} 条） ↓`;
-    }
-  }
-
+  /* ============ 6.8 投票与数学公式渲染 ============ */
   function isRenderablePoll(poll) {
     if (!poll || (poll.type !== 'regular' && poll.type !== 'multiple')) return false;
     if (!Array.isArray(poll.options) || !poll.options.length) return false;
@@ -1647,8 +3356,8 @@
 
   function pollResultsVisible(poll) {
     return Array.isArray(poll.options) && poll.options.length > 0
-        && poll.options.every((option) =>
-          option && typeof option.votes === 'number' && Number.isFinite(option.votes));
+      && poll.options.every((option) =>
+        option && typeof option.votes === 'number' && Number.isFinite(option.votes));
   }
 
   function isPollClosed(poll) {
@@ -1665,19 +3374,17 @@
     const optionCount = poll.options.length;
     const minValue = Number(poll.min);
     const maxValue = Number(poll.max);
-    const min = Number.isFinite(minValue) && minValue > 0
-        ? Math.floor(minValue) : 1;
-    const max = Number.isFinite(maxValue) && maxValue > 0
-        ? Math.min(Math.floor(maxValue), optionCount) : optionCount;
+    const min = Number.isFinite(minValue) && minValue > 0 ? Math.floor(minValue) : 1;
+    const max = Number.isFinite(maxValue) && maxValue > 0 ? Math.min(Math.floor(maxValue), optionCount) : optionCount;
     return { min, max };
   }
 
   function currentPollVotes(post, pollName) {
-    const votes = post.polls_votes && post.polls_votes[pollName];
+    const votes = post && post.polls_votes && post.polls_votes[pollName];
     return Array.isArray(votes) ? votes.map((optionId) => String(optionId)) : [];
   }
 
-  function renderPoll(poll, post, titleHtml = '') {
+  function renderPoll(poll, post, titleHtml) {
     const node = document.createElement('div');
     const selectedVotes = currentPollVotes(post, poll.name);
     const closed = isPollClosed(poll);
@@ -1693,11 +3400,8 @@
 
     const title = document.createElement('div');
     title.className = 'ldp-poll-title';
-    if (titleHtml) {
-      title.innerHTML = titleHtml;
-    } else if (typeof poll.title === 'string' && poll.title) {
-      title.textContent = poll.title;
-    }
+    if (titleHtml) title.innerHTML = titleHtml;
+    else if (typeof poll.title === 'string' && poll.title) title.textContent = poll.title;
     if (titleHtml || (typeof poll.title === 'string' && poll.title)) node.appendChild(title);
 
     const meta = document.createElement('div');
@@ -1720,7 +3424,7 @@
       const selected = selectedVotes.includes(optionId);
       const voters = Number(poll.voters);
       const percent = resultsVisible && Number.isFinite(voters) && voters > 0
-          ? Math.round((option.votes / voters) * 100) : 0;
+        ? Math.round((option.votes / voters) * 100) : 0;
 
       const optionButton = document.createElement('button');
       optionButton.type = 'button';
@@ -1784,7 +3488,7 @@
   }
 
   function renderPolls(content, post) {
-    if (!content || !Array.isArray(post.polls)) return;
+    if (!content || !post || !Array.isArray(post.polls)) return;
     content.querySelectorAll('.poll').forEach((placeholder) => {
       const pollName = placeholder.dataset.pollName || 'poll';
       const poll = post.polls.find((item) => item && item.name === pollName);
@@ -1799,8 +3503,7 @@
     const { min, max } = pollBounds(poll);
     const submit = pollNode.querySelector('.ldp-poll-submit');
     if (submit) {
-      submit.disabled = pollNode.dataset.votable !== '1'
-          || selectedCount < min || selectedCount > max;
+      submit.disabled = pollNode.dataset.votable !== '1' || selectedCount < min || selectedCount > max;
     }
     const count = pollNode.querySelector('.ldp-poll-selected-count');
     if (count) count.textContent = `已选 ${selectedCount}/${max} 项`;
@@ -1820,7 +3523,7 @@
     delete pollNode.dataset.loading;
     const canVote = pollNode.dataset.votable === '1';
     pollNode.querySelectorAll('.ldp-poll-option, .ldp-poll-remove')
-        .forEach((button) => { button.disabled = !canVote; });
+      .forEach((button) => { button.disabled = !canVote; });
     if (poll && poll.type === 'multiple') updateMultiplePollState(pollNode, poll);
     const status = pollNode.querySelector('.ldp-poll-status');
     if (status) {
@@ -1837,8 +3540,16 @@
   }
 
   function findPostForNode(postNode, ctx) {
-    const postNumber = Number(postNode.dataset.postNumber);
-    return ctx.postMap?.get(postNumber) || idToPost.get(Number(postNode.dataset.postId));
+    if (!postNode || !ctx) return null;
+    const postId = postNode.dataset.postId;
+    if (ctx.loader && postId) {
+      const cached = ctx.loader.getPostById(postId);
+      if (cached) return cached;
+    }
+    if (Number(postNode.dataset.postNumber) === 1 && ctx.topic && ctx.topic._opPost) {
+      return ctx.topic._opPost;
+    }
+    return null;
   }
 
   function findPollForNode(post, pollNode) {
@@ -1852,54 +3563,60 @@
   }
 
   function updatePostPoll(post, poll, response, removeVote) {
-    const polls = Array.isArray(post.polls) ? post.polls : (post.polls = []);
-    const index = polls.indexOf(poll);
+    const polls = Array.isArray(post.polls) ? post.polls.slice() : [];
+    const index = polls.findIndex((item) => item && item.name === poll.name);
     const nextPoll = Object.assign({}, poll, response.poll);
     if (index >= 0) polls[index] = nextPoll;
     else polls.push(nextPoll);
+    post.polls = polls;
 
-    const votes = post.polls_votes || (post.polls_votes = {});
-    if (removeVote) {
-      delete votes[poll.name];
-    } else {
-      votes[poll.name] = responseVoteOptions(response.vote) || [];
-    }
+    const votes = Object.assign({}, post.polls_votes || {});
+    if (removeVote) delete votes[poll.name];
+    else votes[poll.name] = responseVoteOptions(response.vote) || [];
+    post.polls_votes = votes;
     return nextPoll;
   }
 
-  async function requestPollVote(pollNode, post, poll, optionIds, removeVote) {
+  async function requestPollVote(pollNode, post, poll, optionIds, removeVote, ctx, modal) {
     setPollLoading(pollNode, removeVote ? '取消投票中…' : '投票中…');
     try {
       const params = removeVote
-          ? { post_id: post.id, poll_name: poll.name }
-          : { post_id: post.id, poll_name: poll.name, options: optionIds };
-      const data = await apiSend(
-          `${BASE}/polls/vote`,
-          removeVote ? 'DELETE' : 'PUT',
-          params
-      );
+        ? { post_id: post.id, poll_name: poll.name }
+        : { post_id: post.id, poll_name: poll.name, options: optionIds };
+      const data = await apiSend(`${BASE}/polls/vote`, removeVote ? 'DELETE' : 'PUT', params);
       if (!data || !data.poll) throw new Error('响应缺少投票数据');
       if (!removeVote && !responseVoteOptions(data.vote)) {
         throw new Error('响应缺少投票选择');
       }
 
       const titleNode = pollNode.querySelector('.ldp-poll-title');
+      const titleHtml = titleNode ? titleNode.innerHTML : '';
       const nextPoll = updatePostPoll(post, poll, data, removeVote);
-      pollNode.replaceWith(renderPoll(
-          nextPoll,
-          post,
-          titleNode ? titleNode.innerHTML : ''
-      ));
+      if (ctx && ctx.loader) {
+        ctx.loader.updatePost(post.id, {
+          polls: post.polls.map((item) => Object.assign({}, item)),
+          polls_votes: Object.assign({}, post.polls_votes),
+        });
+      }
+      if (ctx && ctx.topicId) invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+      const root = modal || pollNode.getRootNode();
+      const selector = `[data-post-id="${CSS.escape(String(post.id))}"] .ldp-poll[data-poll-name="${CSS.escape(String(poll.name))}"]`;
+      const targets = root && root.querySelectorAll ? Array.from(root.querySelectorAll(selector)) : [pollNode];
+      if (!targets.includes(pollNode)) targets.push(pollNode);
+      targets.forEach((targetPoll) => {
+        const ownerPost = targetPoll.closest('.ldp-post');
+        targetPoll.replaceWith(renderPoll(nextPoll, post, titleHtml));
+        if (ownerPost && ctx && ctx.refreshRenderRevision) ctx.refreshRenderRevision(ownerPost);
+      });
     } catch (err) {
       finishPollLoading(pollNode, poll, err.message);
     }
   }
 
-  async function handlePollControl(control, ctx) {
+  async function handlePollControl(control, ctx, modal) {
     const pollNode = control.closest('.ldp-poll');
-    const postNode = control.closest('.ldp-post');
+    const postNode = control.closest('.ldp-embedded-reply, .ldp-post');
     if (!pollNode || !postNode) return;
-
     const post = findPostForNode(postNode, ctx);
     if (!post) {
       showPollStatus(pollNode, '投票失败：未找到帖子数据', true);
@@ -1910,12 +3627,10 @@
       showPollStatus(pollNode, '投票失败：未找到投票数据', true);
       return;
     }
-
     if (control.classList.contains('ldp-poll-option')) {
       if (poll.type === 'multiple') {
         const selected = control.getAttribute('aria-pressed') === 'true';
-        const selectedCount = pollNode
-            .querySelectorAll('.ldp-poll-option[aria-pressed="true"]').length;
+        const selectedCount = pollNode.querySelectorAll('.ldp-poll-option[aria-pressed="true"]').length;
         const { max } = pollBounds(poll);
         if (!selected && selectedCount >= max) {
           showPollStatus(pollNode, `最多可选 ${max} 项`, false);
@@ -1927,195 +3642,32 @@
         updateMultiplePollState(pollNode, poll);
         return;
       }
-
       const optionId = control.dataset.optionId;
       const currentVotes = currentPollVotes(post, poll.name);
-      await requestPollVote(
-          pollNode,
-          post,
-          poll,
-          currentVotes.includes(optionId) ? null : [optionId],
-          currentVotes.includes(optionId)
-      );
+      const cancelling = currentVotes.includes(optionId);
+      await requestPollVote(pollNode, post, poll, cancelling ? null : [optionId], cancelling, ctx, modal);
       return;
     }
-
     if (control.classList.contains('ldp-poll-submit')) {
       const optionIds = Array.from(
-          pollNode.querySelectorAll('.ldp-poll-option[aria-pressed="true"]')
+        pollNode.querySelectorAll('.ldp-poll-option[aria-pressed="true"]')
       ).map((option) => option.dataset.optionId);
-      await requestPollVote(pollNode, post, poll, optionIds, false);
+      await requestPollVote(pollNode, post, poll, optionIds, false, ctx, modal);
       return;
     }
-
     if (control.classList.contains('ldp-poll-remove')) {
-      await requestPollVote(pollNode, post, poll, null, true);
+      await requestPollVote(pollNode, post, poll, null, true, ctx, modal);
     }
   }
 
-  /* ============ 7. 楼层归位（已废弃，保留用于扁平流降级） ============ */
-  function attachPost(p, ctx) {
-    if (ctx.postMap) ctx.postMap.set(p.post_number, p);
-    if (p.post_number === 1) {
-      // 1 楼永久常驻：已存在则跳过（防止重复渲染）
-      if (ctx.topicEl.querySelector('.ldp-post')) return;
-      const node = renderPost(p, false, ctx);
-      ctx.topicEl.appendChild(node);
-      ctx.tracker.observe(node);
-      return;
-    }
-    if (ctx.nodeMap.has(p.post_number)) return;
-
-    const parentNum = p.reply_to_post_number;
-    const node = renderPost(p, !!(parentNum && parentNum !== 1), ctx);
-    ctx.nodeMap.set(p.post_number, node);
-
-    const parentNode = parentNum && parentNum !== 1 ? ctx.nodeMap.get(parentNum) : null;
-    if (parentNum && parentNum !== 1 && !parentNode) {
-      ctx.pending.push({ num: p.post_number, parent: parentNum });
-      ctx.commentsEl.appendChild(node);
-    } else if (parentNode) {
-      parentNode.querySelector(':scope > .ldp-children').appendChild(node);
-    } else {
-      ctx.commentsEl.appendChild(node);
-    }
-    ctx.tracker.observe(node);
-    if (p.reply_count > 0) ctx.repliesIO.observe(node);
-  }
-
-  /* ============ 7. 渲染单条 ============ */
-  /**
-   * renderPost：渲染单个帖子节点。
-   * @param {object} p - 帖子数据
-   * @param {boolean} isReply - 是否是回复（已废弃，兼容性保留）
-   * @param {object} ctx - 全局上下文
-   * @param {number} depth - 树深度（用于缩进）
-   */
-  function renderPost(p, isReply, ctx, depth = 0) {
-    // 检测已删除的评论（缺少作者信息或内容）
-    const isDeleted = !p.username || !p.cooked || p.deleted_at || p.user_deleted === true;
-
-    // 正常评论的渲染逻辑
-    const username = p.username || '';
-    const displayName = p.name || p.display_name || p.display_username || username;
-    const avatar = p.avatar_template
-        ? BASE + p.avatar_template.replace('{size}', '48') : '';
-    const { count, acted, canAct } = likeInfo(p);
-    const isOP = ctx.op && username === ctx.op;
-    const isME = ME_USERNAME && username === ME_USERNAME;
-    const time = fmtTime(p.created_at);
-    const profileUrl = userProfileUrl(p.username);
-    const profileLabel = userProfileLabel(username, displayName);
-    const userCardAttrs = username
-        ? ` data-username="${escAttr(username)}" data-name="${escAttr(displayName)}"`
-          + (p.trust_level != null
-            ? ` data-trust-level="${escAttr(String(p.trust_level))}"` : '')
-        : '';
-
-    let cooked = isDeleted
-        ? '<p class="ldp-deleted">（帖子已被作者删除）</p>'
-        : p.cooked || '';
-    cooked = (() => {
-      const tmp = document.createElement('div');
-      tmp.innerHTML = cooked;
-      tmp.querySelectorAll('a[href]').forEach((a) => {
-        const href = a.getAttribute('href') || '';
-        const isImageLink = /\.(png|jpe?g|gif|webp|bmp|avif)(\?|#|$)/i.test(href);
-        const isLightbox = a.classList.contains('lightbox');
-        if (!isImageLink && !isLightbox) {
-          if (!a.getAttribute('target')) a.setAttribute('target', '_blank');
-        }
-      });
-      return tmp.innerHTML;
-    })();
-
-    const boostsHtml = isDeleted ? '' : renderBoosts(p.boosts || []);
-    const canBoost = !isDeleted && p.can_boost === true;
-    const canDelete = !isDeleted && isME && p.post_number !== 1;
-    const actionsHtml = isDeleted ? '' : `
-      <div class="ldp-actions">
-        <button class="ldp-btn ldp-like ${acted ? 'liked' : ''}"
-          data-acted="${acted ? '1' : '0'}" ${canAct || acted ? '' : 'disabled'} title="点赞">
-            <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;vertical-align:middle;">${ICONS.like}</svg>
-          <span class="ldp-like-count">${count}</span>
-        </button>
-        <button class="ldp-btn ldp-replybtn" title="回复">
-            <svg viewBox="0 0 1024 1024" style="width:12px;height:12px;fill:currentColor;vertical-align:middle;">${ICONS.reply}</svg>
-        </button>
-        <button class="ldp-btn ldp-boost-btn" ${canBoost ? '' : 'disabled'} title="Boost">
-            <svg viewBox="0 0 1024 1024" style="width:12px;height:12px;fill:currentColor;vertical-align:middle;">${ICONS.boost}</svg>
-        </button>
-        ${canDelete ? `<button class="ldp-btn ldp-deletebtn" title="删除">
-          <svg class="fa d-icon d-icon-trash-can svg-icon fa-width-auto svg-string" width="1em" height="1em" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><use href="#trash-can"></use></svg>
-        </button>` : ''}
-      </div>
-    `;
-
-    const node = document.createElement('div');
-    node.className = 'ldp-post' + (depth > 0 ? ' ldp-reply' : '');
-    node.dataset.postId = p.id;
-    node.dataset.postNumber = p.post_number;
-    node.innerHTML = `
-      <div class="ldp-post-head">
-        ${profileUrl ? `<a class="ldp-user-link" href="${profileUrl}" target="_blank" rel="noopener noreferrer" title="${escAttr(profileLabel)}"${userCardAttrs}>` : ''}
-        ${avatar ? `<img class="ldp-avatar" src="${avatar}" alt="" loading="lazy" decoding="async">` : ''}
-        ${displayName ? `<span class="ldp-author">${esc(displayName)}</span>` : ''}
-        ${username ? `<span class="ldp-user">@${esc(username)}</span>` : ''}
-        ${profileUrl ? '</a>' : ''}
-        ${p.trust_level != null ? `<span class="ldp-level">Lv.${p.trust_level}</span>` : ''}
-        ${isOP ? '<span class="ldp-op">OP</span>' : ''}
-        ${isME ? '<span class="ldp-me">ME</span>' : ''}
-        ${time ? `<span class="ldp-time">· ${esc(time)}</span>` : ''}
-        <span class="ldp-floor">#${p.post_number}</span>
-      </div>
-      <div class="ldp-content">${cooked}</div>
-      <div class="ldp-boosts-list">${boostsHtml}</div>
-      <div class="ldp-boost-input-wrap">
-        <input type="text" class="ldp-boost-input" maxlength="50"
-          placeholder="Boost ${esc(p.username)}… (最多16字符)">
-        <button class="ldp-emoji-btn ldp-boost-emoji" type="button" title="表情">${EMOJI_BTN_ICON}</button>
-        <button class="ldp-boost-submit" title="发送">✓</button>
-        <button class="ldp-boost-cancel" title="取消">×</button>
-      </div>
-      ${actionsHtml}
-      <div class="ldp-children"></div>
-      <div class="ldp-sub-loading">加载楼中楼中…</div>
-      <div class="ldp-sub-actions"><button class="ldp-btn ldp-load-more-replies">展示更多回复 ↓</button></div>
-    `;
-    renderPolls(node.querySelector('.ldp-content'), p);
-    prepareSpoilers(node.querySelector('.ldp-content'));
-    renderMath(node);
-    return node;
-  }
-
-  function markPostDeleted(postNode, ctx) {
-    const postNumber = Number(postNode.dataset.postNumber);
-    const post = ctx.postMap?.get(postNumber) || idToPost.get(Number(postNode.dataset.postId));
-    if (post) {
-      post.deleted_at = post.deleted_at || new Date().toISOString();
-      post.user_deleted = true;
-    }
-
-    const content = postNode.querySelector(':scope > .ldp-content');
-    if (content) content.innerHTML = '<p class="ldp-deleted">（帖子已被作者删除）</p>';
-    postNode.style.opacity = '';
-    postNode.querySelectorAll(
-      ':scope > .ldp-boosts-list, :scope > .ldp-boost-input-wrap, :scope > .ldp-actions'
-    ).forEach((el) => el.remove());
-  }
-
-  /* ============ 7.1 公式渲染（KaTeX） ============ */
-  /**
-   * Discourse 的 cooked 中公式只是 <span class="math"> / <div class="math">
-   * 包裹的原始 LaTeX，真正的渲染由站点 discourse-math 插件在客户端完成；
-   * 本脚本自建 DOM 绕过了该流程，因此需自行调用 KaTeX。
-   * 优先复用站点已加载的 KaTeX（window.katex），否则加载站点自带资源，
-   * 最后回退到 jsdelivr CDN（站点可能使用 MathJax 等其它渲染器）。
-   */
   const KATEX_CDN_CSS = 'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css';
   const KATEX_CDN_JS = 'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js';
   const KATEX_CDN_MHCHEM = 'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/mhchem.min.js';
   let katexLoading = null;
+
+  function getKatex() {
+    return (PAGE_WIN && PAGE_WIN.katex) || window.katex || null;
+  }
 
   function loadAsset(kind, url) {
     return new Promise((resolve, reject) => {
@@ -2137,47 +3689,45 @@
   }
 
   function loadKatex() {
-    if (window.katex) return Promise.resolve();
+    if (getKatex()) return Promise.resolve(getKatex());
     if (katexLoading) return katexLoading;
     katexLoading = (async () => {
       let loaded = false;
       try {
-        // 1) 站点自带 KaTeX 资源（与 discourse-math 插件一致，同源最快）
         await loadAsset('css', `${BASE}/plugins/discourse-math/katex/katex.min.css`);
         await loadAsset('js', `${BASE}/plugins/discourse-math/katex/katex.min.js`);
         await loadAsset('js', `${BASE}/plugins/discourse-math/katex/mhchem.min.js`);
-        loaded = !!window.katex;
+        loaded = !!getKatex();
       } catch (err) {
         loaded = false;
       }
       if (!loaded) {
-        // 2) 站点未提供 KaTeX 时回退到公共 CDN
         await loadAsset('css', KATEX_CDN_CSS);
         await loadAsset('js', KATEX_CDN_JS);
         await loadAsset('js', KATEX_CDN_MHCHEM);
       }
-      if (!window.katex) throw new Error('KaTeX 加载失败');
+      const katex = getKatex();
+      if (!katex) throw new Error('KaTeX 加载失败');
+      return katex;
     })();
     katexLoading.catch(() => { katexLoading = null; });
     return katexLoading;
   }
 
   function renderMath(root) {
+    if (!root) return;
     const mathEls = root.querySelectorAll('.math');
     if (!mathEls.length) return;
-
-    loadKatex().then(() => {
+    loadKatex().then((katex) => {
       mathEls.forEach((el) => {
         if (el.dataset.appliedKatex) return;
-        el.dataset.appliedKatex = true;
-
-        // 类名与选项对齐 discourse-math 插件，保证站点 KaTeX CSS 生效
+        el.dataset.appliedKatex = '1';
         const isBlock = el.tagName === 'DIV';
         el.classList.add('math-container', isBlock ? 'block-math' : 'inline-math', 'katex-math');
         const text = el.textContent;
         el.textContent = '';
         try {
-          window.katex.render(text, el, {
+          katex.render(text, el, {
             trust: (context) => ['\\htmlId', '\\href'].includes(context.command),
             macros: {
               '\\eqref': '\\href{###1}{(\\text{#1})}',
@@ -2188,11 +3738,173 @@
             throwOnError: false,
           });
         } catch (err) {
-          el.textContent = text; // 渲染失败时保留原始公式文本
+          el.textContent = text;
         }
       });
     }).catch((err) => {
       console.warn('[LinuxDo 增强阅读] KaTeX 加载失败，公式将以文本显示:', err);
+    });
+  }
+
+  /* ============ 7. 渲染单条 ============ */
+  function renderPost(p, isReply, ctx) {
+    const isDeleted = Boolean(p.deleted_at || p.user_deleted === true || (!p.username && !p.cooked));
+    const username = p.username || '';
+    const displayName = p.name || p.display_name || p.display_username || username;
+    const avatar = resolveAvatar(p.avatar_template, 48);
+    const { count, acted, canAct } = likeInfo(p);
+    const isOP = ctx.op && username && username === ctx.op;
+    const isME = ME_USERNAME && username && username === ME_USERNAME;
+    const time = fmtTime(p.created_at);
+    const profileUrl = username ? userProfileUrl(username) : '';
+
+    const cooked = isDeleted
+      ? '<p class="ldp-deleted">（帖子已被作者删除）</p>'
+      : (p.cooked || '');
+
+    const boostsHtml = isDeleted ? '' : renderBoosts(p.boosts || []);
+    const canBoost = !isDeleted && p.can_boost === true;
+    const canDelete = !isDeleted && isME && Number(p.post_number) !== 1;
+    const currentReaction = String((p.current_user_reaction && p.current_user_reaction.id) || '');
+    const reactionCount = (p.reactions || []).reduce((sum, item) => sum + Math.max(0, Number(item.count) || 0), 0);
+    const validReactions = validReactionIds(ctx.topic, p);
+    const directReplyCount = Math.max(0, Number(p.reply_count) || 0);
+
+    const lastReadPostNumber = Math.max(1, Number(
+      ctx.tracker && ctx.tracker.getReadWaterline ? ctx.tracker.getReadWaterline() : ctx.lastReadPostNumber
+    ) || 0);
+    const isUnread = !p._ldpSkipUnread && p.post_number > lastReadPostNumber;
+
+    const actionsHtml = isDeleted
+      ? (directReplyCount ? `<div class="ldp-actions"><button type="button" class="ldp-btn ldp-reply-toggle"
+          aria-expanded="false" aria-label="此楼层有 ${directReplyCount} 条直属回复">${directReplyCount} 个回复</button></div>` : '')
+      : `<div class="ldp-actions">
+        <button class="ldp-btn ldp-like ${acted ? 'liked' : ''}"
+          data-acted="${acted ? '1' : '0'}" ${canAct || acted ? '' : 'disabled'} title="点赞">
+            <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;vertical-align:middle;">${ICONS.like}</svg>
+          <span class="ldp-like-count">${count}</span>
+        </button>
+        <button class="ldp-btn ldp-replybtn" title="回复">
+            <svg viewBox="0 0 1024 1024" style="width:12px;height:12px;fill:currentColor;vertical-align:middle;">${ICONS.reply}</svg>
+        </button>
+        ${REACTIONS_AVAILABLE !== false && (validReactions.length || reactionCount) ? `<button class="ldp-btn ldp-reaction-btn ${currentReaction ? 'reacted' : ''}"
+          data-current-reaction="${escAttr(currentReaction)}" data-valid-reactions="${escAttr(validReactions.join(','))}"
+          title="添加回应" aria-label="添加回应">${currentReaction ? reactionLabel(currentReaction) : '☺'}${reactionCount ? `<span class="ldp-reaction-count">${reactionCount}</span>` : ''}</button>` : ''}
+        <button class="ldp-btn ldp-post-bookmark ${p.bookmarked ? 'bookmarked' : ''}"
+          data-bookmark-id="${escAttr(String(p.bookmark_id || ''))}" title="收藏楼层" aria-label="收藏楼层">
+          <svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:currentColor;vertical-align:middle;">${ICONS.bookmark}</svg>
+        </button>
+        <button class="ldp-btn ldp-boost-btn" ${canBoost ? '' : 'disabled'} title="Boost">
+          <svg viewBox="0 0 1024 1024" style="width:12px;height:12px;fill:currentColor;vertical-align:middle;">${ICONS.boost}</svg>
+        </button>
+        ${canDelete ? `<button type="button" class="ldp-btn ldp-deletebtn" title="删除" aria-label="删除">${TRASH_BTN_ICON}</button>` : ''}
+        ${directReplyCount ? `<button type="button" class="ldp-btn ldp-reply-toggle"
+          aria-expanded="false" aria-label="此楼层有 ${directReplyCount} 条直属回复">${directReplyCount} 个回复</button>` : ''}
+      </div>`;
+
+    const userIdentityHtml = username
+      ? `<a class="ldp-user-link" href="${escAttr(profileUrl)}" target="_blank" rel="noopener noreferrer" data-username="${escAttr(username)}"><span class="ldp-author">${esc(displayName)}</span><span class="ldp-user">@${esc(username)}</span></a>`
+      : (displayName ? `<span class="ldp-author">${esc(displayName)}</span>` : '');
+
+    const node = document.createElement('div');
+    node.className = 'ldp-post' + (isReply ? ' ldp-reply' : '') + (isUnread ? ' ldp-unread' : '');
+    node.dataset.postId = p.id;
+    node.dataset.postNumber = p.post_number;
+    node.dataset.createdAt = p.created_at || '';
+    node.dataset.replyToPostNumber = p.reply_to_post_number || 0;
+    node.dataset.windowEpoch = String(ctx.windowEpoch || 0);
+    node.innerHTML = `
+      <div class="ldp-post-head">
+        ${avatar && username ? `<button type="button" class="ldp-avatar-btn" title="查看 ${escAttr(username)} 的个人详情" aria-label="查看 ${escAttr(username)} 的个人详情" data-username="${escAttr(username)}"><img class="ldp-avatar" src="${escAttr(avatar)}" alt="" loading="lazy" decoding="async"></button>` : (avatar ? `<img class="ldp-avatar" src="${escAttr(avatar)}" alt="" loading="lazy" decoding="async">` : '')}
+        ${userIdentityHtml}
+        ${p.trust_level != null && p.trust_level !== '' ? `<span class="ldp-level">Lv.${esc(String(p.trust_level))}</span>` : ''}
+        ${isOP ? '<span class="ldp-op">OP</span>' : ''}
+        ${isME ? '<span class="ldp-me">ME</span>' : ''}
+        ${time ? `<span class="ldp-time">· ${esc(time)}</span>` : ''}
+        <span class="ldp-floor">#${p.post_number}</span>
+        <span class="ldp-unread-dot" title="未读" aria-label="未读"></span>
+      </div>
+      <div class="ldp-content">${cooked}</div>
+      ${isDeleted ? '' : `<div class="ldp-boosts-list">${boostsHtml}</div>
+      <div class="ldp-boost-input-wrap">
+        <input type="text" class="ldp-boost-input" maxlength="50"
+          placeholder="Boost ${esc(username)}… (最多16字符)">
+        <button class="ldp-emoji-btn ldp-boost-emoji" type="button" title="表情">${EMOJI_BTN_ICON}</button>
+        <button class="ldp-boost-submit" title="发送">✓</button>
+        <button class="ldp-boost-cancel" title="取消">×</button>
+      </div>`}
+      ${actionsHtml}
+      <div class="ldp-children"></div>
+    `;
+    const content = node.querySelector('.ldp-content');
+    content.querySelectorAll('a[href]').forEach((anchor) => {
+      if (!isImageAnchor(anchor) && !anchor.getAttribute('target')) anchor.setAttribute('target', '_blank');
+    });
+    content.querySelectorAll('img').forEach((img) => {
+      if (!img.hasAttribute('loading')) img.setAttribute('loading', 'lazy');
+      if (!img.hasAttribute('decoding')) img.setAttribute('decoding', 'async');
+    });
+    content.querySelectorAll('iframe').forEach((iframe) => {
+      if (!iframe.hasAttribute('loading')) iframe.setAttribute('loading', 'lazy');
+    });
+    if (Number(ctx.highlightPostId) === Number(p.id) && Date.now() < Number(ctx.highlightUntil || 0)) {
+      node.classList.add('ldp-flash');
+    }
+    if (!isDeleted) {
+      renderPolls(content, p);
+      prepareSpoilers(content);
+      renderMath(node);
+      enhanceCodeBlocks(node);
+    }
+    return node;
+  }
+
+  function markPostDeleted(postId, modal, ctx) {
+    const deletedAt = new Date().toISOString();
+    if (ctx && ctx.loader) {
+      ctx.loader.updatePost(postId, { deleted_at: deletedAt, user_deleted: true });
+    }
+    if (!modal) return;
+    const escapedId = CSS.escape(String(postId));
+    modal.querySelectorAll(`.ldp-post[data-post-id="${escapedId}"], .ldp-embedded-reply[data-post-id="${escapedId}"]`).forEach((node) => {
+      const content = node.querySelector(':scope > .ldp-content');
+      if (content) content.innerHTML = '<p class="ldp-deleted">（帖子已被作者删除）</p>';
+      node.querySelectorAll(':scope > .ldp-boosts-list, :scope > .ldp-boost-input-wrap, :scope > .ldp-replybox, :scope > .ldp-reaction-picker').forEach((el) => el.remove());
+      const actions = node.querySelector(':scope > .ldp-actions');
+      if (actions) {
+        const replyToggle = actions.querySelector('.ldp-reply-toggle');
+        if (replyToggle && !replyToggle.hidden) actions.replaceChildren(replyToggle);
+        else actions.remove();
+      }
+      if (node.classList.contains('ldp-post') && ctx && ctx.refreshRenderRevision) {
+        ctx.refreshRenderRevision(node);
+      }
+    });
+  }
+
+  function syncRenderedPostState(root, post, ctx) {
+    if (!root || !post || !post.id) return;
+    const { count, acted } = likeInfo(post);
+    const currentReaction = String((post.current_user_reaction && post.current_user_reaction.id) || '');
+    const reactionCount = (post.reactions || []).reduce((sum, item) => sum + Math.max(0, Number(item.count) || 0), 0);
+    root.querySelectorAll(`.ldp-post[data-post-id="${CSS.escape(String(post.id))}"]`).forEach((node) => {
+      const like = node.querySelector(':scope > .ldp-actions .ldp-like');
+      if (like) {
+        like.classList.toggle('liked', acted); like.dataset.acted = acted ? '1' : '0';
+        const countNode = like.querySelector('.ldp-like-count'); if (countNode) countNode.textContent = String(count);
+      }
+      const bookmark = node.querySelector(':scope > .ldp-actions .ldp-post-bookmark');
+      if (bookmark) {
+        bookmark.classList.toggle('bookmarked', !!post.bookmarked);
+        bookmark.dataset.bookmarkId = String(post.bookmark_id || '');
+      }
+      const reaction = node.querySelector(':scope > .ldp-actions .ldp-reaction-btn');
+      if (reaction) {
+        reaction.classList.toggle('reacted', !!currentReaction);
+        reaction.dataset.currentReaction = currentReaction;
+        reaction.innerHTML = `${currentReaction ? reactionLabel(currentReaction) : '☺'}${reactionCount ? `<span class="ldp-reaction-count">${reactionCount}</span>` : ''}`;
+      }
+      if (ctx) updateReplyToggle(node, post.post_number, ctx);
     });
   }
 
@@ -2203,11 +3915,16 @@
     const username = (post.querySelector(':scope > .ldp-post-head .ldp-user')?.textContent || '').replace(/^@/, '');
     box = document.createElement('div');
     box.className = 'ldp-replybox';
-    box.innerHTML = `<textarea placeholder="回复 @${esc(username)} …"></textarea><div class="ldp-reply-tools"><div class="ldp-insert-wrap"><button class="ldp-emoji-btn ldp-reply-insert" type="button" title="插入模板" aria-haspopup="true" aria-expanded="false">${INSERT_BTN_ICON}</button><div class="ldp-insert-menu" hidden><button class="ldp-insert-item ldp-reply-details" type="button">${DETAILS_ICON}<span>隐藏详细信息</span></button><button class="ldp-insert-item ldp-reply-spoiler" type="button">${SPOILER_ICON}<span>模糊剧透</span></button></div></div><button class="ldp-emoji-btn ldp-reply-emoji" type="button" title="表情">${EMOJI_BTN_ICON}</button><button class="ldp-send">发送</button><span class="ldp-reply-tip">✓ 已发送</span></div>`;
+    box.innerHTML = `<textarea placeholder="回复 @${esc(username)} …"></textarea><div class="ldp-reply-tools"><div class="ldp-insert-wrap"><button class="ldp-emoji-btn ldp-reply-insert" type="button" title="插入模板" aria-haspopup="true" aria-expanded="false">${INSERT_BTN_ICON}</button><div class="ldp-insert-menu" hidden><button class="ldp-insert-item ldp-reply-details" type="button">${DETAILS_ICON}<span>隐藏详细信息</span></button><button class="ldp-insert-item ldp-reply-spoiler" type="button">${SPOILER_ICON}<span>模糊剧透</span></button></div></div><button class="ldp-emoji-btn ldp-reply-emoji" type="button" title="表情">${EMOJI_BTN_ICON}</button><button class="ldp-send" type="button">发送</button><span class="ldp-reply-tip">✓ 已发送</span></div>`;
+
     const textarea = box.querySelector('textarea');
     bindPasteEvent(textarea);
     const emojiBtn = box.querySelector('.ldp-reply-emoji');
-    emojiBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); toggleEmojiPanel(emojiBtn, textarea); });
+    emojiBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleEmojiPanel(emojiBtn, textarea);
+    });
     const insertBtn = box.querySelector('.ldp-reply-insert');
     const insertMenu = box.querySelector('.ldp-insert-menu');
     const onInsertMenuOutside = (e) => {
@@ -2219,7 +3936,8 @@
       document.removeEventListener('mousedown', onInsertMenuOutside, true);
     };
     insertBtn.addEventListener('click', (e) => {
-      e.preventDefault(); e.stopPropagation();
+      e.preventDefault();
+      e.stopPropagation();
       if (insertMenu.hidden) {
         insertMenu.hidden = false;
         insertBtn.setAttribute('aria-expanded', 'true');
@@ -2236,13 +3954,14 @@
       insertAtCursor(textarea, '[spoiler]此文本将被模糊处理[/spoiler]');
       closeInsertMenu();
     });
+
     const actions = post.querySelector(':scope > .ldp-actions');
     if (actions) actions.after(box);
     else post.appendChild(box);
     return box;
   }
 
-  /* ============ 文件粘贴上传 ============ */
+  /* ============ 文件粘贴上传（大图压缩 + 分片直传 + 标准回退） ============ */
   const MULTIPART_UPLOAD_CONCURRENCY = 6;
   const MULTIPART_RETRY_DELAYS = [0, 1000, 3000, 5000];
   const HUGE_FILE_CHECKSUM_LIMIT = 100 * 1024 * 1024;
@@ -2253,8 +3972,6 @@
   const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'svg', 'ico', 'webp', 'avif', 'heic', 'heif', 'jxl']);
   const AUDIO_EXTENSIONS = new Set(['mp3', 'ogg', 'oga', 'opus', 'wav', 'm4a', 'm4b', 'm4p', 'm4r', 'aac', 'flac']);
   const VIDEO_EXTENSIONS = new Set(['mov', 'mp4', 'webm', 'ogv', 'm4v', '3gp', 'avi', 'mpeg']);
-
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   function fileExtension(filename) {
     const match = (filename || '').match(/\.([a-z0-9]+)$/i);
@@ -2286,7 +4003,7 @@
     return `${baseName || 'clipboard-file'}.webp`;
   }
 
-  let imageMagickReady;
+  let imageMagickReady = null;
 
   async function ensureImageMagick() {
     if (!imageMagickReady) {
@@ -2294,13 +4011,14 @@
         const { initializeImageMagick } = await import(IMAGE_MAGICK_CDN);
         await initializeImageMagick(new URL(IMAGE_MAGICK_WASM));
       })();
+      imageMagickReady.catch(() => { imageMagickReady = null; });
     }
     return imageMagickReady;
   }
 
   async function convertAnimatedGifWithOfficialWorker(file) {
+    if (location.hostname !== 'linux.do') return null;
     const input = await file.arrayBuffer();
-    // Blob Worker 只是官方 chunk 的入口包装，chunk 内相对 WASM 路径仍会解析到 L 站 CDN。
     const worker = new Worker(URL.createObjectURL(new Blob([
       `import '${OFFICIAL_MEDIA_WORKER_URL}';`,
     ], { type: 'text/javascript' })), { type: 'module' });
@@ -2322,7 +4040,6 @@
         };
         worker.onerror = () => reject(new Error('官方图片处理 Worker 加载失败'));
         worker.onmessageerror = () => reject(new Error('官方图片处理 Worker 消息解析失败'));
-
         worker.postMessage({
           type: 'convertAnimated',
           file: input,
@@ -2345,8 +4062,6 @@
       try {
         const converted = await convertAnimatedGifWithOfficialWorker(file);
         if (converted) return converted;
-        console.warn('[LinuxDo 增强阅读] 官方 Worker 未产出更小的 WebP，将尝试上传原 GIF');
-        return file;
       } catch (err) {
         console.warn('[LinuxDo 增强阅读] 官方 GIF 预处理失败，将回退 ImageMagick:', err);
       }
@@ -2356,9 +4071,9 @@
       await ensureImageMagick();
       const { ImageMagick, MagickFormat } = await import(IMAGE_MAGICK_CDN);
       const input = new Uint8Array(await file.arrayBuffer());
-      const output = await ImageMagick.readCollection(input, async images => {
-        images.forEach(image => { image.quality = 75; });
-        return await images.write(MagickFormat.WebP, data => data);
+      const output = await ImageMagick.readCollection(input, async (images) => {
+        images.forEach((image) => { image.quality = 75; });
+        return await images.write(MagickFormat.WebP, (data) => data);
       });
       const blob = new Blob([output], { type: 'image/webp' });
       if (blob.size >= file.size || blob.size > DISCOURSE_IMAGE_SIZE_LIMIT) return file;
@@ -2404,9 +4119,8 @@
 
   async function uploadMultipartParts(file, uniqueIdentifier) {
     const chunkSize = multipartChunkSize(file.size);
-    const totalParts = Math.ceil(file.size / chunkSize);
+    const totalParts = Math.ceil(Math.max(1, file.size) / chunkSize);
     const parts = new Array(totalParts);
-
     for (let partNumber = 1; partNumber <= totalParts; partNumber += MULTIPART_UPLOAD_CONCURRENCY) {
       const batchNumbers = [];
       for (let n = partNumber; n < Math.min(partNumber + MULTIPART_UPLOAD_CONCURRENCY, totalParts + 1); n++) {
@@ -2447,6 +4161,14 @@
     });
   }
 
+  async function uploadDirectFile(file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('type', 'composer');
+    formData.append('synchronous', 'true');
+    return apiSend(`${BASE}/uploads.json`, 'POST', formData);
+  }
+
   async function uploadFile(file) {
     let uploadId;
     try {
@@ -2459,6 +4181,9 @@
       return await completeMultipartUpload(created.unique_identifier, parts);
     } catch (err) {
       if (uploadId) await abortMultipartUpload(uploadId).catch(() => {});
+      if (!uploadId && err && (err.status === 404 || err.status === 405 || err.status === 422)) {
+        return await uploadDirectFile(file);
+      }
       throw err;
     }
   }
@@ -2487,7 +4212,7 @@
 
   function bindPasteEvent(textarea) {
     textarea.addEventListener('paste', async (e) => {
-      const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+      const items = (e.clipboardData || (e.originalEvent && e.originalEvent.clipboardData) || {}).items || [];
       for (const item of items) {
         if (item.kind === 'file') {
           e.preventDefault();
@@ -2514,99 +4239,132 @@
     });
   }
 
-  /* ============ 9. 加载剩余子回复 ============ */
-  /**
-   * loadAllChildren：加载指定帖子的所有剩余子回复。
-   * @param {number} postId - 帖子 ID
-   * @param {number} postNumber - 帖子楼号
-   * @param {HTMLElement} button - "展示更多"按钮
-   * @param {object} ctx - 全局上下文
-   */
-  async function loadAllChildren(postId, postNumber, button, ctx, silent = false) {
-    if (button) {
-      button.disabled = true;
-      button.textContent = '加载中...';
+  /* ============ 9. 原帖式直属回复折叠 ============ */
+  function renderEmbeddedReply(post, ctx) {
+    const isDeleted = Boolean(post.deleted_at || post.user_deleted === true || (!post.username && !post.cooked));
+    const username = post.username || '';
+    const displayName = post.name || post.display_name || username;
+    const avatar = resolveAvatar(post.avatar_template, 32);
+    const time = fmtTime(post.created_at);
+    const profileUrl = username ? userProfileUrl(username) : '';
+    const userIdentityHtml = username
+      ? `<a class="ldp-user-link" href="${escAttr(profileUrl)}" target="_blank" rel="noopener noreferrer" data-username="${escAttr(username)}"><span class="ldp-author">${esc(displayName)}</span><span class="ldp-user">@${esc(username)}</span></a>`
+      : `<span class="ldp-author">${esc(displayName)}</span>`;
+    const node = document.createElement('div');
+    node.className = 'ldp-embedded-reply';
+    node.dataset.postId = String(post.id);
+    node.dataset.postNumber = String(post.post_number);
+    node.setAttribute('aria-label', `楼层 #${post.post_number} 的直属回复`);
+    node.innerHTML = `
+      <div class="ldp-embedded-head">
+        ${avatar && username ? `<button type="button" class="ldp-avatar-btn" title="查看 ${escAttr(username)} 的个人详情"
+          aria-label="查看 ${escAttr(username)} 的个人详情" data-username="${escAttr(username)}">
+          <img class="ldp-avatar" src="${escAttr(avatar)}" alt="" loading="lazy" decoding="async"></button>` : (avatar ? `<img class="ldp-avatar" src="${escAttr(avatar)}" alt="" loading="lazy" decoding="async">` : '')}
+        ${userIdentityHtml}
+        ${post.trust_level != null && post.trust_level !== '' ? `<span class="ldp-level">Lv.${esc(String(post.trust_level))}</span>` : ''}
+        ${ctx.op && username && username === ctx.op ? '<span class="ldp-op">OP</span>' : ''}
+        ${ME_USERNAME && username && username === ME_USERNAME ? '<span class="ldp-me">ME</span>' : ''}
+        ${time ? `<span class="ldp-time">· ${esc(time)}</span>` : ''}
+        <button type="button" class="ldp-btn ldp-embedded-jump" data-post-number="${Number(post.post_number)}"
+          title="跳到原始楼层">跳到 #${Number(post.post_number)}</button>
+      </div>
+      <div class="ldp-content">${isDeleted ? '<p class="ldp-deleted">（帖子已被作者删除）</p>' : (post.cooked || '')}</div>`;
+    const content = node.querySelector('.ldp-content');
+    content.querySelectorAll('a[href]').forEach((anchor) => {
+      if (!isImageAnchor(anchor) && !anchor.getAttribute('target')) anchor.setAttribute('target', '_blank');
+    });
+    content.querySelectorAll('img').forEach((img) => {
+      if (!img.hasAttribute('loading')) img.setAttribute('loading', 'lazy');
+      if (!img.hasAttribute('decoding')) img.setAttribute('decoding', 'async');
+    });
+    content.querySelectorAll('iframe').forEach((iframe) => {
+      if (!iframe.hasAttribute('loading')) iframe.setAttribute('loading', 'lazy');
+    });
+    if (!isDeleted) {
+      renderPolls(content, post);
+      prepareSpoilers(content);
+      renderMath(node);
+      enhanceCodeBlocks(node);
     }
-
-    try {
-      const children = await fetchAllNestedChildren(ctx.topicId, postNumber);
-      const postNode = ctx.nodeMap.get(postNumber)
-          || button?.closest('.ldp-post');
-      if (!postNode) throw new Error(`父楼层 #${postNumber} 尚未渲染`);
-
-      const post = ctx.postMap?.get(postNumber) || idToPost.get(postId);
-      if (post) post.children = children;
-      indexTree(children);
-      indexPostsByNumber(children, ctx);
-
-      // 清理扁平窗口中可能临时挂在顶层的重复节点；随后用权威嵌套数据重建子树。
-      const childNumbers = new Set();
-      const collectNumbers = (items) => items.forEach((item) => {
-        childNumbers.add(item.post_number);
-        if (item.children?.length) collectNumbers(item.children);
-      });
-      collectNumbers(children);
-      childNumbers.forEach((postNum) => {
-        const oldNode = ctx.nodeMap.get(postNum);
-        if (oldNode) oldNode.remove();
-        ctx.nodeMap.delete(postNum);
-      });
-      if (ctx.pending) {
-        ctx.pending = ctx.pending.filter((item) => !childNumbers.has(item.num));
-      }
-
-      const childrenEl = postNode.querySelector(':scope > .ldp-children');
-      childrenEl.innerHTML = '';
-
-      let parentDepth = 0;
-      let cursor = postNode.parentElement;
-      while (cursor && cursor !== ctx.commentsEl) {
-        if (cursor.classList.contains('ldp-children')) parentDepth++;
-        cursor = cursor.parentElement;
-      }
-      renderNestedTree(children, childrenEl, ctx, parentDepth + 1);
-
-      const actionsEl = postNode.querySelector(':scope > .ldp-sub-actions');
-      if (actionsEl) actionsEl.style.display = 'none';
-      if (button) button.remove();
-      postNode.dataset.repliesLoaded = '1';
-      return children;
-    } catch (e) {
-      if (button) {
-        button.disabled = false;
-        button.textContent = '展示更多回复 ↓';
-      }
-      if (!silent) {
-        alert('加载失败：' + e.message);
-        return [];
-      }
-      throw e;
-    }
+    return node;
   }
 
-  /* ============ 9. 楼层归位辅助函数 ============ */
-  /**
-   * reflowPending：重新组织等待父节点的帖子。
-   * 当子帖子的父节点还未渲染时，会先放到 pending 数组，
-   * 父节点渲染后调用此函数重新组织DOM结构。
-   */
-  function reflowPending(ctx) {
-    if (!ctx.pending || !ctx.pending.length) return;
-    const rest = [];
-    ctx.pending.forEach((it) => {
-      const child = ctx.nodeMap.get(it.num);
-      const parent = ctx.nodeMap.get(it.parent);
-      if (child && parent) {
-        parent.querySelector(':scope > .ldp-children').appendChild(child);
-      } else {
-        rest.push(it);
-      }
+  function mergeSubReplyState(postNumber, replies, ctx, options) {
+    const key = Number(postNumber);
+    const state = ctx.subReplyState.get(key)
+      || { all: [], expanded: false, loaded: false, loading: false, error: null };
+    const byId = new Map();
+    [...state.all, ...(replies || [])].forEach((reply) => {
+      if (!reply || !reply.id || Number(reply.reply_to_post_number) !== key) return;
+      const canonical = ctx.loader.getPostById(reply.id) || reply;
+      byId.set(Number(canonical.id), canonical);
     });
-    ctx.pending = rest;
+    state.all = Array.from(byId.values()).sort((a, b) => Number(a.post_number) - Number(b.post_number));
+    if (options && options.loaded) state.loaded = true;
+    state.loading = false;
+    state.error = null;
+    ctx.subReplyState.set(key, state);
+    return state;
+  }
+
+  function updateReplyToggle(parentNode, postNumber, ctx) {
+    if (!parentNode) return;
+    const state = ctx.subReplyState.get(Number(postNumber));
+    const post = ctx.loader.getPostById(parentNode.dataset.postId);
+    const count = Math.max(Number(post && post.reply_count) || 0, Number(state && state.all.length) || 0);
+    let button = parentNode.querySelector(':scope > .ldp-actions .ldp-reply-toggle');
+    if (!button && count > 0) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'ldp-btn ldp-reply-toggle';
+      const actions = parentNode.querySelector(':scope > .ldp-actions');
+      if (actions) actions.appendChild(button);
+    }
+    if (!button) return;
+    button.hidden = count <= 0 && !(state && state.error);
+    button.setAttribute('aria-label', `此楼层有 ${count} 条直属回复`);
+    button.classList.toggle('is-error', !!(state && state.error));
+    button.setAttribute('aria-expanded', state && state.expanded ? 'true' : 'false');
+    if (state && state.loading) button.textContent = '回复加载中…';
+    else if (state && state.error) button.textContent = '加载失败，点击重试';
+    else button.textContent = `${count} 个回复`;
+  }
+
+  function renderSubReplyStateInto(parentNode, postNumber, ctx) {
+    const state = ctx.subReplyState.get(Number(postNumber));
+    if (!state || !parentNode) return;
+    const children = parentNode.querySelector(':scope > .ldp-children');
+    if (!children) return;
+    children.replaceChildren();
+    children.classList.toggle('expanded', !!state.expanded);
+    if (state.expanded) {
+      const fragment = document.createDocumentFragment();
+      state.all.forEach((reply) => {
+        fragment.appendChild(renderEmbeddedReply(ctx.loader.getPostById(reply.id) || reply, ctx));
+      });
+      children.appendChild(fragment);
+    }
+    updateReplyToggle(parentNode, postNumber, ctx);
+  }
+
+  function renderSubReplyState(postNumber, ctx) {
+    const parentNode = ctx.nodeMap.get(Number(postNumber))
+      || ctx.topicEl.querySelector(`.ldp-post[data-post-number="${postNumber}"]`);
+    if (!parentNode) return;
+    const mutate = () => renderSubReplyStateInto(parentNode, postNumber, ctx);
+    if (ctx.withViewportAnchor) ctx.withViewportAnchor(mutate);
+    else mutate();
+    if (ctx.refreshRenderRevision) ctx.refreshRenderRevision(parentNode);
+    if (ctx.onPostsChanged) ctx.onPostsChanged();
   }
 
   /* ============ 10. 事件委托 ============ */
   function bindActions(modal, ctx) {
+    // 先于站点和浏览器默认链接行为接管 Discourse 图片、黑色信息条和右下角放大控件。
+    modal.addEventListener('click', (e) => {
+      interceptImagePreviewClick(e, modal);
+    }, true);
+
     modal.addEventListener('click', async (e) => {
       const spoiler = e.target.closest('.ldp-spoiler');
       if (spoiler && spoiler.classList.contains('ldp-spoiler-blurred')) {
@@ -2622,50 +4380,69 @@
         setSpoilerState(spoiler, true);
         return;
       }
+
       const videoPlaceholder = e.target.closest('.video-placeholder-container[data-video-src]');
       if (videoPlaceholder && !videoPlaceholder.querySelector('video')) {
         e.preventDefault();
         e.stopPropagation();
-        activateVideoPlaceholder(videoPlaceholder);
+        if (ctx.withViewportAnchor) ctx.withViewportAnchor(() => activateVideoPlaceholder(videoPlaceholder));
+        else activateVideoPlaceholder(videoPlaceholder);
         return;
       }
 
-      const userCardTrigger = e.target.closest(
-          '.ldp-user-link, .ldp-boost-avatar-link, .ldp-b-avatar'
-      );
+      // 图片本体及其文件名/尺寸/右下角放大控件统一使用脚本灯箱，避免跳转到 CDN 原图页
+      if (interceptImagePreviewClick(e, modal)) return;
+
+      const avatarBtn = e.target.closest('.ldp-avatar-btn');
+      if (avatarBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        openUserCardV2(avatarBtn.dataset.username, avatarBtn);
+        return;
+      }
+
+      const userCardTrigger = e.target.closest('.ldp-user-link, .ldp-boost-avatar-link, .ldp-b-avatar');
       if (userCardTrigger && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
-        const info = getUserCardInfo(userCardTrigger);
-        if (info) {
+        const uname = userCardTrigger.dataset.username;
+        if (uname) {
           e.preventDefault();
           e.stopPropagation();
-          openUserCard(userCardTrigger, info);
+          openUserCardV2(uname, userCardTrigger);
           return;
         }
       }
 
+      // 允许内容区 <a target="_blank"> 正常跳转
       const anchor = e.target.closest('a');
       if (anchor && anchor.target === '_blank') return;
 
-      const pollControl = e.target.closest(
-          '.ldp-poll-option, .ldp-poll-submit, .ldp-poll-remove'
-      );
+      const pollControl = e.target.closest('.ldp-poll-option, .ldp-poll-submit, .ldp-poll-remove');
       if (pollControl) {
         e.preventDefault();
         e.stopPropagation();
         if (pollControl.disabled || pollControl.closest('.ldp-poll')?.hasAttribute('data-loading')) return;
-        await handlePollControl(pollControl, ctx);
+        await handlePollControl(pollControl, ctx, modal);
+        return;
+      }
+      const embeddedJump = e.target.closest('.ldp-embedded-jump');
+      if (embeddedJump && ctx.virtualFlow) {
+        e.preventDefault();
+        await ctx.virtualFlow.seekToPost(Number(embeddedJump.dataset.postNumber));
         return;
       }
 
-      const img = e.target.closest('.ldp-content img');
-      if (img) { e.preventDefault(); e.stopPropagation(); openLightbox(resolveOriginalSrc(img)); return; }
+      const threadToggle = e.target.closest('.ldp-thread-toggle');
+      if (threadToggle) {
+        const summary = threadToggle.closest('.ldp-reply-summary');
+        const expanded = summary.classList.toggle('expanded');
+        threadToggle.textContent = `${threadToggle.textContent.split('·')[0].trim()} · ${expanded ? '收起' : '展开'}`;
+        return;
+      }
 
-      const moreBtn = e.target.closest('.ldp-load-more-replies');
-      if (moreBtn) {
-        const post = moreBtn.closest('.ldp-post');
-        const postId = +post.dataset.postId;
-        const postNumber = +post.dataset.postNumber;
-        await loadAllChildren(postId, postNumber, moreBtn, ctx);
+      const replyToggle = e.target.closest('.ldp-reply-toggle');
+      if (replyToggle && ctx.repliesIO) {
+        const post = replyToggle.closest('.ldp-post');
+        await ctx.repliesIO.toggle(post);
         return;
       }
 
@@ -2673,21 +4450,131 @@
       if (!postNode) return;
       const postId = postNode.dataset.postId, postNumber = +postNode.dataset.postNumber;
 
+      const syncCopies = (selector, update) => {
+        modal.querySelectorAll(`.ldp-post[data-post-id="${CSS.escape(String(postId))}"] ${selector}`)
+          .forEach(update);
+      };
+
       const likeBtn = e.target.closest('.ldp-like');
       if (likeBtn && !likeBtn.disabled) {
         const countEl = likeBtn.querySelector('.ldp-like-count'), acted = likeBtn.dataset.acted === '1';
         likeBtn.disabled = true;
         try {
+          let nextCount;
           if (!acted) {
             await apiSend(`${BASE}/post_actions`, 'POST', { id: postId, post_action_type_id: 2, flag_topic: false });
-            likeBtn.classList.add('liked'); likeBtn.dataset.acted = '1';
-            countEl.textContent = (+countEl.textContent) + 1;
+            nextCount = (+countEl.textContent) + 1;
+            syncCopies('.ldp-like', (button) => {
+              button.classList.add('liked'); button.dataset.acted = '1';
+              const count = button.querySelector('.ldp-like-count'); if (count) count.textContent = nextCount;
+            });
           } else {
             await apiSend(`${BASE}/post_actions/${postId}?post_action_type_id=2`, 'DELETE');
-            likeBtn.classList.remove('liked'); likeBtn.dataset.acted = '0';
-            countEl.textContent = Math.max(0, (+countEl.textContent) - 1);
+            nextCount = Math.max(0, (+countEl.textContent) - 1);
+            syncCopies('.ldp-like', (button) => {
+              button.classList.remove('liked'); button.dataset.acted = '0';
+              const count = button.querySelector('.ldp-like-count'); if (count) count.textContent = nextCount;
+            });
           }
+          if (ctx.loader) ctx.loader.updatePost(postId, (post) => {
+            const actions = Array.isArray(post.actions_summary) ? post.actions_summary.map((item) => Object.assign({}, item)) : [];
+            let like = actions.find((item) => Number(item.id) === 2);
+            if (!like) { like = { id: 2 }; actions.push(like); }
+            like.count = nextCount; like.acted = !acted;
+            post.actions_summary = actions;
+            return post;
+          });
+          invalidateCollectionCache('responses').catch(() => {});
+          invalidateTopicSnapshot(ctx.topicId).catch(() => {});
         } catch (err) { alert('操作失败：' + err.message); } finally { likeBtn.disabled = false; }
+        return;
+      }
+
+      const bookmarkBtn = e.target.closest('.ldp-post-bookmark');
+      if (bookmarkBtn && !bookmarkBtn.disabled) {
+        bookmarkBtn.disabled = true;
+        const bookmarkId = bookmarkBtn.dataset.bookmarkId;
+        try {
+          let nextId = '';
+          if (!bookmarkBtn.classList.contains('bookmarked')) {
+            const data = await apiSend(`${BASE}/bookmarks`, 'POST', {
+              bookmarkable_id: postId, bookmarkable_type: 'Post',
+            });
+            nextId = String((data && data.id) || '');
+          } else if (bookmarkId) {
+            await apiSend(`${BASE}/bookmarks/${bookmarkId}`, 'DELETE');
+          }
+          syncCopies('.ldp-post-bookmark', (button) => {
+            button.classList.toggle('bookmarked', !!nextId);
+            button.dataset.bookmarkId = nextId;
+          });
+          if (ctx.loader) ctx.loader.updatePost(postId, {
+            bookmarked: !!nextId, bookmark_id: nextId || null,
+          });
+          invalidateCollectionCache('bookmarks').catch(() => {});
+          invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+        } catch (err) { alert('楼层收藏操作失败：' + err.message); }
+        finally { syncCopies('.ldp-post-bookmark', (button) => { button.disabled = false; }); }
+        return;
+      }
+
+      const reactionBtn = e.target.closest('.ldp-reaction-btn');
+      if (reactionBtn) {
+        let picker = postNode.querySelector(':scope > .ldp-reaction-picker');
+        if (!picker) {
+          const reactionIds = String(reactionBtn.dataset.validReactions || '').split(',').filter(Boolean);
+          if (!reactionIds.length) return;
+          picker = document.createElement('div');
+          picker.className = 'ldp-reaction-picker';
+          const current = reactionBtn.dataset.currentReaction || '';
+          picker.innerHTML = reactionIds.map((id) => `<button type="button" data-reaction-id="${escAttr(id)}"
+            class="${id === current ? 'selected' : ''}" title="${escAttr(id)}">${reactionLabel(id)}</button>`).join('');
+          postNode.querySelector(':scope > .ldp-actions').after(picker);
+        }
+        picker.classList.toggle('open');
+        return;
+      }
+
+      const reactionChoice = e.target.closest('.ldp-reaction-picker [data-reaction-id]');
+      if (reactionChoice) {
+        reactionChoice.disabled = true;
+        try {
+          const reactionId = reactionChoice.dataset.reactionId;
+          await apiSend(`${BASE}/discourse-reactions/posts/${postId}/custom-reactions/${encodeURIComponent(reactionId)}/toggle.json`, 'PUT');
+          const cachedPost = ctx.loader && ctx.loader.getPostById(postId);
+          const previous = String((cachedPost && cachedPost.current_user_reaction && cachedPost.current_user_reaction.id)
+            || postNode.querySelector('.ldp-reaction-btn').dataset.currentReaction || '');
+          const selected = previous !== reactionId;
+          if (ctx.loader) ctx.loader.updatePost(postId, (post) => {
+            const reactions = Array.isArray(post.reactions) ? post.reactions.map((item) => Object.assign({}, item)) : [];
+            const adjust = (id, delta) => {
+              if (!id) return;
+              let item = reactions.find((entry) => String(entry.id) === String(id));
+              if (!item && delta > 0) { item = { id, type: 'emoji', count: 0 }; reactions.push(item); }
+              if (item) item.count = Math.max(0, Number(item.count || 0) + delta);
+            };
+            if (previous) adjust(previous, -1);
+            if (selected) adjust(reactionId, 1);
+            post.reactions = reactions.filter((item) => Number(item.count) > 0);
+            post.current_user_reaction = selected ? { id: reactionId, type: 'emoji', can_undo: true } : null;
+            return post;
+          });
+          syncCopies('.ldp-reaction-btn', (button) => {
+            button.classList.toggle('reacted', selected);
+            button.dataset.currentReaction = selected ? reactionId : '';
+            button.textContent = selected ? reactionLabel(reactionId) : '☺';
+          });
+          invalidateCollectionCache('responses').catch(() => {});
+          invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+        } catch (err) {
+          if (err && err.status === 404) {
+            REACTIONS_AVAILABLE = false;
+            modal.querySelectorAll('.ldp-reaction-btn,.ldp-reaction-picker').forEach((node) => node.remove());
+          } else {
+            alert('回应操作失败：' + err.message);
+          }
+        }
+        finally { reactionChoice.disabled = false; }
         return;
       }
 
@@ -2699,7 +4586,7 @@
         return;
       }
 
-      const boostBtn = e.target.closest('.ldp-boost-btn');
+      // Boost按钮：展开/收起输入框
       const boostEmojiBtn = e.target.closest('.ldp-boost-emoji');
       if (boostEmojiBtn) {
         e.preventDefault();
@@ -2710,6 +4597,8 @@
         return;
       }
 
+      // Boost按钮：展开/收起输入框
+      const boostBtn = e.target.closest('.ldp-boost-btn');
       if (boostBtn && !boostBtn.disabled) {
         const wrap = postNode.querySelector(':scope > .ldp-boost-input-wrap');
         if (!wrap) return;
@@ -2719,6 +4608,7 @@
         return;
       }
 
+      // 删除自己的回复楼层
       const deleteBtn = e.target.closest('.ldp-deletebtn');
       if (deleteBtn && !deleteBtn.disabled) {
         deleteBtn.disabled = true;
@@ -2726,14 +4616,16 @@
           await apiSend(`${BASE}/posts/${postId}`, 'DELETE', {
             context: `/t/topic/${ctx.topicId}/${postNumber}`,
           });
-          markPostDeleted(postNode, ctx);
+          markPostDeleted(postId, modal, ctx);
+          invalidateTopicSnapshot(ctx.topicId).catch(() => {});
         } catch (err) {
           alert('删除失败：' + err.message);
-          deleteBtn.disabled = false;
+          if (deleteBtn.isConnected) deleteBtn.disabled = false;
         }
         return;
       }
 
+      // 🚀 取消发射
       const boostCancel = e.target.closest('.ldp-boost-cancel');
       if (boostCancel) {
         const wrap = boostCancel.closest('.ldp-boost-input-wrap');
@@ -2741,6 +4633,7 @@
         return;
       }
 
+      // 🚀 确认发射
       const boostSubmit = e.target.closest('.ldp-boost-submit');
       if (boostSubmit && !boostSubmit.disabled) {
         const wrap = boostSubmit.closest('.ldp-boost-input-wrap');
@@ -2754,42 +4647,48 @@
           if (res && res.id) {
             const listEl = postNode.querySelector(':scope > .ldp-boosts-list');
             if (listEl) {
-              const bAvatar = res.user && res.user.avatar_template
-                  ? BASE + res.user.avatar_template.replace('{size}', '36') : '';
-              const bProfileUrl = userProfileUrl(res.user && res.user.username);
-              const bProfileLabel = userProfileLabel(res.user && res.user.username, res.user && (res.user.name || res.user.display_name));
+              const bAvatar = res.user && resolveAvatar(res.user.avatar_template, 36);
               const bUsername = (res.user && res.user.username) || '';
-              const bCardName = String(
-                  (res.user && (res.user.name || res.user.display_name)) || bUsername || ''
-              );
-              const bCardAttrs = bUsername
-                  ? ` data-username="${escAttr(bUsername)}" data-name="${escAttr(bCardName)}"`
-                  : '';
+              const bName = (res.user && (res.user.name || res.user.display_name)) || bUsername;
+              const bProfileUrl = bUsername ? userProfileUrl(bUsername) : '';
               const newBubble = document.createElement('div');
               newBubble.className = 'ldp-boost-bubble ldp-flash';
               newBubble.dataset.boostId = res.id;
               newBubble.innerHTML =
-                  (bAvatar ? (bProfileUrl
-                    ? `<a class="ldp-boost-avatar-link" href="${bProfileUrl}" target="_blank" rel="noopener noreferrer" title="${escAttr(bProfileLabel)}"${bCardAttrs}><img class="ldp-b-avatar" src="${bAvatar}" alt=""${bCardAttrs}></a>`
-                    : `<img class="ldp-b-avatar" src="${bAvatar}" alt=""${bCardAttrs}>`) : '') +
-                  `<p>${res.cooked || ''}</p>` +
-                  `<button class="ldp-boost-del" title="删除此Boost">×</button>`;
+                (bAvatar ? (bProfileUrl
+                  ? `<a class="ldp-boost-avatar-link" href="${escAttr(bProfileUrl)}" target="_blank" rel="noopener noreferrer" title="${escAttr(bName || '@' + bUsername)}" data-username="${escAttr(bUsername)}"><img class="ldp-b-avatar" src="${escAttr(bAvatar)}" alt="" data-username="${escAttr(bUsername)}"></a>`
+                  : `<img class="ldp-b-avatar" src="${escAttr(bAvatar)}" alt="">`) : '') +
+                `<p>${res.cooked || ''}</p>` +
+                `<button class="ldp-boost-del" title="删除此Boost">×</button>`;
               listEl.appendChild(newBubble);
             }
             input.value = '';
             wrap.classList.remove('open');
+
             const btn = postNode.querySelector(':scope > .ldp-actions > .ldp-boost-btn');
             if (btn) btn.disabled = true;
             if (postNumber === 1) {
-              const fBoost = ctx.scrollRoot.closest('.ldp-modal').querySelector('.ldp-f-boost');
-              if (fBoost) { fBoost.disabled = true; fBoost.style.opacity = '0.4'; }
+              const fBoost = modal.closest('.ldp-modal')?.querySelector('.ldp-f-boost');
+              if (fBoost) fBoost.disabled = true;
             }
+            if (ctx.loader) {
+              ctx.loader.updatePost(postId, (current) => {
+                const boosts = Array.isArray(current.boosts) ? current.boosts.slice() : [];
+                boosts.push(Object.assign({ can_delete: true }, res));
+                current.boosts = boosts;
+                current.can_boost = false;
+                return current;
+              });
+              if (ctx.refreshRenderRevision) ctx.refreshRenderRevision(postNode);
+            }
+            invalidateTopicSnapshot(ctx.topicId).catch(() => {});
           }
         } catch (err) { alert('发射失败：' + err.message); }
         finally { boostSubmit.disabled = false; }
         return;
       }
 
+      // 删除 Boost 气泡
       const boostDel = e.target.closest('.ldp-boost-del');
       if (boostDel) {
         const bubble = boostDel.closest('.ldp-boost-bubble');
@@ -2798,24 +4697,37 @@
         try {
           await apiSend(`${BASE}/discourse-boosts/boosts/${boostId}`, 'DELETE');
           bubble.remove();
+
           const btn = postNode.querySelector(':scope > .ldp-actions > .ldp-boost-btn');
           if (btn) btn.disabled = false;
           if (postNumber === 1) {
-            const fBoost = ctx.scrollRoot.closest('.ldp-modal').querySelector('.ldp-f-boost');
-            if (fBoost) { fBoost.disabled = false; fBoost.style.opacity = '1'; }
+            const fBoost = modal.closest('.ldp-modal')?.querySelector('.ldp-f-boost');
+            if (fBoost) fBoost.disabled = false;
           }
+          if (ctx.loader) {
+            ctx.loader.updatePost(postId, (current) => {
+              current.boosts = (current.boosts || []).filter((item) => String(item.id) !== String(boostId));
+              current.can_boost = true;
+              return current;
+            });
+            if (ctx.refreshRenderRevision) ctx.refreshRenderRevision(postNode);
+          }
+          invalidateTopicSnapshot(ctx.topicId).catch(() => {});
         } catch (err) { alert('删除失败：' + err.message); }
         return;
       }
 
+      // 发送回复
       const sendBtn = e.target.closest('.ldp-send');
       if (sendBtn) {
         const box = sendBtn.closest('.ldp-replybox'),
             textarea = box.querySelector('textarea'),
             raw = textarea.value.trim();
         if (!raw) return;
+
         sendBtn.disabled = true;
         sendBtn.textContent = '发送中…';
+
         try {
           const data = await apiSend(`${BASE}/posts`, 'POST', {
             raw,
@@ -2823,10 +4735,42 @@
             reply_to_post_number: postNumber,
             nested_post: true,
           });
+
+          // 拿到回复数据
           const postData = data && data.post ? data.post : data;
+
           if (postData && postData.cooked) {
-            const isTopLevel = postNumber === 1;
-            const newPost = {
+            if (ctx.loader) {
+              if (!postData.reply_to_post_number) postData.reply_to_post_number = postNumber;
+              const canonicalReply = ctx.loader.mergePost(postData) || postData;
+              const parentPost = ctx.loader.getPostByNumber(postNumber);
+              if (parentPost) {
+                ctx.loader.updatePost(parentPost.id, {
+                  reply_count: Math.max(0, Number(parentPost.reply_count) || 0) + 1,
+                });
+                const parentNode = ctx.nodeMap.get(Number(postNumber));
+                const cacheKey = String(parentPost.id);
+                if (ctx.subReplyCache.has(cacheKey)) {
+                  const replies = [...(ctx.subReplyCache.get(cacheKey) || []), canonicalReply];
+                  ctx.subReplyCache.set(cacheKey, replies);
+                  mergeSubReplyState(postNumber, replies, ctx, { loaded: true });
+                }
+                if (parentNode) {
+                  const state = ctx.subReplyState.get(Number(postNumber));
+                  if (state && state.expanded) renderSubReplyState(postNumber, ctx);
+                  else updateReplyToggle(parentNode, postNumber, ctx);
+                }
+              }
+              ctx.totalComments = (ctx.totalComments || 0) + 1;
+              updateCommentsHeader(ctx);
+              invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+              if (ctx.onMutation) ctx.onMutation(postData);
+              box.classList.remove('open');
+              textarea.value = '';
+              return;
+            }
+            const isTopLevel = postNumber === 1; // 回复楼主帖时按普通顶级评论处理，而非楼中楼
+            const newNode = renderPost({
               id: postData.id,
               post_number: postData.post_number,
               username: postData.username || ME_USERNAME,
@@ -2835,35 +4779,36 @@
               cooked: postData.cooked,
               created_at: postData.created_at || new Date().toISOString(),
               reply_to_post_number: postNumber,
-              polls: postData.polls,
-              polls_votes: postData.polls_votes,
               actions_summary: [],
               boosts: [],
               can_boost: true,
-            };
-            const newNode = renderPost(
-                newPost, !isTopLevel, ctx, isTopLevel ? 0 : 1
-            );
+              _ldpSkipUnread: true,
+            }, !isTopLevel, ctx);
+
             newNode.classList.add('ldp-flash');
+
             if (isTopLevel) {
               ctx.commentsEl.prepend(newNode);
               newNode.scrollIntoView({ behavior: 'smooth', block: 'center' });
             } else {
               const childrenContainer = postNode.querySelector(':scope > .ldp-children');
-              if (childrenContainer) {
-                childrenContainer.prepend(newNode);
-              } else {
-                console.warn('Parent post has no .ldp-children container');
-              }
+              childrenContainer.prepend(newNode);
             }
+
             ctx.nodeMap.set(postData.post_number, newNode);
-            ctx.postMap.set(newPost.post_number, newPost);
-            idToPost.set(newPost.id, newPost);
             ctx.tracker.observe(newNode);
             ctx.totalComments = (ctx.totalComments || 0) + 1;
             updateCommentsHeader(ctx);
+            if (ctx.onPostsChanged) ctx.onPostsChanged();
+            invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+            if (ctx.onMutation) ctx.onMutation(postData);
+
             const tip = box.querySelector('.ldp-reply-tip');
-            if (tip) { tip.classList.add('show'); setTimeout(() => tip.classList.remove('show'), 1500); }
+            if (tip) {
+              tip.classList.add('show');
+              setTimeout(() => tip.classList.remove('show'), 1500);
+            }
+
             box.classList.remove('open');
             textarea.value = '';
           }
@@ -2875,7 +4820,7 @@
         }
         return;
       }
-      });
+    });
 
     modal.addEventListener('keydown', (e) => {
       const spoiler = e.target.closest('.ldp-spoiler');
@@ -2885,48 +4830,181 @@
     });
   }
 
+  /* ============ 11. 直属回复按需加载 ============ */
+  function createRepliesIO(ctx) {
+    const inFlight = new Map();
+    const loadForNode = async (node) => {
+      if (!node || !node.isConnected) return [];
+      const postId = String(node.dataset.postId || '');
+      const postNumber = Number(node.dataset.postNumber);
+      if (!postId) return [];
+      if (ctx.subReplyCache.has(postId)) {
+        const cached = ctx.subReplyCache.get(postId) || [];
+        mergeSubReplyState(postNumber, cached, ctx, { loaded: true });
+        return cached;
+      }
+      if (inFlight.has(postId)) return inFlight.get(postId);
+      const request = fetchJSON(`${BASE}/posts/${postId}/replies.json`, {
+        signal: ctx.signal, priority: 'visible',
+        dedupeKey: `direct-replies:${BASE}:${postId}`,
+      }).then((items) => {
+        const replies = (Array.isArray(items) ? items : [])
+          .filter((reply) => Number(reply.reply_to_post_number) === postNumber)
+          .map((reply) => ctx.loader.mergePost(reply) || reply);
+        ctx.subReplyCache.set(postId, replies);
+        mergeSubReplyState(postNumber, replies, ctx, { loaded: true });
+        const parent = ctx.loader.getPostById(postId);
+        if (parent && Number(parent.reply_count) !== replies.length) {
+          ctx.loader.updatePost(postId, { reply_count: replies.length });
+        }
+        return replies;
+      });
+      inFlight.set(postId, request);
+      try {
+        return await request;
+      } finally {
+        inFlight.delete(postId);
+      }
+    };
+
+    const toggle = async (node) => {
+      if (!node || !node.isConnected) return;
+      const postNumber = Number(node.dataset.postNumber);
+      let state = ctx.subReplyState.get(postNumber);
+      if (!state) {
+        state = mergeSubReplyState(postNumber, ctx.loader.getKnownChildren(postNumber), ctx);
+      }
+      if (state.expanded) {
+        state.expanded = false;
+        renderSubReplyState(postNumber, ctx);
+        return;
+      }
+      state.expanded = true;
+      state.error = null;
+      if (state.loaded) {
+        renderSubReplyState(postNumber, ctx);
+        return;
+      }
+      state.loading = true;
+      updateReplyToggle(node, postNumber, ctx);
+      try {
+        await loadForNode(node);
+      } catch (error) {
+        state.loading = false;
+        state.error = error;
+        state.expanded = false;
+      }
+      if (node.isConnected) renderSubReplyState(postNumber, ctx);
+    };
+
+    return {
+      toggle,
+      loadForNode,
+      observe() {},
+      unobserve() {},
+      clearNode() {},
+      setScrollActive() {},
+      flushPendingReplies() { return 0; },
+      disconnect() { inFlight.clear(); },
+    };
+  }
+
   /* ============ 12. 收藏 ============ */
-  function bindBookmark(btn, topic) {
+  function bindBookmarks(buttons, topic) {
+    const targets = Array.from(buttons || []).filter(Boolean);
     let bookmarked = !!topic.bookmarked, bookmarkId = topic.bookmark_id || null;
-    const sync = () => { btn.classList.toggle('bookmarked', bookmarked); };
+    const sync = () => {
+      targets.forEach((button) => {
+        button.classList.toggle('bookmarked', bookmarked);
+        button.setAttribute('aria-pressed', bookmarked ? 'true' : 'false');
+      });
+    };
     sync();
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
+    const toggle = async () => {
+      targets.forEach((button) => { button.disabled = true; });
       try {
         if (!bookmarked) {
           const data = await apiSend(`${BASE}/bookmarks`, 'POST', { bookmarkable_id: topic.id, bookmarkable_type: 'Topic' });
           bookmarkId = data && data.id ? data.id : bookmarkId; bookmarked = true;
         } else if (bookmarkId) {
           await apiSend(`${BASE}/bookmarks/${bookmarkId}`, 'DELETE'); bookmarked = false; bookmarkId = null;
-        } else {
-          await apiSend(`${BASE}/t/${topic.id}/remove_bookmarks`, 'PUT'); bookmarked = false;
-        }
+        } else { await apiSend(`${BASE}/t/${topic.id}/remove_bookmarks`, 'PUT'); bookmarked = false; }
+        topic.bookmarked = bookmarked; topic.bookmark_id = bookmarkId;
         sync();
-      } catch (err) { alert('收藏操作失败：' + err.message); } finally { btn.disabled = false; }
-    });
+        invalidateCollectionCache('bookmarks').catch(() => {});
+        invalidateTopicSnapshot(topic.id).catch(() => {});
+      } catch (err) { alert('收藏操作失败：' + err.message); }
+      finally { targets.forEach((button) => { button.disabled = false; }); }
+    };
+    targets.forEach((button) => button.addEventListener('click', toggle));
   }
 
-  function bindFooterLike(btn, countEl, opPost) {
-    if (!opPost) { btn.disabled = true; return; }
-    const { count, acted, canAct } = likeInfo(opPost);
-    let liked = acted;
-    countEl.textContent = count;
-    btn.classList.toggle('liked', liked);
-    btn.disabled = !(canAct || acted);
-    btn.addEventListener('click', async () => {
-      if (btn.disabled) return;
-      btn.disabled = true;
+  function bindReaderFooter(footer, ctx, topic, opNode) {
+    if (!footer || !opNode || !topic._opPost) return;
+    const likeButton = footer.querySelector('.ldp-f-like');
+    const likeCount = footer.querySelector('.ldp-f-like-count');
+    const replyCount = footer.querySelector('.ldp-f-reply-count');
+    const replyButton = footer.querySelector('.ldp-f-reply');
+    const boostButton = footer.querySelector('.ldp-f-boost');
+    const opId = Number(topic._opPost.id);
+    ctx.footerReplyCountEl = replyCount;
+    updateCommentsHeader(ctx);
+
+    const syncLike = (post) => {
+      if (!post || Number(post.id) !== opId) return;
+      const info = likeInfo(post);
+      likeCount.textContent = String(info.count);
+      likeButton.classList.toggle('liked', info.acted);
+      likeButton.dataset.acted = info.acted ? '1' : '0';
+      likeButton.disabled = !(info.canAct || info.acted);
+    };
+    syncLike(ctx.loader.getPostById(opId) || topic._opPost);
+    ctx.loader.subscribePosts((posts) => posts.forEach(syncLike));
+
+    likeButton.addEventListener('click', async () => {
+      const post = ctx.loader.getPostById(opId) || topic._opPost;
+      const info = likeInfo(post);
+      likeButton.disabled = true;
       try {
-        if (!liked) {
-          await apiSend(`${BASE}/post_actions`, 'POST', { id: opPost.id, post_action_type_id: 2, flag_topic: false });
-          liked = true; btn.classList.add('liked');
-          countEl.textContent = (+countEl.textContent) + 1;
-        } else {
-          await apiSend(`${BASE}/post_actions/${opPost.id}?post_action_type_id=2`, 'DELETE');
-          liked = false; btn.classList.remove('liked');
-          countEl.textContent = Math.max(0, (+countEl.textContent) - 1);
-        }
-      } catch (err) { alert('操作失败：' + err.message); } finally { btn.disabled = false; }
+        if (info.acted) await apiSend(`${BASE}/post_actions/${opId}?post_action_type_id=2`, 'DELETE');
+        else await apiSend(`${BASE}/post_actions`, 'POST', { id: opId, post_action_type_id: 2, flag_topic: false });
+        ctx.loader.updatePost(opId, (current) => {
+          const actions = Array.isArray(current.actions_summary)
+            ? current.actions_summary.map((item) => Object.assign({}, item)) : [];
+          let like = actions.find((item) => Number(item.id) === 2);
+          if (!like) { like = { id: 2, can_act: true }; actions.push(like); }
+          like.acted = !info.acted;
+          like.count = Math.max(0, Number(info.count) + (info.acted ? -1 : 1));
+          current.actions_summary = actions;
+          return current;
+        });
+        invalidateCollectionCache('responses').catch(() => {});
+        invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+      } catch (error) {
+        syncLike(post);
+        alert('操作失败：' + error.message);
+      }
+    });
+
+    replyButton.addEventListener('click', () => {
+      const box = ensureReplyBox(opNode);
+      box.classList.toggle('open');
+      if (box.classList.contains('open')) {
+        box.querySelector('textarea').focus({ preventScroll: true });
+        box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+    });
+    const inlineBoost = opNode.querySelector(':scope > .ldp-actions .ldp-boost-btn');
+    boostButton.disabled = !inlineBoost || inlineBoost.disabled;
+    boostButton.addEventListener('click', () => {
+      const wrap = opNode.querySelector(':scope > .ldp-boost-input-wrap');
+      if (!wrap) return;
+      const opening = !wrap.classList.contains('open');
+      wrap.classList.toggle('open', opening);
+      if (opening) {
+        wrap.querySelector('.ldp-boost-input').focus({ preventScroll: true });
+        wrap.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
     });
   }
 
@@ -2936,327 +5014,261 @@
     if (ctx.footerReplyCountEl) ctx.footerReplyCountEl.textContent = ctx.totalComments || 0;
   }
 
-  /* ============ 13. 定位：递归展开楼中楼并高亮目标 ============ */
-  function waitForScrollEnd(el, timeoutMs = 1200) {
-    const IDLE_MS = 120;
-    return new Promise((resolve) => {
-      let done = false;
-      let idleTimer = null;
-      const finish = () => {
-        if (done) return;
-        done = true;
-        el.removeEventListener('scroll', onScroll);
-        clearTimeout(idleTimer);
-        clearTimeout(safety);
-        resolve();
-      };
-      const onScroll = () => {
-        clearTimeout(idleTimer);
-        idleTimer = setTimeout(finish, IDLE_MS);
-      };
-      el.addEventListener('scroll', onScroll, { passive: true });
-      idleTimer = setTimeout(finish, IDLE_MS);
-      const safety = setTimeout(finish, timeoutMs);
-    });
-  }
+  function bindTimeline(modal, ctx, topic, controls) {
+    const rail = modal.querySelector('.ldp-timeline');
+    if (!rail) return { refresh() {}, destroy() {} };
 
-  function resolveTargetPostNumber(targetPostNumber, posts) {
-    const target = Number(targetPostNumber);
-    if (!Number.isFinite(target) || target <= 1) return targetPostNumber;
+    const body = ctx.scrollRoot;
+    const topDateBtn = rail.querySelector('.ldp-tl-top-date');
+    const bottomDateBtn = rail.querySelector('.ldp-tl-bottom-date');
+    const currentText = rail.querySelector('.ldp-tl-current-post');
+    const currentDate = rail.querySelector('.ldp-tl-current-date');
+    const track = rail.querySelector('.ldp-tl-track');
+    const fill = rail.querySelector('.ldp-tl-fill');
+    const thumb = rail.querySelector('.ldp-tl-thumb');
+    const getTotalPosts = () => Math.max(1, controls.getTotalPosts ? controls.getTotalPosts()
+      : (topic.highest_post_number || topic.posts_count || ctx.totalComments + 1));
+    const getStreamLength = () => Math.max(0, controls.getStreamLength());
+    let raf = 0;
+    let seeking = false;
+    let cachedPosts = [];
+    let currentPost = null;
+    let trackHeight = Math.max(1, track.clientHeight - 16);
+    let lastRatio = -1;
+    let lastPercent = -1;
+    let lastPostNumber = -1;
+    let lastTotalPosts = -1;
+    let lastDate = null;
+    let lastSeeking = null;
+    let seekToken = 0;
+    let destroyed = false;
 
-    const availableNumbers = (posts || [])
-        .map((post) => Number(post?.post_number))
-        .filter((postNumber) => Number.isFinite(postNumber) && postNumber >= 1)
-        .sort((a, b) => a - b);
-    if (!availableNumbers.length || availableNumbers.includes(target)) return target;
+    topDateBtn.textContent = fmtDate(topic.created_at) || '顶部';
+    bottomDateBtn.textContent = fmtDate(topic.last_posted_at || topic.bumped_at) || '底部';
+    track.setAttribute('aria-valuemin', '1');
+    track.setAttribute('aria-valuemax', String(getTotalPosts()));
 
-    // Discourse 删除或隐藏回复后楼号可能不连续。优先定位到下一个
-    // 实际可见的楼层；如果已经到末尾，则回退到最近的前一楼。
-    return availableNumbers.find((postNumber) => postNumber > target)
-        ?? availableNumbers[availableNumbers.length - 1];
-  }
-
-  async function fetchPostForLocate(topicId, postNumber, ctx) {
-    const cached = ctx.postMap?.get(postNumber);
-    if (cached) return cached;
-
-    const data = await fetchJSON(`${BASE}/t/${topicId}.json?post_number=${postNumber}`);
-    const posts = data.post_stream?.posts || [];
-    posts.forEach((post) => {
-      if (ctx.postMap) ctx.postMap.set(post.post_number, post);
-      idToPost.set(post.id, post);
-    });
-    return posts.find((post) => post.post_number === postNumber) || null;
-  }
-
-  function ensurePostPlacement(post, ctx) {
-    if (!post || post.post_number === 1) return ctx.nodeMap.get(1) || null;
-
-    if (ctx.postMap) ctx.postMap.set(post.post_number, post);
-    idToPost.set(post.id, post);
-
-    let node = ctx.nodeMap.get(post.post_number);
-    if (!node) {
-      attachPost(post, ctx);
-      reflowPending(ctx);
-      node = ctx.nodeMap.get(post.post_number);
-    }
-    if (!node) return null;
-
-    const parentNumber = +post.reply_to_post_number || 1;
-    if (parentNumber > 1) {
-      const parentNode = ctx.nodeMap.get(parentNumber);
-      const childrenEl = parentNode?.querySelector(':scope > .ldp-children');
-      if (childrenEl && node.parentElement !== childrenEl) childrenEl.appendChild(node);
-    } else if (node.parentElement !== ctx.commentsEl) {
-      ctx.commentsEl.appendChild(node);
-    }
-    return node;
-  }
-
-  async function expandTargetAncestorChain(targetPostNumber, ctx) {
-    const targetPost = await fetchPostForLocate(ctx.topicId, targetPostNumber, ctx);
-    if (!targetPost) throw new Error(`未找到目标楼层 #${targetPostNumber}`);
-
-    const chain = [targetPost];
-    const seen = new Set([targetPostNumber]);
-    let current = targetPost;
-
-    while (+current.reply_to_post_number > 1) {
-      const parentNumber = +current.reply_to_post_number;
-      if (seen.has(parentNumber)) throw new Error('楼中楼祖先链存在循环引用');
-      seen.add(parentNumber);
-
-      const parent = await fetchPostForLocate(ctx.topicId, parentNumber, ctx);
-      if (!parent) throw new Error(`未找到父楼层 #${parentNumber}`);
-      chain.unshift(parent);
-      current = parent;
-    }
-
-    // 从最外层父回复向目标逐层展开，确保多层楼中楼的每一级 DOM 都已就位。
-    for (let i = 0; i < chain.length; i++) {
-      const post = ctx.postMap?.get(chain[i].post_number) || chain[i];
-      ensurePostPlacement(post, ctx);
-
-      const childOnPath = chain[i + 1];
-      if (!childOnPath) continue;
-
-      await loadAllChildren(post.id, post.post_number, null, ctx, true);
-      const refreshedChild = ctx.postMap?.get(childOnPath.post_number) || childOnPath;
-      ensurePostPlacement(refreshedChild, ctx);
-      reflowPending(ctx);
-    }
-
-    return ctx.nodeMap.get(targetPostNumber) || null;
-  }
-
-  async function locatePost(targetPostNumber, ctx) {
-    if (!targetPostNumber || targetPostNumber <= 1) return false;
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-
-    let targetNode = ctx.nodeMap.get(targetPostNumber);
-    let locateError = null;
-    try {
-      targetNode = await expandTargetAncestorChain(targetPostNumber, ctx) || targetNode;
-    } catch (error) {
-      // 嵌套接口不可用时保留 1.3.0 原有的扁平定位作为降级路径。
-      locateError = error;
-      targetNode = ctx.nodeMap.get(targetPostNumber)
-          || (targetNode?.isConnected ? targetNode : null);
-    }
-
-    if (!targetNode || targetNode.isConnected === false) {
-      const reason = locateError?.message ? `：${locateError.message}` : '';
-      console.warn(`[LinuxDo 增强阅读] 目标楼层 #${targetPostNumber} 不可见，无法定位${reason}`);
-      return false;
-    }
-
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-    targetNode.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await waitForScrollEnd(ctx.scrollRoot);
-
-    const flashObserver = new IntersectionObserver((entries, observer) => {
-      const visibleEntry = entries.find((entry) =>
-          entry.isIntersecting && entry.intersectionRatio >= 0.5
-      );
-      if (!visibleEntry) return;
-
-      observer.disconnect();
-      const node = visibleEntry.target;
-      node.classList.remove('ldp-flash');
-      void node.offsetWidth;
-      node.classList.add('ldp-flash');
-      setTimeout(() => node.classList.remove('ldp-flash'), 1700);
-    }, { root: ctx.scrollRoot, threshold: [0.5] });
-    flashObserver.observe(targetNode);
-    setTimeout(() => flashObserver.disconnect(), 1500);
-    return true;
-  }
-
-  function createFloorNavigator(nav, scrollRoot, topicId) {
-    const thumb = nav.querySelector('.ldp-slider-thumb');
-    const tip = nav.querySelector('.ldp-slider-tip');
-    const track = nav.querySelector('.ldp-slider-track');
-    const modal = nav.parentElement;
-    let currentFloor = 1;
-    let totalFloors = 1;
-    let dragging = false;
-    let scrollRaf = 0;
-    let suppressClick = false;
-    let resizeHandler = null;
-    let mutationObserver = null;
-    let mutationTimer = null;
-    let geometryTimer = null;
-
-    const updateGeometry = () => {
-      const bodyRect = scrollRoot.getBoundingClientRect();
-      const modalRect = modal.getBoundingClientRect();
-      nav.style.top = `${bodyRect.top - modalRect.top}px`;
-      nav.style.bottom = `${modalRect.bottom - bodyRect.bottom}px`;
-    };
-
-    const getRenderedFloors = () => Array.from(
-      scrollRoot.querySelectorAll('.ldp-post[data-post-number]')
-    ).map((node) => Number(node.dataset.postNumber))
-      .filter((floor) => Number.isFinite(floor) && floor >= 1)
-      .filter((floor, index, floors) => floors.indexOf(floor) === index)
-      .sort((a, b) => a - b);
-
-    const currentFloorAt = () => {
-      if (scrollRoot.scrollTop <= 2) return 1;
-      const rootRect = scrollRoot.getBoundingClientRect();
-      const probeY = rootRect.top + Math.min(rootRect.height * 0.35, 260);
-      const heads = Array.from(scrollRoot.querySelectorAll('.ldp-post-head'))
-        .map((head) => ({
-          top: head.getBoundingClientRect().top,
-          floor: Number(head.closest('.ldp-post')?.dataset.postNumber),
-        }))
-        .filter((item) => Number.isFinite(item.floor))
-        .sort((a, b) => a.top - b.top);
-      if (!heads.length) return 1;
-      let floor = heads[0].floor;
-      heads.forEach((item) => { if (item.top <= probeY) floor = item.floor; });
-      return floor;
-    };
-
-    const floorFromRatio = (ratio) => Math.max(
-      1, Math.min(totalFloors, Math.round(1 + ratio * (totalFloors - 1)))
-    );
-
-    const paint = (floor, showTip = false) => {
-      currentFloor = Math.max(1, Math.min(totalFloors, Number(floor) || 1));
-      const ratio = totalFloors > 1 ? (currentFloor - 1) / (totalFloors - 1) : 0;
-      const trackHeight = track.offsetHeight || nav.offsetHeight;
-      const y = 8 + Math.max(0, Math.min(1, ratio)) * trackHeight;
-      thumb.style.top = `${y}px`;
-      thumb.textContent = String(currentFloor);
-      tip.textContent = `#${currentFloor}`;
-      tip.style.top = `${y}px`;
-      if (showTip) tip.classList.add('show');
-    };
-
-    const updateThumbPosition = () => {
-      scrollRaf = 0;
-      if (dragging || nav.hidden) return;
-      const renderedFloors = getRenderedFloors();
-      if (!renderedFloors.length) return;
-      paint(currentFloorAt());
-    };
-
-    const onScroll = () => {
-      if (!scrollRaf) scrollRaf = requestAnimationFrame(updateThumbPosition);
-    };
-
-    const navigateToFloor = (floor) => {
-      const targetFloor = floorFromRatio(Math.max(0, Math.min(1,
-        (floor - 1) / Math.max(1, totalFloors - 1))));
-      if (targetFloor === currentFloor) {
-        paint(currentFloor);
-        return;
+    const visiblePost = () => {
+      if (!cachedPosts.length) return null;
+      if (body.scrollTop <= 1) {
+        currentPost = cachedPosts[0];
+        return currentPost;
       }
-      // 复用现有目标楼层逻辑：窗口加载、楼号修正、祖先链展开和高亮均由 openModal 完成。
-      openModal(topicId, targetFloor);
+      const bodyRect = body.getBoundingClientRect();
+      const probeX = bodyRect.left + Math.max(1, bodyRect.width * 0.5);
+      const probeY = bodyRect.top + Math.min(bodyRect.height * 0.35, 180);
+      const hit = document.elementFromPoint(probeX, probeY);
+      const hitPost = hit && hit.closest ? hit.closest('.ldp-post[data-post-number]') : null;
+      if (hitPost && body.contains(hitPost)) currentPost = hitPost;
+      if (!currentPost || !currentPost.isConnected) {
+        currentPost = body.scrollTop <= 1 ? cachedPosts[0] : cachedPosts[cachedPosts.length - 1];
+      }
+      return currentPost;
     };
 
-    let lastTargetFloor = 1;
-    const onPointerMove = (event) => {
+    const setProgress = () => {
+      const post = visiblePost();
+      const postNumber = post ? (+post.dataset.postNumber || 1) : 1;
+      const streamIndex = postNumber <= 1 ? -1 : controls.getStreamIndex(post.dataset.postId);
+      const streamLength = getStreamLength();
+      const totalPosts = getTotalPosts();
+      track.setAttribute('aria-valuemax', String(totalPosts));
+      const ratio = streamLength
+        ? Math.max(0, Math.min(1, (streamIndex + 1) / streamLength))
+        : 0;
+      if (Math.abs(ratio - lastRatio) >= 0.0005) {
+        fill.style.transform = `translateX(-50%) scaleY(${ratio})`;
+        thumb.style.transform = `translate(-50%,-50%) translateY(${ratio * trackHeight}px)`;
+        lastRatio = ratio;
+      }
+      const percent = Math.round(ratio * 100);
+      if (percent !== lastPercent) {
+        track.setAttribute('aria-valuenow', String(postNumber));
+        lastPercent = percent;
+      }
+
+      if (postNumber !== lastPostNumber || totalPosts !== lastTotalPosts) {
+        currentText.textContent = `${postNumber} / ${totalPosts}`;
+        lastPostNumber = postNumber;
+        lastTotalPosts = totalPosts;
+      }
+      const date = seeking ? '正在定位…' : (post ? (fmtDate(post.dataset.createdAt) || '当前') : '当前');
+      if (date !== lastDate) {
+        currentDate.textContent = date;
+        lastDate = date;
+      }
+      if (seeking !== lastSeeking) {
+        rail.setAttribute('aria-busy', seeking ? 'true' : 'false');
+        track.setAttribute('aria-busy', seeking ? 'true' : 'false');
+        lastSeeking = seeking;
+      }
+    };
+
+    const schedule = () => {
+      if (destroyed || raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        setProgress();
+      });
+    };
+
+    const seek = async (index, targetPostNumber) => {
+      const token = ++seekToken;
+      seeking = true;
+      rail.classList.add('ldp-tl-loading');
+      currentDate.textContent = '正在定位…';
+      schedule();
+      try {
+        if (Number(targetPostNumber) <= 1 && controls.scrollToTop) await controls.scrollToTop();
+        else await controls.seekToIndex(index, targetPostNumber);
+      } catch (err) {
+        if (!(err && err.name === 'AbortError')) throw err;
+      } finally {
+        if (token !== seekToken) return;
+        seeking = false;
+        rail.classList.remove('ldp-tl-loading');
+        lastDate = null;
+        schedule();
+      }
+    };
+
+    const jumpTop = () => seek(0, 1);
+    const jumpBottom = () => seek(Math.max(0, getStreamLength() - 1));
+    const jumpByRatio = (ratio) => {
+      const safeRatio = Math.max(0, Math.min(1, ratio));
+      const streamLength = getStreamLength();
+      if (!streamLength || safeRatio <= 0) return jumpTop();
+      const index = Math.max(0, Math.min(streamLength - 1, Math.round(safeRatio * streamLength) - 1));
+      return seek(index);
+    };
+
+    let dragTip = track.querySelector('.ldp-tl-drag-tip');
+    if (!dragTip) {
+      dragTip = document.createElement('span');
+      dragTip.className = 'ldp-tl-drag-tip';
+      track.appendChild(dragTip);
+    }
+    let dragging = false;
+    let dragMoved = false;
+    let dragStartY = 0;
+    let dragRatio = 0;
+    let suppressNextClick = false;
+
+    const paintDrag = (ratio) => {
+      const safeRatio = Math.max(0, Math.min(1, ratio));
+      const totalPosts = getTotalPosts();
+      const previewFloor = Math.max(1, Math.min(totalPosts, Math.round(1 + safeRatio * (totalPosts - 1))));
+      const y = safeRatio * trackHeight;
+      fill.style.transform = `translateX(-50%) scaleY(${safeRatio})`;
+      thumb.style.transform = `translate(-50%,-50%) translateY(${y}px)`;
+      dragTip.textContent = `#${previewFloor}`;
+      dragTip.style.top = `${8 + y}px`;
+      dragTip.classList.add('show');
+      currentText.textContent = `${previewFloor} / ${totalPosts}`;
+      lastPostNumber = -1;
+      lastRatio = -1;
+    };
+
+    const onPointerMove = (e) => {
       if (!dragging) return;
-      event.preventDefault();
+      if (!dragMoved && Math.abs(e.clientY - dragStartY) < 3) return;
+      dragMoved = true;
+      e.preventDefault();
       const rect = track.getBoundingClientRect();
-      const ratio = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
-      lastTargetFloor = floorFromRatio(ratio);
-      const y = 8 + ratio * rect.height;
-      thumb.style.top = `${y}px`;
-      thumb.textContent = String(lastTargetFloor);
-      tip.textContent = `#${lastTargetFloor}`;
-      tip.style.top = `${y}px`;
-      tip.classList.add('show');
+      dragRatio = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
+      paintDrag(dragRatio);
     };
 
     const onPointerUp = () => {
       if (!dragging) return;
       dragging = false;
-      suppressClick = true;
-      thumb.style.cursor = 'grab';
-      tip.classList.remove('show');
+      thumb.classList.remove('dragging');
+      dragTip.classList.remove('show');
       document.removeEventListener('pointermove', onPointerMove);
       document.removeEventListener('pointerup', onPointerUp);
-      navigateToFloor(lastTargetFloor);
+      if (dragMoved) {
+        suppressNextClick = true;
+        setTimeout(() => { suppressNextClick = false; }, 50);
+        jumpByRatio(dragRatio);
+      } else {
+        schedule();
+      }
     };
 
-    thumb.addEventListener('pointerdown', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
+    const onThumbPointerDown = (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
       dragging = true;
-      lastTargetFloor = currentFloor;
-      thumb.style.cursor = 'grabbing';
-      tip.classList.add('show');
+      dragMoved = false;
+      dragStartY = e.clientY;
+      const rect = track.getBoundingClientRect();
+      dragRatio = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
+      thumb.classList.add('dragging');
       document.addEventListener('pointermove', onPointerMove);
       document.addEventListener('pointerup', onPointerUp);
-    });
+    };
 
-    nav.addEventListener('click', (event) => {
-      if (suppressClick) { suppressClick = false; return; }
-      if (event.target === thumb) return;
+    const onTrackClick = (e) => {
+      if (suppressNextClick) {
+        suppressNextClick = false;
+        return;
+      }
       const rect = track.getBoundingClientRect();
-      const ratio = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
-      navigateToFloor(floorFromRatio(ratio));
+      jumpByRatio((e.clientY - rect.top) / Math.max(1, rect.height));
+    };
+
+    const onTrackKeydown = (e) => {
+      if (e.key === 'Home') { e.preventDefault(); jumpTop(); }
+      else if (e.key === 'End') { e.preventDefault(); jumpBottom(); }
+      else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') { e.preventDefault(); jumpByRatio((lastRatio < 0 ? 0 : lastRatio) - 1 / Math.max(1, getStreamLength())); }
+      else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') { e.preventDefault(); jumpByRatio((lastRatio < 0 ? 0 : lastRatio) + 1 / Math.max(1, getStreamLength())); }
+      else if (e.key === 'PageUp') { e.preventDefault(); body.scrollBy({ top: -body.clientHeight * 0.8, behavior: 'smooth' }); }
+      else if (e.key === 'PageDown') { e.preventDefault(); body.scrollBy({ top: body.clientHeight * 0.8, behavior: 'smooth' }); }
+    };
+
+    const refresh = () => {
+      cachedPosts = Array.from(body.querySelectorAll('.ldp-post[data-post-number]'))
+        .sort((a, b) => (+a.dataset.postNumber || 0) - (+b.dataset.postNumber || 0));
+      if (!currentPost || !currentPost.isConnected) currentPost = cachedPosts[0] || null;
+      if (!dragging) schedule();
+    };
+
+    const resizeObserver = new ResizeObserver(() => {
+      trackHeight = Math.max(1, track.clientHeight - 16);
+      lastRatio = -1;
+      if (!dragging) schedule();
     });
 
-    scrollRoot.addEventListener('scroll', onScroll, { passive: true });
-    mutationObserver = new MutationObserver(() => {
-      clearTimeout(mutationTimer);
-      mutationTimer = setTimeout(() => {
-        updateGeometry();
-        updateThumbPosition();
-      }, 100);
-    });
-    mutationObserver.observe(scrollRoot, { childList: true, subtree: true });
-    resizeHandler = updateGeometry;
-    window.addEventListener('resize', resizeHandler);
-    updateGeometry();
-    geometryTimer = setTimeout(updateGeometry, 100);
+    topDateBtn.addEventListener('click', jumpTop);
+    bottomDateBtn.addEventListener('click', jumpBottom);
+    thumb.addEventListener('pointerdown', onThumbPointerDown);
+    track.addEventListener('click', onTrackClick);
+    track.addEventListener('keydown', onTrackKeydown);
+    body.addEventListener('scroll', schedule, { passive: true });
+    resizeObserver.observe(track);
+    resizeObserver.observe(ctx.topicEl);
+    resizeObserver.observe(ctx.commentsEl);
+    refresh();
 
     return {
-      setTotal(total, initialFloor = 1) {
-        totalFloors = Math.max(1, Number(total) || 1);
-        nav.hidden = totalFloors <= 1;
-        paint(initialFloor);
-      },
-      refresh: updateGeometry,
+      refresh,
       destroy() {
-        scrollRoot.removeEventListener('scroll', onScroll);
-        if (scrollRaf) cancelAnimationFrame(scrollRaf);
-        if (resizeHandler) window.removeEventListener('resize', resizeHandler);
-        if (mutationObserver) mutationObserver.disconnect();
-        clearTimeout(mutationTimer);
-        clearTimeout(geometryTimer);
+        destroyed = true;
+        dragging = false;
+        cancelAnimationFrame(raf);
+        resizeObserver.disconnect();
         document.removeEventListener('pointermove', onPointerMove);
         document.removeEventListener('pointerup', onPointerUp);
+        topDateBtn.removeEventListener('click', jumpTop);
+        bottomDateBtn.removeEventListener('click', jumpBottom);
+        thumb.removeEventListener('pointerdown', onThumbPointerDown);
+        track.removeEventListener('click', onTrackClick);
+        track.removeEventListener('keydown', onTrackKeydown);
+        body.removeEventListener('scroll', schedule);
       },
     };
   }
 
+  /* 骨架屏 HTML */
   const SKELETON_HTML = `
     <div class="ldp-sk-head">
       <div class="ldp-sk ldp-sk-avatar"></div>
@@ -3278,809 +5290,1936 @@
       </div>
     </div>`;
 
-  /* ============ 14. 弹窗主体 ============ */
-  let CURRENT_OVERLAY = null;
-
-  function getTopicCategoryName(categoryId) {
-    if (!categoryId) return '';
-    const badge = document.querySelector(
-        `.badge-category[data-category-id="${categoryId}"] .badge-category__name`
-    );
-    return badge ? badge.textContent.trim() : '';
-  }
-
-  function renderTopicTaxonomy(overlay, topic) {
-    const wrap = overlay.querySelector('.ldp-topic-tags');
-    if (!wrap) return;
-    const categoryName = getTopicCategoryName(topic?.category_id);
-    const tags = Array.isArray(topic?.tags) ? topic.tags : [];
-    const parts = [];
-    if (categoryName) {
-      parts.push(`<span class="ldp-topic-category">${esc(categoryName)}</span>`);
-    }
-    tags.forEach((tag) => {
-      if (tag?.name) parts.push(`<span class="ldp-topic-tag">${esc(tag.name)}</span>`);
+  function waitForScrollEnd(el, timeoutMs) {
+    const limit = timeoutMs || 1200;
+    return new Promise((resolve) => {
+      let lastTop = el.scrollTop;
+      let stableSince = Date.now();
+      const started = Date.now();
+      const check = () => {
+        const current = el.scrollTop;
+        if (Math.abs(current - lastTop) < 1) {
+          if (Date.now() - stableSince >= 120 || Date.now() - started >= limit) {
+            resolve();
+            return;
+          }
+        } else {
+          lastTop = current;
+          stableSince = Date.now();
+        }
+        requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
     });
-    wrap.innerHTML = parts.join('');
-    wrap.hidden = !parts.length;
   }
 
-  /**
-   * openModal(topicId, targetPostNumber)
-   *
-   * targetPostNumber 来源：
-   *   - null / undefined → 场景 A（首次打开，从头加载）
-   *   - 0                → 场景 B（已读过，跳到第一条未读）
-   *   - N > 0            → 场景 C（通知直达，跳到第 N 楼）
-   *
-   * 优化策略：两阶段并行加载
-   *   阶段 1：请求 topic.json → 立即渲染 1 楼 → 移除骨架屏
-   *   阶段 2：解析 stream → 计算窗口 → 加载评论（后台进行）
-   */
-  async function openModal(topicId, targetPostNumber) {
-    if (CURRENT_OVERLAY) {
-      if (typeof CURRENT_OVERLAY.ldpClose === 'function') CURRENT_OVERLAY.ldpClose();
-      else CURRENT_OVERLAY.remove();
-      CURRENT_OVERLAY = null;
+  async function locatePost(targetPostNumber, ctx, options) {
+    const behavior = options && options.behavior === 'smooth' ? 'smooth' : 'auto';
+    if (!targetPostNumber || targetPostNumber <= 1) {
+      if (behavior === 'smooth') {
+        ctx.scrollRoot.scrollTo({ top: 0, behavior });
+        await waitForScrollEnd(ctx.scrollRoot);
+      } else {
+        ctx.scrollRoot.scrollTop = 0;
+      }
+      return true;
+    }
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    const node = ctx.nodeMap.get(Number(targetPostNumber));
+    if (!node) return false;
+    node.scrollIntoView({ behavior, block: 'center' });
+    if (behavior === 'smooth') await waitForScrollEnd(ctx.scrollRoot);
+    node.classList.remove('ldp-flash');
+    void node.offsetWidth;
+    node.classList.add('ldp-flash');
+    setTimeout(() => node.classList.remove('ldp-flash'), 1700);
+    return true;
+  }
+
+  /* ============ 13. 2.0 加载器与虚拟楼层流 ============ */
+  function createLoaderV2(topicId, signal) {
+    let topic = null;
+    let stream = [];
+    let streamIndex = new Map();
+    const cache = new Map();
+    const postRevisions = new Map();
+    const postIdByNumber = new Map();
+    const parentNumberByPostId = new Map();
+    const childrenByParentNumber = new Map();
+    const streamListeners = new Set();
+    const postListeners = new Set();
+    let prefetchedAnchor = null;
+    let refreshPromise = null;
+    let streamRevision = 0;
+    let snapshotTimer = 0;
+    let snapshotMaxTimer = 0;
+    let snapshotDirty = false;
+    let snapshotSuspended = 0;
+    let snapshotWriting = false;
+
+    const bumpPostRevision = (postId) => {
+      const id = Number(postId);
+      postRevisions.set(id, (postRevisions.get(id) || 0) + 1);
+    };
+
+    const indexPost = (post) => {
+      if (!post || !post.id) return false;
+      const id = Number(post.id);
+      const postNumber = Number(post.post_number) || 0;
+      const previousParent = parentNumberByPostId.get(id) || 0;
+      const nextParent = Number(post.reply_to_post_number) > 1 ? Number(post.reply_to_post_number) : 0;
+      if (postNumber > 0) postIdByNumber.set(postNumber, id);
+      if (previousParent && previousParent !== nextParent) {
+        const previousChildren = childrenByParentNumber.get(previousParent);
+        if (previousChildren) {
+          previousChildren.delete(id);
+          if (!previousChildren.size) childrenByParentNumber.delete(previousParent);
+        }
+      }
+      if (nextParent) {
+        parentNumberByPostId.set(id, nextParent);
+        if (!childrenByParentNumber.has(nextParent)) childrenByParentNumber.set(nextParent, new Set());
+        childrenByParentNumber.get(nextParent).add(id);
+      } else {
+        parentNumberByPostId.delete(id);
+      }
+    };
+
+    const rebuildReplyIndex = () => {
+      postIdByNumber.clear(); parentNumberByPostId.clear(); childrenByParentNumber.clear();
+      cache.forEach(indexPost);
+    };
+
+    const cachePosts = (posts, emit) => {
+      const changed = (posts || []).filter((post) => post && post.id).map((post) => {
+        const id = Number(post.id);
+        const next = Object.assign({}, cache.get(id) || {}, post);
+        cache.set(id, next);
+        bumpPostRevision(id);
+        indexPost(next);
+        return next;
+      });
+      if (emit) emitPosts(changed);
+      return changed;
+    };
+
+    function getPostByNumber(postNumber) {
+      const id = postIdByNumber.get(Number(postNumber));
+      return id ? cache.get(id) || null : null;
     }
 
-    const abortController = new AbortController();
+    function getKnownChildren(parentPostNumber) {
+      return Array.from(childrenByParentNumber.get(Number(parentPostNumber)) || [])
+        .map((id) => cache.get(Number(id))).filter(Boolean)
+        .sort((a, b) => Number(a.post_number) - Number(b.post_number));
+    }
+
+    const emitPosts = (posts) => {
+      const changed = (posts || []).filter(Boolean);
+      if (!changed.length) return;
+      postListeners.forEach((listener) => listener(changed));
+    };
+
+    const replaceStream = (nextStream) => {
+      const seen = new Set();
+      const normalized = (nextStream || []).map(Number).filter((id) => id > 0 && !seen.has(id) && seen.add(id));
+      const unchanged = normalized.length === stream.length && normalized.every((id, index) => id === stream[index]);
+      if (unchanged) return false;
+      stream = normalized;
+      streamIndex = new Map(stream.map((id, index) => [String(id), index]));
+      streamRevision += 1;
+      streamListeners.forEach((listener) => listener(stream.slice(), streamRevision));
+      return true;
+    };
+
+    const flushSnapshot = async () => {
+      if (snapshotTimer) clearTimeout(snapshotTimer);
+      if (snapshotMaxTimer) clearTimeout(snapshotMaxTimer);
+      snapshotTimer = snapshotMaxTimer = 0;
+      if (!snapshotDirty || snapshotSuspended || snapshotWriting || !topic) return;
+      snapshotDirty = false;
+      snapshotWriting = true;
+      const writePromise = writeTopicSnapshot(topicId, topic, cache.entries());
+      TOPIC_SNAPSHOT_WRITES.set(String(topicId), writePromise);
+      try { await writePromise; }
+      finally {
+        if (TOPIC_SNAPSHOT_WRITES.get(String(topicId)) === writePromise) {
+          TOPIC_SNAPSHOT_WRITES.delete(String(topicId));
+        }
+        snapshotWriting = false;
+        if (snapshotDirty) scheduleSnapshotWrite();
+      }
+    };
+
+    const scheduleSnapshotWrite = (immediate) => {
+      snapshotDirty = true;
+      if (snapshotSuspended || snapshotWriting) return;
+      if (immediate) { flushSnapshot().catch(() => {}); return; }
+      if (snapshotTimer) clearTimeout(snapshotTimer);
+      snapshotTimer = setTimeout(() => flushSnapshot().catch(() => {}), 1000);
+      if (!snapshotMaxTimer) snapshotMaxTimer = setTimeout(() => flushSnapshot().catch(() => {}), 3000);
+    };
+
+    const hydrate = (data, cachedEntries) => {
+      if (!data) return null;
+      topic = data;
+      (cachedEntries || []).forEach((entry) => {
+        if (Array.isArray(entry) && entry[1]) {
+          cache.set(Number(entry[0]), entry[1]);
+          bumpPostRevision(entry[0]);
+        }
+      });
+      const initialPosts = (data.post_stream && data.post_stream.posts) || [];
+      initialPosts.forEach((post) => {
+        cache.set(Number(post.id), Object.assign({}, cache.get(Number(post.id)) || {}, post));
+        bumpPostRevision(post.id);
+      });
+      rebuildReplyIndex();
+      const opPost = initialPosts.find((post) => Number(post.post_number) === 1)
+        || Array.from(cache.values()).find((post) => Number(post.post_number) === 1) || null;
+      replaceStream(((data.post_stream && data.post_stream.stream) || [])
+        .filter((id) => Number(id) !== Number(opPost && opPost.id)));
+      topic._opPost = opPost;
+      topic._opUsername = (topic.details && topic.details.created_by && topic.details.created_by.username)
+        || (opPost && opPost.username) || null;
+      return topic;
+    };
+
+    const mergeTopicResponse = (data) => {
+      hydrate(data, []);
+      scheduleSnapshotWrite();
+      return topic;
+    };
+
+    function fetchTopic(priority) {
+      return fetchJSON(`${BASE}/t/${topicId}.json?track_visit=true&forceLoad=true`, {
+        cache: 'no-store', priority: priority || 'target', signal,
+        dedupeKey: `topic:${BASE}:${topicId}`,
+        headers: {
+          'Accept': 'application/json, text/javascript, */*; q=0.01',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Discourse-Present': 'true', 'Discourse-Track-View': 'true',
+          'Discourse-Track-View-Topic-Id': String(topicId),
+        },
+      });
+    }
+
+    function fetchAnchor(postNumber) {
+      if (!(Number(postNumber) > 1)) return Promise.resolve(null);
+      return fetchJSON(`${BASE}/t/${topicId}.json?post_number=${Number(postNumber)}`, {
+        signal, priority: 'target', dedupeKey: `anchor:${BASE}:${topicId}:${Number(postNumber)}`,
+      }).catch((error) => {
+        if (error && error.name === 'AbortError') throw error;
+        return null;
+      });
+    }
+
+    async function init(targetPostNumber, options) {
+      const forceNetwork = !!(options && options.forceNetwork);
+      const snapshotPromise = forceNetwork ? Promise.resolve(null) : readTopicSnapshot(topicId, signal);
+      const anchorPromise = fetchAnchor(targetPostNumber);
+      const snapshot = await snapshotPromise;
+      prefetchedAnchor = anchorPromise;
+
+      if (snapshot && snapshot.payload && snapshot.payload.topic) {
+        hydrate(snapshot.payload.topic, snapshot.payload.posts);
+        if (!snapshot.fresh) {
+          refreshPromise = fetchTopic('background').then(mergeTopicResponse).catch(() => null);
+        }
+        return topic;
+      }
+
+      const data = await fetchTopic('target');
+      return mergeTopicResponse(data);
+    }
+
+    async function fetchIds(ids, priority, requestSignal) {
+      const missing = ids.filter((id) => !cache.has(Number(id)));
+      if (!missing.length) return;
+      const chunks = [];
+      for (let index = 0; index < missing.length; index += PAGE_SIZE) {
+        chunks.push(missing.slice(index, index + PAGE_SIZE));
+      }
+      await Promise.all(chunks.map(async (chunk) => {
+        const qs = chunk.map((id) => `post_ids[]=${encodeURIComponent(id)}`).join('&');
+        const part = await fetchJSON(`${BASE}/t/${topicId}/posts.json?${qs}`, {
+          signal: requestSignal || signal, priority: priority || 'visible',
+          dedupeKey: `posts:${BASE}:${topicId}:${chunk.join(',')}`,
+        });
+        cachePosts((part.post_stream && part.post_stream.posts) || [], true);
+      }));
+      if (topic) scheduleSnapshotWrite();
+    }
+
+    async function fetchRange(start, end, priority, requestSignal) {
+      const safeStart = Math.max(0, Math.min(stream.length, Number(start) || 0));
+      const safeEnd = Math.max(safeStart, Math.min(stream.length, Number(end) || 0));
+      const ids = stream.slice(safeStart, safeEnd);
+      await fetchIds(ids, priority, requestSignal);
+      return ids.map((id) => cache.get(Number(id))).filter(Boolean);
+    }
+
+    function nearestPost(posts, requested) {
+      const target = Number(requested) || 1;
+      return posts.slice().sort((a, b) => a.post_number - b.post_number)
+        .find((post) => Number(post.post_number) === target)
+        || posts.slice().sort((a, b) => Math.abs(a.post_number - target) - Math.abs(b.post_number - target))[0]
+        || null;
+    }
+
+    async function resolveTarget(targetPostNumber, requestSignal) {
+      const target = Math.max(1, Number(targetPostNumber) || 1);
+      if (target <= 1 || !stream.length) return { index: 0, postNumber: 1 };
+      const cachedTarget = Array.from(cache.values()).find((post) => Number(post.post_number) === target);
+      const cachedIndex = cachedTarget && streamIndex.get(String(cachedTarget.id));
+      if (cachedIndex !== undefined) {
+        const start = Math.max(0, cachedIndex - SLICE_RADIUS);
+        const end = Math.min(stream.length, start + PAGE_SIZE);
+        const posts = await fetchRange(start, end, 'target', requestSignal);
+        return { index: cachedIndex, postNumber: target, start, end, posts };
+      }
+      let anchor = prefetchedAnchor ? await prefetchedAnchor : await fetchAnchor(target);
+      prefetchedAnchor = null;
+      const anchorPosts = (anchor && anchor.post_stream && anchor.post_stream.posts) || [];
+      cachePosts(anchorPosts, true);
+      const nearest = nearestPost(anchorPosts, target);
+      let indexed = nearest && streamIndex.get(String(nearest.id));
+      if (indexed === undefined && nearest && Number(nearest.id) > 0) {
+        const estimated = Math.max(0, Math.min(stream.length, Number(nearest.post_number) - 2));
+        const nextStream = stream.slice();
+        nextStream.splice(estimated, 0, Number(nearest.id));
+        replaceStream(nextStream);
+        indexed = streamIndex.get(String(nearest.id));
+      }
+      const index = indexed === undefined
+        ? Math.max(0, Math.min(stream.length - 1, target - 2)) : indexed;
+      const start = Math.max(0, index - SLICE_RADIUS);
+      const end = Math.min(stream.length, start + PAGE_SIZE);
+      const posts = await fetchRange(start, end, 'target', requestSignal);
+      const resolved = nearestPost(posts, nearest ? nearest.post_number : target);
+      return { index, postNumber: resolved ? resolved.post_number : target, start, end, posts };
+    }
+
+    async function resolveThreadTarget(targetPostNumber, requestSignal) {
+      const requested = Math.max(1, Number(targetPostNumber) || 1);
+      if (requested <= 1) {
+        return { index: 0, postNumber: 1, targetPostNumber: 1, rootPostId: null, targetPostId: null, path: [] };
+      }
+      const resolved = await resolveTarget(requested, requestSignal);
+      const targetPost = getPostByNumber(requested)
+        || getPostByNumber(resolved.postNumber)
+        || cache.get(Number(stream[resolved.index])) || null;
+      if (!targetPost) return Object.assign({}, resolved, { targetPostNumber: requested, path: [] });
+      const targetIndex = streamIndex.get(String(targetPost.id));
+      return {
+        index: targetIndex === undefined ? resolved.index : targetIndex,
+        postNumber: Number(targetPost.post_number) || resolved.postNumber,
+        rootPostId: Number(targetPost.id) || null,
+        targetPostId: Number(targetPost.id) || null,
+        targetPostNumber: Number(targetPost.post_number) || requested,
+        path: [targetPost],
+      };
+    }
+
+    async function loadAll(requestSignal, onBatch) {
+      snapshotSuspended += 1;
+      try {
+        for (let start = 0; start < stream.length; start += PAGE_SIZE * REQUEST_MAX_CONCURRENCY) {
+          throwIfAborted(requestSignal);
+          const groups = [];
+          for (let offset = 0; offset < PAGE_SIZE * REQUEST_MAX_CONCURRENCY; offset += PAGE_SIZE) {
+            if (start + offset >= stream.length) break;
+            groups.push(fetchRange(start + offset, start + offset + PAGE_SIZE, 'background', requestSignal));
+          }
+          await Promise.all(groups);
+          if (onBatch) onBatch(Math.min(stream.length, start + PAGE_SIZE * REQUEST_MAX_CONCURRENCY), stream.length);
+        }
+        return Array.from(cache.values());
+      } finally {
+        snapshotSuspended = Math.max(0, snapshotSuspended - 1);
+        if (!snapshotSuspended) scheduleSnapshotWrite(true);
+      }
+    }
+
+    function updatePost(postId, updater) {
+      const id = Number(postId);
+      const current = cache.get(id);
+      if (!current) return null;
+      const next = typeof updater === 'function' ? updater(Object.assign({}, current)) : Object.assign({}, current, updater || {});
+      if (!next) return current;
+      cache.set(id, next);
+      bumpPostRevision(id);
+      indexPost(next);
+      emitPosts([next]);
+      scheduleSnapshotWrite();
+      return next;
+    }
+
+    function mergePost(post) {
+      if (!post || !post.id) return null;
+      const id = Number(post.id);
+      const next = Object.assign({}, cache.get(id) || {}, post);
+      if (Number(next.post_number) > 1 && !streamIndex.has(String(id))) {
+        const nextStream = stream.slice();
+        const estimated = Math.max(0, Math.min(nextStream.length, Number(next.post_number) - 2));
+        nextStream.splice(estimated, 0, id);
+        replaceStream(nextStream);
+      }
+      cachePosts([next], true);
+      scheduleSnapshotWrite();
+      return next;
+    }
+
+    return {
+      init, resolveTarget, resolveThreadTarget, fetchRange, fetchIds, loadAll, updatePost, mergePost, flushSnapshot,
+      get streamLength() { return stream.length; },
+      get streamRevision() { return streamRevision; },
+      get topic() { return topic; },
+      get refreshPromise() { return refreshPromise; },
+      getStreamId(index) { return stream[index]; },
+      getStreamIndex(postId) {
+        const index = streamIndex.get(String(postId));
+        return index === undefined ? -1 : index;
+      },
+      getCachedByIndex(index) { return cache.get(Number(stream[index])) || null; },
+      getPostById(postId) { return cache.get(Number(postId)) || null; },
+      getPostRevision(postId) { return postRevisions.get(Number(postId)) || 0; },
+      getPostByNumber,
+      getStreamIds() { return stream.slice(); },
+      getKnownChildren,
+      getCachedPosts() { return Array.from(cache.values()); },
+      subscribeStream(listener) { streamListeners.add(listener); return () => streamListeners.delete(listener); },
+      subscribePosts(listener) { postListeners.add(listener); return () => postListeners.delete(listener); },
+      destroy() {
+        if (snapshotTimer) clearTimeout(snapshotTimer);
+        if (snapshotMaxTimer) clearTimeout(snapshotMaxTimer);
+        snapshotTimer = snapshotMaxTimer = 0;
+        streamListeners.clear(); postListeners.clear();
+        if (snapshotDirty) flushSnapshot().catch(() => {});
+      },
+    };
+  }
+
+  function createVirtualFlow(loader, ctx) {
+    const DEFAULT_HEIGHT = 184;
+    const OVERSCAN_SCREENS = 1.25;
+    const KEEPALIVE_SCREENS = 0.5;
+    const HEIGHT_EPSILON = 1;
+    const SEEK_QUIET_MS = 120;
+    const SEEK_MAX_MS = 500;
+    const MANUAL_SCROLL_QUIET_MS = 180;
+    const USER_SCROLL_IDLE_MS = 350;
+    const DISCONTINUOUS_SCROLL_SCREENS = 1.5;
+    const displayStreamIds = () => onlyOp
+      ? loader.getStreamIds().filter((id) => (loader.getPostById(id) || {}).username === ctx.op)
+      : loader.getStreamIds();
+    let logicalIds = loader.getStreamIds();
+    const heightByPostId = new Map();
+    let positionByPostId = new Map();
+    let heights = logicalIds.map((id) => heightByPostId.get(id) || DEFAULT_HEIGHT);
+    let prefix = [0];
+    let mountedStart = -1;
+    let mountedEnd = -1;
+    let logicalRevision = 0;
+    let scrollRaf = 0;
+    let resizeRaf = 0;
+    let interactionRevision = 0;
+    let destroyed = false;
+    let onlyOp = false;
+    let onlyOpController = null;
+    let pinnedAnchor = null;
+    let seekQuietTimer = 0;
+    let seekMaxTimer = 0;
+    let seekingScroll = false;
+    let committing = false;
+    let mountSequence = 0;
+    let latestMountSequence = 0;
+    let activeMount = null;
+    let queuedMount = null;
+    let pendingResizeAnchor = null;
+    let manualScrollAnchor = null;
+    let manualScrollTimer = 0;
+    let manualScrollActive = false;
+    let lastObservedScrollTop = ctx.scrollRoot.scrollTop;
+    let viewportWasAtBottom = false;
+    let stableViewportAnchor = null;
+    let preferredFocusPostId = 0;
+    let preferredViewportAnchor = null;
+    let preferredProtectedUntil = 0;
+    let userScrollActive = false;
+    let userScrollTimer = 0;
+    let pendingProjectionReconcile = false;
+    let projectionReconcileQueued = false;
+    let projectionReconcileRunning = false;
+    let explicitSeekDepth = 0;
+    const pendingResizeHeights = new Map();
+    const resizeObserver = new ResizeObserver((entries) => {
+      if (destroyed || committing || !entries.length) return;
+      entries.forEach((entry) => {
+        if (!entry.target.isConnected) return;
+        const postId = Number(entry.target.dataset.streamPostId);
+        const position = positionByPostId.get(postId);
+        if (position === undefined) return;
+        const next = Math.max(56, entry.borderBoxSize && entry.borderBoxSize[0]
+          ? entry.borderBoxSize[0].blockSize : entry.contentRect.height);
+        if (Math.abs((heights[position] || DEFAULT_HEIGHT) - next) >= HEIGHT_EPSILON) {
+          pendingResizeHeights.set(postId, next);
+        }
+      });
+      if (!pendingResizeHeights.size) {
+        if (!resizeRaf) pendingResizeAnchor = null;
+        return;
+      }
+      if (!pendingResizeAnchor) {
+        const preferredNode = preferredFocusPostId
+          ? windowEl.querySelector(`.ldp-post[data-post-id="${Number(preferredFocusPostId)}"]`) : null;
+        pendingResizeAnchor = pinnedAnchor || preferredViewportAnchor || stableViewportAnchor
+          || captureNodeViewportAnchor(preferredNode) || captureViewportAnchor();
+      }
+      if (resizeRaf) return;
+      if (pinnedAnchor) notePinnedActivity();
+      resizeRaf = requestAnimationFrame(applyResizeUpdates);
+    });
+
+    ctx.commentsEl.innerHTML = `
+      <div class="ldp-virtual-spacer ldp-virtual-spacer-top" aria-hidden="true"></div>
+      <div class="ldp-virtual-window"></div>
+      <div class="ldp-virtual-spacer ldp-virtual-spacer-bottom" aria-hidden="true"></div>`;
+    const topSpacer = ctx.commentsEl.querySelector('.ldp-virtual-spacer-top');
+    const windowEl = ctx.commentsEl.querySelector('.ldp-virtual-window');
+    const bottomSpacer = ctx.commentsEl.querySelector('.ldp-virtual-spacer-bottom');
+
+    function rebuildPrefix() {
+      positionByPostId = new Map(logicalIds.map((id, index) => [Number(id), index]));
+      prefix = new Array(heights.length + 1);
+      prefix[0] = 0;
+      for (let index = 0; index < heights.length; index++) prefix[index + 1] = prefix[index] + (heights[index] || DEFAULT_HEIGHT);
+    }
+
+    function lowerBound(value) {
+      let low = 0, high = Math.max(0, prefix.length - 1);
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2);
+        if (prefix[mid] < value) low = mid + 1;
+        else high = mid;
+      }
+      return Math.max(0, Math.min(heights.length - 1, low - (prefix[low] > value ? 1 : 0)));
+    }
+
+    function contentTop() {
+      return ctx.commentsEl.offsetTop;
+    }
+
+    function isAtBottom() {
+      return ctx.scrollRoot.scrollHeight - ctx.scrollRoot.clientHeight - ctx.scrollRoot.scrollTop <= 2;
+    }
+
+    function currentAnchor() {
+      if (!logicalIds.length) return { aboveContent: true, scrollTop: ctx.scrollRoot.scrollTop };
+      if (ctx.scrollRoot.scrollTop < contentTop()) {
+        return { aboveContent: true, scrollTop: ctx.scrollRoot.scrollTop };
+      }
+      const y = Math.max(0, ctx.scrollRoot.scrollTop - contentTop());
+      const position = lowerBound(y);
+      return { position, postId: logicalIds[position], offset: y - prefix[position] };
+    }
+
+    function restoreAnchor(anchor) {
+      if (!anchor || !heights.length) return;
+      if (anchor.aboveContent) {
+        ctx.scrollRoot.scrollTop = Math.max(0, Number(anchor.scrollTop) || 0);
+        viewportWasAtBottom = isAtBottom();
+        stableViewportAnchor = anchor;
+        return;
+      }
+      const mapped = positionByPostId.get(Number(anchor.postId));
+      const position = mapped === undefined ? Math.min(anchor.position, heights.length - 1) : mapped;
+      ctx.scrollRoot.scrollTop = contentTop() + prefix[position] + anchor.offset;
+      viewportWasAtBottom = isAtBottom();
+      stableViewportAnchor = captureViewportAnchor();
+    }
+
+    function captureNodeViewportAnchor(visible) {
+      if (!visible || !visible.isConnected) return null;
+      const rootRect = ctx.scrollRoot.getBoundingClientRect();
+      let rootNode = visible;
+      while (rootNode.parentElement && rootNode.parentElement !== windowEl) rootNode = rootNode.parentElement;
+      const postId = Number(rootNode.dataset.streamPostId);
+      const focusPostId = Number(visible.dataset.postId);
+      const position = positionByPostId.get(postId);
+      if (position === undefined) return null;
+      const post = loader.getPostById(focusPostId || postId);
+      return {
+        postId, focusPostId, position, postNumber: post && Number(post.post_number),
+        viewportOffset: visible.getBoundingClientRect().top - rootRect.top,
+        offset: ctx.scrollRoot.scrollTop - contentTop() - prefix[position],
+      };
+    }
+
+    function captureViewportAnchor() {
+      if (!logicalIds.length || ctx.scrollRoot.scrollTop < contentTop()) return currentAnchor();
+      const rootRect = ctx.scrollRoot.getBoundingClientRect();
+      const nodes = Array.from(windowEl.querySelectorAll('.ldp-post[data-post-id]'));
+      const visibleNodes = nodes.filter((node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.bottom > rootRect.top + 1 && rect.top < rootRect.bottom - 1;
+      });
+      const atBottom = viewportWasAtBottom || isAtBottom();
+      const probeY = rootRect.top + Math.min(24, rootRect.height * 0.1);
+      const probeNodes = visibleNodes.filter((node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.top <= probeY && rect.bottom > probeY;
+      });
+      const visible = (atBottom && visibleNodes.length ? visibleNodes[visibleNodes.length - 1] : null)
+        || probeNodes[probeNodes.length - 1] || visibleNodes[0];
+      if (!visible) return currentAnchor();
+      return captureNodeViewportAnchor(visible) || currentAnchor();
+    }
+
+    function restoreViewportAnchor(anchor) {
+      if (!anchor || !heights.length) return;
+      if (anchor.aboveContent) {
+        ctx.scrollRoot.scrollTop = Math.max(0, Number(anchor.scrollTop) || 0);
+        viewportWasAtBottom = isAtBottom();
+        stableViewportAnchor = anchor;
+        return;
+      }
+      const mapped = positionByPostId.get(Number(anchor.postId));
+      const position = mapped === undefined
+        ? Math.max(0, Math.min(heights.length - 1, Number(anchor.position) || 0)) : mapped;
+      const rootNode = Array.from(windowEl.children)
+        .find((item) => Number(item.dataset.streamPostId) === Number(logicalIds[position]));
+      const focusNode = Number(anchor.focusPostId) && rootNode
+        ? rootNode.querySelector(`.ldp-post[data-post-id="${Number(anchor.focusPostId)}"]`)
+        : null;
+      const node = focusNode || rootNode;
+      if (node && Number.isFinite(Number(anchor.viewportOffset))) {
+        const rootTop = ctx.scrollRoot.getBoundingClientRect().top;
+        const delta = node.getBoundingClientRect().top - rootTop - Number(anchor.viewportOffset);
+        if (Math.abs(delta) >= 0.5) ctx.scrollRoot.scrollTop += delta;
+        viewportWasAtBottom = isAtBottom();
+        stableViewportAnchor = captureNodeViewportAnchor(node) || captureViewportAnchor();
+        if (preferredFocusPostId && Number(anchor.focusPostId) === Number(preferredFocusPostId)) {
+          preferredViewportAnchor = stableViewportAnchor;
+        }
+        return;
+      }
+      const offset = Number.isFinite(Number(anchor.offset)) ? Number(anchor.offset) : -Number(anchor.viewportOffset || 0);
+      ctx.scrollRoot.scrollTop = Math.max(0, contentTop() + prefix[position] + offset);
+      viewportWasAtBottom = isAtBottom();
+      stableViewportAnchor = captureViewportAnchor();
+    }
+
+    function syncSpacers() {
+      const top = mountedStart < 0 ? 0 : prefix[mountedStart];
+      const bottom = mountedEnd < 0 ? prefix[prefix.length - 1] : prefix[prefix.length - 1] - prefix[mountedEnd];
+      topSpacer.style.height = `${Math.max(0, top)}px`;
+      bottomSpacer.style.height = `${Math.max(0, bottom)}px`;
+    }
+
+    function unregisterRootNode(rootNode) {
+      if (!rootNode) return;
+      resizeObserver.unobserve(rootNode);
+      rootNode.querySelectorAll('.ldp-post[data-post-id]').forEach((node) => {
+        ctx.tracker.unobserve(node);
+        if (ctx.repliesIO && ctx.repliesIO.clearNode) ctx.repliesIO.clearNode(node);
+        const postNumber = Number(node.dataset.postNumber);
+        if (ctx.nodeMap.get(postNumber) === node) ctx.nodeMap.delete(postNumber);
+      });
+      if (rootNode.matches && rootNode.matches('.ldp-post[data-post-id]')) {
+        ctx.tracker.unobserve(rootNode);
+        if (ctx.repliesIO && ctx.repliesIO.clearNode) ctx.repliesIO.clearNode(rootNode);
+        const postNumber = Number(rootNode.dataset.postNumber);
+        if (ctx.nodeMap.get(postNumber) === rootNode) ctx.nodeMap.delete(postNumber);
+      }
+    }
+
+    function clearWindow() {
+      Array.from(windowEl.children).forEach(unregisterRootNode);
+      ctx.windowEpoch += 1;
+      ctx.nodeMap.clear();
+      windowEl.replaceChildren();
+    }
+
+    function measureWindowHeights() {
+      let changed = false;
+      Array.from(windowEl.children).forEach((node) => {
+        const postId = Number(node.dataset.streamPostId);
+        const position = positionByPostId.get(postId);
+        if (position === undefined) return;
+        const next = Math.max(56, node.getBoundingClientRect().height);
+        if (Math.abs((heights[position] || DEFAULT_HEIGHT) - next) < HEIGHT_EPSILON) return;
+        heights[position] = next;
+        heightByPostId.set(postId, next);
+        changed = true;
+      });
+      if (changed) rebuildPrefix();
+      return changed;
+    }
+
+    function applyResizeUpdates() {
+      if (resizeRaf) cancelAnimationFrame(resizeRaf);
+      resizeRaf = 0;
+      if (destroyed || !pendingResizeHeights.size) {
+        pendingResizeHeights.clear();
+        pendingResizeAnchor = null;
+        return;
+      }
+      const anchor = pendingResizeAnchor;
+      pendingResizeAnchor = null;
+      let changed = false;
+      let beforeAnchorDelta = 0;
+      const anchorPosition = anchor && positionByPostId.get(Number(anchor.postId));
+      pendingResizeHeights.forEach((next, postId) => {
+        const position = positionByPostId.get(Number(postId));
+        if (position === undefined || Math.abs((heights[position] || DEFAULT_HEIGHT) - next) < HEIGHT_EPSILON) return;
+        if (anchorPosition !== undefined && position < anchorPosition) {
+          beforeAnchorDelta += next - (heights[position] || DEFAULT_HEIGHT);
+        }
+        heights[position] = next;
+        heightByPostId.set(Number(postId), next);
+        changed = true;
+      });
+      pendingResizeHeights.clear();
+      if (!changed) return;
+      rebuildPrefix();
+      syncSpacers();
+      if (Math.abs(beforeAnchorDelta) >= 0.5) {
+        ctx.scrollRoot.scrollTop += beforeAnchorDelta;
+        viewportWasAtBottom = isAtBottom();
+        stableViewportAnchor = anchor || stableViewportAnchor;
+      } else if (!userScrollActive && anchor && (anchor.pinned || Number.isFinite(Number(anchor.viewportOffset)))) {
+        restoreViewportAnchor(anchor);
+      } else if (!userScrollActive) {
+        restoreAnchor(anchor);
+      }
+    }
+
+    function withViewportAnchor(mutator) {
+      if (typeof mutator !== 'function') return undefined;
+      if (destroyed || committing) return mutator();
+      if (resizeRaf || pendingResizeHeights.size) applyResizeUpdates();
+      const anchor = pinnedAnchor || captureViewportAnchor();
+      committing = true;
+      try {
+        return mutator();
+      } finally {
+        measureWindowHeights();
+        syncSpacers();
+        restoreViewportAnchor(anchor);
+        committing = false;
+        if (pinnedAnchor) notePinnedActivity();
+      }
+    }
+
+    function renderTreeRevision(post) {
+      if (!post || !post.id) return 'missing';
+      const id = Number(post.id);
+      const state = ctx.subReplyState.get(Number(post.post_number));
+      const replyIds = state ? state.all.map((reply) => Number(reply.id)).join(',') : '';
+      return `${onlyOp ? 'op' : 'all'}:${id}:${loader.getPostRevision(id)}:${state && state.expanded ? 1 : 0}:${replyIds}`;
+    }
+
+    function rebuildNodeMap() {
+      ctx.nodeMap.clear();
+      windowEl.querySelectorAll('.ldp-post[data-post-number]').forEach((node) => {
+        ctx.nodeMap.set(Number(node.dataset.postNumber), node);
+      });
+    }
+
+    function renderWindow(entries) {
+      const previous = new Map(Array.from(windowEl.children).map((node) => [String(node.dataset.streamPostId || ''), node]));
+      const retained = new Set();
+      const fragment = document.createDocumentFragment();
+      entries.forEach(({ id, post }) => {
+        if (!post) {
+          let placeholder = previous.get(String(id));
+          if (!placeholder || !placeholder.classList.contains('ldp-missing-post')) {
+            placeholder = document.createElement('div');
+            placeholder.className = 'ldp-missing-post';
+          }
+          placeholder.dataset.streamPostId = String(id);
+          placeholder.setAttribute('aria-hidden', 'true');
+          retained.add(placeholder);
+          fragment.appendChild(placeholder);
+          return;
+        }
+        const revision = renderTreeRevision(post);
+        const previousNode = previous.get(String(id));
+        let node = previousNode && previousNode.classList.contains('ldp-post')
+          && previousNode.dataset.renderRevision === revision ? previousNode : null;
+        if (!node) {
+          if (previousNode) unregisterRootNode(previousNode);
+          node = renderPost(post, false, ctx);
+          node.dataset.renderRevision = revision;
+          ctx.tracker.observe(node);
+        }
+        node.dataset.streamPostId = String(id);
+        node.dataset.windowEpoch = String(ctx.windowEpoch + 1);
+        if (Number(ctx.highlightPostId) === Number(post.id) && Date.now() < Number(ctx.highlightUntil || 0)) {
+          node.classList.add('ldp-flash');
+        }
+        retained.add(node);
+        fragment.appendChild(node);
+      });
+      previous.forEach((node) => {
+        if (!retained.has(node)) unregisterRootNode(node);
+      });
+      ctx.windowEpoch += 1;
+      windowEl.replaceChildren(fragment);
+      rebuildNodeMap();
+      entries.forEach(({ post }) => {
+        if (!post) return;
+        const parent = ctx.nodeMap.get(Number(post.post_number));
+        if (!parent) return;
+        if (parent.dataset.renderRevision === renderTreeRevision(post)
+          && ctx.subReplyState.has(Number(post.post_number))) {
+          renderSubReplyStateInto(parent, post.post_number, ctx);
+        }
+      });
+      rebuildNodeMap();
+    }
+
+    function settleMountRequest(request, value, error) {
+      request.waiters.forEach(({ resolve, reject }) => error ? reject(error) : resolve(value));
+      request.waiters.length = 0;
+    }
+
+    function startNextMount() {
+      if (destroyed || activeMount || !queuedMount) return;
+      const request = queuedMount;
+      queuedMount = null;
+      activeMount = request;
+      (async () => {
+        const groups = [];
+        for (let index = 0; index < request.source.length; index += PAGE_SIZE) {
+          groups.push(loader.fetchIds(request.source.slice(index, index + PAGE_SIZE), request.priority, ctx.signal));
+        }
+        await Promise.all(groups);
+        if (destroyed) return false;
+        if (request.interactionRevision !== interactionRevision) return false;
+        let commitStart = request.start;
+        let commitEnd = request.end;
+        if (request.logicalRevision !== logicalRevision) {
+          const currentPositions = request.source
+            .map((id) => positionByPostId.get(Number(id)))
+            .filter((position) => position !== undefined);
+          const contiguous = currentPositions.length > 0
+            && currentPositions.every((position, index) => position === currentPositions[0] + index);
+          if (!contiguous) return false;
+          commitStart = currentPositions[0];
+          commitEnd = currentPositions[currentPositions.length - 1] + 1;
+        }
+        if (!request.forceCommit && request.sequence < latestMountSequence) return false;
+        const entries = request.source.map((id) => ({ id, post: loader.getPostById(id) }));
+        const anchor = request.anchorOverride || manualScrollAnchor
+          || (request.preserveAnchor ? captureViewportAnchor() : null);
+        committing = true;
+        try {
+          if (resizeRaf) cancelAnimationFrame(resizeRaf);
+          resizeRaf = 0;
+          pendingResizeHeights.clear();
+          pendingResizeAnchor = null;
+          mountedStart = commitStart;
+          mountedEnd = commitEnd;
+          renderWindow(entries);
+          measureWindowHeights();
+          syncSpacers();
+          if (anchor) restoreViewportAnchor(anchor);
+          Array.from(windowEl.children).forEach((node) => resizeObserver.observe(node));
+        } finally {
+          committing = false;
+        }
+        if (ctx.onPostsChanged) ctx.onPostsChanged();
+        return true;
+      })().then((committed) => {
+        settleMountRequest(request, committed);
+        if (committed && request.forceCommit && queuedMount && !queuedMount.forceCommit) {
+          settleMountRequest(queuedMount, false);
+          queuedMount = null;
+        }
+      }).catch((error) => settleMountRequest(request, false, error)).finally(() => {
+        activeMount = null;
+        queueMicrotask(startNextMount);
+      });
+    }
+
+    function mount(start, end, priority, options) {
+      if (destroyed || !logicalIds.length) return Promise.resolve(false);
+      const safeStart = Math.max(0, Math.min(logicalIds.length - 1, start));
+      const safeEnd = Math.max(safeStart + 1, Math.min(logicalIds.length, end));
+      const force = !!(options && options.force);
+      if (!force && safeStart === mountedStart && safeEnd === mountedEnd) return Promise.resolve(true);
+      const source = logicalIds.slice(safeStart, safeEnd);
+      const same = (request) => request && request.start === safeStart && request.end === safeEnd
+        && request.logicalRevision === logicalRevision
+        && request.interactionRevision === interactionRevision
+        && request.source.length === source.length && request.source.every((id, index) => Number(id) === Number(source[index]));
+      return new Promise((resolve, reject) => {
+        const forceCommit = !!(options && options.forceCommit);
+        if (same(activeMount) && (!forceCommit || activeMount.forceCommit)) {
+          if (options && options.anchorOverride) activeMount.anchorOverride = options.anchorOverride;
+          activeMount.waiters.push({ resolve, reject });
+          return;
+        }
+        if (same(queuedMount)) {
+          if (options && options.anchorOverride) queuedMount.anchorOverride = options.anchorOverride;
+          if (forceCommit) {
+            queuedMount.forceCommit = true;
+            queuedMount.priority = priority || 'target';
+            queuedMount.preserveAnchor = !options || options.preserveAnchor !== false;
+            queuedMount.anchorOverride = options && options.anchorOverride;
+          }
+          queuedMount.waiters.push({ resolve, reject });
+          return;
+        }
+        const request = {
+          start: safeStart, end: safeEnd, source,
+          logicalRevision, interactionRevision,
+          priority: priority || 'visible', sequence: ++mountSequence,
+          preserveAnchor: !options || options.preserveAnchor !== false,
+          anchorOverride: options && options.anchorOverride,
+          forceCommit,
+          waiters: [{ resolve, reject }],
+        };
+        latestMountSequence = request.sequence;
+        if (queuedMount) settleMountRequest(queuedMount, false);
+        queuedMount = request;
+        startNextMount();
+      });
+    }
+
+    function desiredWindow(force) {
+      const relativeTop = Math.max(0, ctx.scrollRoot.scrollTop - contentTop());
+      const viewport = Math.max(1, ctx.scrollRoot.clientHeight);
+      if (!force && mountedStart >= 0 && mountedEnd > mountedStart) {
+        const before = mountedStart === 0 ? Infinity : relativeTop - prefix[mountedStart];
+        const after = mountedEnd >= logicalIds.length ? Infinity : prefix[mountedEnd] - (relativeTop + viewport);
+        if (before >= viewport * KEEPALIVE_SCREENS && after >= viewport * KEEPALIVE_SCREENS) return null;
+      }
+      const first = lowerBound(Math.max(0, relativeTop - viewport * OVERSCAN_SCREENS));
+      let last = lowerBound(relativeTop + viewport * (1 + OVERSCAN_SCREENS)) + 1;
+      last = Math.min(logicalIds.length, Math.max(first + 1, last));
+      if (last - first > MAX_RENDERED_POSTS) last = first + MAX_RENDERED_POSTS;
+      return { start: first, end: last };
+    }
+
+    function windowAroundPosition(position) {
+      const start = Math.max(0, Math.min(position - SLICE_RADIUS, Math.max(0, logicalIds.length - PAGE_SIZE)));
+      return { start, end: Math.min(logicalIds.length, Math.max(start + PAGE_SIZE, position + 1)) };
+    }
+
+    function visibleRenderedPost() {
+      const rect = ctx.scrollRoot.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width * 0.5, rect.top + rect.height * 0.35);
+      const node = hit && hit.closest ? hit.closest('.ldp-post[data-post-id]') : null;
+      return node && ctx.scrollRoot.contains(node) ? loader.getPostById(node.dataset.postId) : null;
+    }
+
+    function requestProjectionReconcile() {
+      pendingProjectionReconcile = true;
+      if (destroyed || userScrollActive || explicitSeekDepth > 0 || projectionReconcileQueued || projectionReconcileRunning) return;
+      projectionReconcileQueued = true;
+      queueMicrotask(async () => {
+        projectionReconcileQueued = false;
+        if (destroyed || userScrollActive || !pendingProjectionReconcile) return;
+        pendingProjectionReconcile = false;
+        projectionReconcileRunning = true;
+        try {
+          await reconcileStream(displayStreamIds());
+        } catch (error) {
+          if (!error || error.name !== 'AbortError') console.warn('[LinuxDo Reader] 回复投影更新失败', error);
+        } finally {
+          projectionReconcileRunning = false;
+          if (pendingProjectionReconcile) requestProjectionReconcile();
+        }
+      });
+    }
+
+    function setUserScrollActive(active) {
+      const next = !!active;
+      if (userScrollActive === next) return;
+      userScrollActive = next;
+      if (ctx.repliesIO && ctx.repliesIO.setScrollActive) ctx.repliesIO.setScrollActive(next);
+      if (!next) {
+        if (!destroyed && ctx.repliesIO && ctx.repliesIO.flushPendingReplies) ctx.repliesIO.flushPendingReplies();
+        if (!destroyed && pendingProjectionReconcile) requestProjectionReconcile();
+      }
+    }
+
+    function noteUserScroll() {
+      if (destroyed || committing || seekingScroll) return;
+      setUserScrollActive(true);
+      if (userScrollTimer) clearTimeout(userScrollTimer);
+      userScrollTimer = setTimeout(() => {
+        userScrollTimer = 0;
+        setUserScrollActive(false);
+      }, USER_SCROLL_IDLE_MS);
+    }
+
+    function onScroll(event) {
+      const nextScrollTop = ctx.scrollRoot.scrollTop;
+      const viewport = Math.max(1, ctx.scrollRoot.clientHeight);
+      const syntheticScroll = !!(event && event.isTrusted === false);
+      if (syntheticScroll && !seekingScroll) beginManualScroll();
+      const discontinuous = !committing && !seekingScroll && !pinnedAnchor
+        && Math.abs(nextScrollTop - lastObservedScrollTop) > viewport * DISCONTINUOUS_SCROLL_SCREENS;
+      const treatAsManual = manualScrollActive
+        || (discontinuous && (syntheticScroll
+          || (!preferredViewportAnchor && performance.now() >= preferredProtectedUntil)));
+      if (treatAsManual && !seekingScroll) noteUserScroll();
+      if (treatAsManual && !seekingScroll) {
+        preferredFocusPostId = 0;
+        preferredViewportAnchor = null;
+      }
+      lastObservedScrollTop = nextScrollTop;
+      if (manualScrollActive || discontinuous || seekingScroll || pinnedAnchor) {
+        viewportWasAtBottom = isAtBottom();
+        stableViewportAnchor = pinnedAnchor || preferredViewportAnchor
+          || (manualScrollActive || discontinuous ? currentAnchor() : captureViewportAnchor());
+      }
+      if (pinnedAnchor && !seekingScroll) {
+        const focusNode = Number(pinnedAnchor.focusPostId)
+          ? windowEl.querySelector(`.ldp-post[data-post-id="${Number(pinnedAnchor.focusPostId)}"]`) : null;
+        if (focusNode) {
+          const rootTop = ctx.scrollRoot.getBoundingClientRect().top;
+          if (Math.abs(focusNode.getBoundingClientRect().top - rootTop - pinnedAnchor.viewportOffset) > 2) clearPinnedAnchor();
+        } else {
+          const mapped = positionByPostId.get(Number(pinnedAnchor.postId));
+          const position = mapped === undefined ? pinnedAnchor.position : mapped;
+          const expected = contentTop() + prefix[position] - pinnedAnchor.viewportOffset;
+          if (Math.abs(ctx.scrollRoot.scrollTop - expected) > 2) clearPinnedAnchor();
+        }
+      }
+      if (scrollRaf) return;
+      scrollRaf = requestAnimationFrame(() => {
+        scrollRaf = 0;
+        if (treatAsManual) {
+          manualScrollActive = true;
+          manualScrollAnchor = currentAnchor();
+          scheduleManualScrollRelease();
+        }
+        const desired = desiredWindow(false);
+        if (desired) {
+          mount(desired.start, desired.end, 'visible', {
+            anchorOverride: manualScrollAnchor,
+          }).catch(() => {});
+        }
+        const anchor = currentAnchor();
+        const post = visibleRenderedPost() || (anchor.aboveContent ? null : loader.getPostById(logicalIds[anchor.position]));
+        if (post && loader.topic) rememberTopicHistory(loader.topic, post.post_number);
+      });
+    }
+
+    function clearPinnedAnchor() {
+      if (!committing && pendingResizeAnchor && pendingResizeAnchor.pinned) {
+        if (pendingResizeHeights.size) applyResizeUpdates();
+        else pendingResizeAnchor = null;
+      }
+      pinnedAnchor = null;
+      if (seekQuietTimer) clearTimeout(seekQuietTimer);
+      if (seekMaxTimer) clearTimeout(seekMaxTimer);
+      seekQuietTimer = seekMaxTimer = 0;
+    }
+
+    function notePinnedActivity() {
+      if (!pinnedAnchor) return;
+      if (seekQuietTimer) clearTimeout(seekQuietTimer);
+      seekQuietTimer = setTimeout(clearPinnedAnchor, SEEK_QUIET_MS);
+      if (!seekMaxTimer) seekMaxTimer = setTimeout(clearPinnedAnchor, SEEK_MAX_MS);
+    }
+
+    function clearManualScrollAnchor() {
+      manualScrollActive = false;
+      manualScrollAnchor = null;
+      if (manualScrollTimer) clearTimeout(manualScrollTimer);
+      manualScrollTimer = 0;
+    }
+
+    function scheduleManualScrollRelease() {
+      if (manualScrollTimer) clearTimeout(manualScrollTimer);
+      manualScrollTimer = setTimeout(clearManualScrollAnchor, MANUAL_SCROLL_QUIET_MS);
+    }
+
+    function beginManualScroll() {
+      clearPinnedAnchor();
+      preferredFocusPostId = 0;
+      preferredViewportAnchor = null;
+      preferredProtectedUntil = 0;
+      interactionRevision += 1;
+      manualScrollActive = true;
+      noteUserScroll();
+      scheduleManualScrollRelease();
+    }
+
+    async function performSeekResolvedTarget(target, options) {
+      preferredFocusPostId = Number(target && target.targetPostId) || Number(target && target.rootPostId) || 0;
+      preferredViewportAnchor = null;
+      preferredProtectedUntil = performance.now() + SEEK_MAX_MS;
+      if (!logicalIds.length) {
+        ctx.scrollRoot.scrollTop = 0;
+        return true;
+      }
+      if (Number(target && target.targetPostNumber) <= 1) return scrollToTop();
+      await reconcileStream(displayStreamIds(), { forceCommit: true });
+      const rootPostId = Number(target && target.rootPostId)
+        || Number(loader.getStreamId(Number(target && target.index) || 0));
+      let position = positionByPostId.get(rootPostId);
+      if (position === undefined) {
+        const fallbackPost = loader.getPostByNumber(target && target.postNumber);
+        position = fallbackPost ? positionByPostId.get(Number(fallbackPost.id)) : undefined;
+      }
+      if (position === undefined) position = Math.max(0, Math.min(logicalIds.length - 1, Number(target && target.index) || 0));
+      let targetWindow = windowAroundPosition(position);
+      const local = position >= mountedStart && position < mountedEnd;
+      let mounted = await mount(targetWindow.start, targetWindow.end, 'target', {
+        preserveAnchor: false, forceCommit: true,
+      });
+      for (let attempt = 0; !mounted && !destroyed && attempt < MAX_RENDERED_POSTS; attempt++) {
+        await Promise.resolve();
+        position = positionByPostId.get(rootPostId);
+        if (position === undefined) position = Math.max(0, Math.min(logicalIds.length - 1, Number(target && target.index) || 0));
+        targetWindow = windowAroundPosition(position);
+        mounted = await mount(targetWindow.start, targetWindow.end, 'target', {
+          force: true, preserveAnchor: false, forceCommit: true,
+        });
+      }
+      if (!mounted || destroyed) return false;
+      position = positionByPostId.get(rootPostId);
+      if (position === undefined) position = 0;
+      const behavior = local && options && options.smooth ? 'smooth' : 'auto';
+      const top = contentTop() + prefix[position];
+      const viewportOffset = ctx.scrollRoot.clientHeight * 0.3;
+      let node = ctx.nodeMap.get(Number(target && target.postNumber));
+      clearPinnedAnchor();
+      pinnedAnchor = { position, postId: logicalIds[position], viewportOffset, pinned: true };
+      seekingScroll = true;
+      try {
+        if (node && (!target || !Array.isArray(target.path) || target.path.length <= 1)) {
+          node.scrollIntoView({ block: 'center', behavior });
+        } else {
+          ctx.scrollRoot.scrollTo({ top: Math.max(0, top - viewportOffset), behavior });
+        }
+        if (behavior === 'smooth') await waitForScrollEnd(ctx.scrollRoot);
+        else await new Promise((resolve) => requestAnimationFrame(resolve));
+        lastObservedScrollTop = ctx.scrollRoot.scrollTop;
+      } finally {
+        seekingScroll = false;
+      }
+      viewportWasAtBottom = isAtBottom();
+      stableViewportAnchor = captureViewportAnchor();
+      notePinnedActivity();
+      if (node) {
+        ctx.highlightPostId = Number(node.dataset.postId) || Number(target && target.targetPostId) || 0;
+        ctx.highlightUntil = Date.now() + 1700;
+        const applyHighlight = () => {
+          if (!ctx.highlightPostId || Date.now() >= ctx.highlightUntil) return;
+          windowEl.querySelectorAll(`.ldp-post[data-post-id="${Number(ctx.highlightPostId)}"]`)
+            .forEach((item) => item.classList.add('ldp-flash'));
+        };
+        applyHighlight();
+        requestAnimationFrame(() => requestAnimationFrame(applyHighlight));
+        setTimeout(() => {
+          if (Number(ctx.highlightPostId) !== Number(node.dataset.postId) || Date.now() < ctx.highlightUntil) return;
+          windowEl.querySelectorAll(`.ldp-post[data-post-id="${Number(ctx.highlightPostId)}"]`)
+            .forEach((item) => item.classList.remove('ldp-flash'));
+          ctx.highlightPostId = 0;
+          ctx.highlightUntil = 0;
+        }, 1710);
+      }
+      return true;
+    }
+
+    async function seekResolvedTarget(target, options) {
+      explicitSeekDepth += 1;
+      try {
+        return await performSeekResolvedTarget(target, options);
+      } finally {
+        explicitSeekDepth = Math.max(0, explicitSeekDepth - 1);
+        if (!destroyed && explicitSeekDepth === 0 && pendingProjectionReconcile) requestProjectionReconcile();
+      }
+    }
+
+    async function seekToIndex(streamIndex, desiredPostNumber, options) {
+      const safeIndex = Math.max(0, Math.min(loader.streamLength - 1, Number(streamIndex) || 0));
+      const streamId = loader.getStreamId(safeIndex);
+      if (streamId && !loader.getPostById(streamId)) await loader.fetchIds([streamId], 'target', ctx.signal);
+      const streamPost = loader.getPostById(streamId);
+      const postNumber = Number(desiredPostNumber) || Number(streamPost && streamPost.post_number) || safeIndex + 2;
+      const target = await loader.resolveThreadTarget(postNumber, ctx.signal);
+      return seekResolvedTarget(target, options);
+    }
+
+    async function seekToPost(postNumber) {
+      const target = await loader.resolveThreadTarget(postNumber, ctx.signal);
+      return seekResolvedTarget(target, { smooth: false });
+    }
+
+    async function scrollToTop() {
+      clearPinnedAnchor();
+      preferredFocusPostId = 0;
+      preferredViewportAnchor = null;
+      preferredProtectedUntil = 0;
+      viewportWasAtBottom = false;
+      stableViewportAnchor = { aboveContent: true, scrollTop: 0 };
+      ctx.scrollRoot.scrollTo({ top: 0, behavior: 'auto' });
+      onScroll();
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      if (destroyed) return false;
+      ctx.scrollRoot.scrollTop = 0;
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      if (!destroyed) ctx.scrollRoot.scrollTop = 0;
+      return !destroyed;
+    }
+
+    async function setOnlyOp(enabled) {
+      onlyOp = !!enabled;
+      if (onlyOpController) onlyOpController.abort();
+      onlyOpController = null;
+      await reconcileStream(displayStreamIds(), { forceCommit: true });
+      if (!onlyOp) return;
+      onlyOpController = new AbortController();
+      const controller = onlyOpController;
+      const abortScan = () => controller.abort();
+      ctx.signal.addEventListener('abort', abortScan, { once: true });
+      loader.loadAll(controller.signal, () => {
+        if (!destroyed && onlyOp && !controller.signal.aborted) reconcileStream(displayStreamIds()).catch(() => {});
+      }).then(() => {
+        if (!destroyed && onlyOp && !controller.signal.aborted) return reconcileStream(displayStreamIds());
+      }).catch((error) => {
+        if (!error || error.name !== 'AbortError') console.warn('[LinuxDo Reader] 只看楼主加载失败', error);
+      }).finally(() => ctx.signal.removeEventListener('abort', abortScan));
+    }
+
+    async function reconcileStream(nextIds, options) {
+      if (destroyed) return;
+      const reconciliationInteractionRevision = interactionRevision;
+      const preferredNode = preferredFocusPostId
+        ? windowEl.querySelector(`.ldp-post[data-post-id="${Number(preferredFocusPostId)}"]`) : null;
+      const anchor = logicalIds.length
+        ? (pinnedAnchor || manualScrollAnchor || preferredViewportAnchor || captureNodeViewportAnchor(preferredNode)
+          || stableViewportAnchor || captureViewportAnchor()) : null;
+      const nextLogicalIds = (nextIds || displayStreamIds())
+        .filter((id) => !onlyOp || (loader.getPostById(id) || {}).username === ctx.op);
+      const streamChanged = nextLogicalIds.length !== logicalIds.length
+        || nextLogicalIds.some((id, index) => Number(id) !== Number(logicalIds[index]));
+      if (streamChanged) {
+        logicalIds = nextLogicalIds;
+        heights = logicalIds.map((id) => heightByPostId.get(Number(id)) || DEFAULT_HEIGHT);
+        logicalRevision += 1;
+        rebuildPrefix();
+        mountedStart = mountedEnd = -1;
+      }
+      const revision = logicalRevision;
+      if (!logicalIds.length) {
+        withViewportAnchor(() => clearWindow());
+        syncSpacers();
+        return;
+      }
+      if (!streamChanged && mountedStart >= 0 && mountedEnd > mountedStart) return;
+      let position = anchor && positionByPostId.get(Number(anchor.postId));
+      if (position === undefined && anchor && anchor.postNumber) {
+        let distance = Infinity;
+        logicalIds.forEach((id, index) => {
+          const post = loader.getPostById(id);
+          const nextDistance = post ? Math.abs(Number(post.post_number) - anchor.postNumber) : Infinity;
+          if (nextDistance < distance) { distance = nextDistance; position = index; }
+        });
+      }
+      if (position === undefined) position = Math.max(0, Math.min(logicalIds.length - 1, Number(anchor && anchor.position) || 0));
+      const desired = windowAroundPosition(position);
+      const committed = await mount(desired.start, desired.end, 'visible', {
+        force: true, forceCommit: !!(options && options.forceCommit),
+        preserveAnchor: true, anchorOverride: anchor,
+      });
+      if (committed || destroyed || revision !== logicalRevision
+        || reconciliationInteractionRevision !== interactionRevision) return;
+      const retryPosition = positionByPostId.get(Number(anchor && anchor.postId));
+      const retryWindow = windowAroundPosition(retryPosition === undefined ? position : retryPosition);
+      await mount(retryWindow.start, retryWindow.end, 'visible', {
+        force: true, forceCommit: true,
+        preserveAnchor: true, anchorOverride: anchor,
+      });
+    }
+
+    rebuildPrefix();
+    syncSpacers();
+    ctx.withViewportAnchor = withViewportAnchor;
+    ctx.refreshRenderRevision = (node) => {
+      if (!node || !node.isConnected) return;
+      let rootNode = node;
+      while (rootNode.parentElement && rootNode.parentElement !== windowEl) rootNode = rootNode.parentElement;
+      const post = loader.getPostById(rootNode.dataset.postId);
+      if (post) rootNode.dataset.renderRevision = renderTreeRevision(post);
+    };
+    const unsubscribeStream = loader.subscribeStream(() => requestProjectionReconcile());
+    const unsubscribePosts = loader.subscribePosts((posts) => {
+      const root = ctx.commentsEl.closest('.ldp-shell') || ctx.commentsEl;
+      posts.forEach((post) => syncRenderedPostState(root, post, ctx));
+      if (onlyOp && posts.some((post) => post && post.username === ctx.op)) reconcileStream(displayStreamIds()).catch(() => {});
+    });
+    const releasePinnedAnchor = () => beginManualScroll();
+    const releasePinnedOnPointer = (event) => {
+      if (event.target === ctx.scrollRoot) beginManualScroll();
+      else clearPinnedAnchor();
+    };
+    const releasePinnedOnKey = (event) => {
+      if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar'].includes(event.key)) {
+        beginManualScroll();
+      }
+    };
+    ctx.scrollRoot.addEventListener('scroll', onScroll, { passive: true });
+    ctx.scrollRoot.addEventListener('wheel', releasePinnedAnchor, { passive: true });
+    ctx.scrollRoot.addEventListener('touchmove', releasePinnedAnchor, { passive: true });
+    ctx.scrollRoot.addEventListener('pointerdown', releasePinnedOnPointer, { passive: true });
+    document.addEventListener('keydown', releasePinnedOnKey, true);
+    return {
+      async mountInitial(target) {
+        if (Number(target && target.targetPostNumber) <= 1) {
+          const initialWindow = windowAroundPosition(0);
+          await mount(initialWindow.start, initialWindow.end, 'target', {
+            preserveAnchor: false, forceCommit: true,
+          });
+          return scrollToTop();
+        }
+        return seekResolvedTarget(target, { smooth: false });
+      },
+      seekToIndex, seekToPost, scrollToTop, setOnlyOp,
+      getCurrentPost() {
+        const anchor = currentAnchor();
+        return visibleRenderedPost() || loader.getPostById(logicalIds[anchor.position]);
+      },
+      refresh() { onScroll(); },
+      destroy() {
+        destroyed = true;
+        if (onlyOpController) onlyOpController.abort();
+        unsubscribeStream(); unsubscribePosts();
+        cancelAnimationFrame(scrollRaf);
+        cancelAnimationFrame(resizeRaf);
+        if (userScrollTimer) clearTimeout(userScrollTimer);
+        userScrollTimer = 0;
+        setUserScrollActive(false);
+        clearPinnedAnchor();
+        clearManualScrollAnchor();
+        if (queuedMount) settleMountRequest(queuedMount, false);
+        queuedMount = null;
+        resizeObserver.disconnect();
+        ctx.scrollRoot.removeEventListener('scroll', onScroll);
+        ctx.scrollRoot.removeEventListener('wheel', releasePinnedAnchor);
+        ctx.scrollRoot.removeEventListener('touchmove', releasePinnedAnchor);
+        ctx.scrollRoot.removeEventListener('pointerdown', releasePinnedOnPointer);
+        document.removeEventListener('keydown', releasePinnedOnKey, true);
+        if (ctx.withViewportAnchor === withViewportAnchor) ctx.withViewportAnchor = null;
+        if (ctx.refreshRenderRevision) ctx.refreshRenderRevision = null;
+        clearWindow();
+      },
+    };
+  }
+
+  /* ============ 13. 弹窗主体 + 双向分片加载 ============ */
+  let CURRENT_OVERLAY = null;
+  let CURRENT_MODAL_CLOSE = null;
+
+  function readerIcon(path, viewBox) {
+    return `<svg viewBox="${viewBox || '0 0 24 24'}" aria-hidden="true">${path}</svg>`;
+  }
+
+  const READER_ICONS = {
+    history: readerIcon('<path d="M12 2a10 10 0 1 1-8.4 4.58L2 5v5h5L5.05 8.05A7.5 7.5 0 1 0 12 4.5V2Zm-1 5h2v5.4l3.4 2-1 1.72L11 13.5V7Z"/>'),
+    collection: readerIcon('<path d="M4 4h6a3 3 0 0 1 2 1.05A3 3 0 0 1 14 4h6a2 2 0 0 1 2 2v13a1 1 0 0 1-1 1h-7a2 2 0 0 0-2 2 2 2 0 0 0-2-2H3a1 1 0 0 1-1-1V6a2 2 0 0 1 2-2Zm0 2v12h6a4 4 0 0 1 1 .13V7a1 1 0 0 0-1-1H4Zm10 0a1 1 0 0 0-1 1v11.13a4 4 0 0 1 1-.13h6V6h-6Z"/>'),
+    bookmark: readerIcon(ICONS.bookmark),
+    filter: readerIcon('<path d="M4 5h16v2H4V5Zm3 6h10v2H7v-2Zm3 6h4v2h-4v-2Z"/>'),
+    refresh: readerIcon('<path d="M17.65 6.35A8 8 0 1 0 20 12h-2.5a5.5 5.5 0 1 1-1.46-3.73L13 11h7V4l-2.35 2.35Z"/>'),
+    close: readerIcon('<path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/>'),
+    trash: readerIcon('<path d="M8 3h8l1 2h4v2H3V5h4l1-2Zm-2 6h12l-1 12H7L6 9Zm3 2 .5 8h2L11 11H9Zm4 0-.5 8h2l.5-8h-2Z"/>'),
+  };
+
+  function closeReaderPanel(app) {
+    if (!app) return;
+    if (app.panelAbort) app.panelAbort.abort();
+    app.panelAbort = null;
+    const panel = app.modal && app.modal.querySelector('.ldp-reader-panel');
+    if (panel) panel.remove();
+    if (panel && typeof app.onPanelClosed === 'function') app.onPanelClosed();
+  }
+
+  function panelItemHtml(item, type) {
+    const target = collectionItemTarget(item);
+    const title = item.title || item.topic_title || (item.topic && item.topic.title)
+      || item.name || `主题 ${target.topicId || ''}`;
+    const username = item.username || (item.user && item.user.username) || '';
+    const avatarTemplate = item.avatar_template || (item.user && item.user.avatar_template) || '';
+    const avatar = avatarTemplate ? resolveAvatar(avatarTemplate, 48) : '';
+    const meta = type === 'responses'
+      ? `${item._reactionType === 'reaction' ? '自定义回应' : '点赞'} · ${fmtTime(item.created_at || item.acted_at)}`
+      : `${target.postNumber > 1 ? `#${target.postNumber}` : '整帖'} · ${username ? `@${username}` : fmtTime(item.created_at)}`;
+    return `<div class="ldp-panel-item" data-topic-id="${escAttr(target.topicId || '')}" data-post-number="${target.postNumber}"
+      data-record-id="${escAttr(String(item.id || item.bookmark_id || ''))}" data-reaction-type="${escAttr(item._reactionType || '')}"
+      data-post-id="${escAttr(String(item.post_id || (String(item.bookmarkable_type).toLowerCase() === 'post' ? item.bookmarkable_id : '') || item.id || ''))}" data-reaction-id="${escAttr(String(item.reaction_id || item.reaction_value || item.reaction || ''))}">
+      ${avatar ? `<img class="ldp-panel-avatar" src="${escAttr(avatar)}" alt="">` : '<span class="ldp-panel-avatar"></span>'}
+      <button type="button" class="ldp-panel-item-main"><span class="ldp-panel-item-title">${esc(title)}</span><span class="ldp-panel-item-meta">${esc(meta)}</span></button>
+      <button type="button" class="ldp-panel-delete" title="移除" aria-label="移除">${READER_ICONS.trash}</button>
+    </div>`;
+  }
+
+  function showHistoryPanel(app) {
+    closeReaderPanel(app);
+    const panel = document.createElement('section');
+    panel.className = 'ldp-reader-panel';
+    panel.innerHTML = `<div class="ldp-panel-head"><strong>浏览历史</strong><button class="ldp-panel-close" title="关闭">×</button></div>
+      <input class="ldp-panel-search" type="search" placeholder="搜索标题或作者" aria-label="搜索浏览历史">
+      <div class="ldp-panel-list"></div>
+      <div class="ldp-panel-foot"><button type="button" data-panel-action="clear">清空历史</button><span></span><div><button type="button" data-panel-action="prev">上一页</button> <button type="button" data-panel-action="next">下一页</button></div></div>`;
+    app.modal.appendChild(panel);
+    let page = 0;
+    const pageSize = 20;
+    const search = panel.querySelector('.ldp-panel-search');
+    const list = panel.querySelector('.ldp-panel-list');
+    const pageText = panel.querySelector('.ldp-panel-foot span');
+    const render = () => {
+      const query = search.value.trim().toLowerCase();
+      const entries = getHistoryEntries().filter((item) => !query
+        || `${item.title} ${item.username}`.toLowerCase().includes(query));
+      const pages = Math.max(1, Math.ceil(entries.length / pageSize));
+      page = Math.max(0, Math.min(pages - 1, page));
+      const slice = entries.slice(page * pageSize, (page + 1) * pageSize);
+      list.innerHTML = slice.length ? slice.map((item) => panelItemHtml({
+        id: item.topicId, topic_id: item.topicId, post_number: item.lastPostNumber,
+        title: item.title, username: item.username, avatar_template: item.avatar,
+        created_at: new Date(item.lastViewedAt).toISOString(),
+      }, 'history')).join('') : '<div class="ldp-panel-empty">暂无浏览历史</div>';
+      pageText.textContent = `${page + 1} / ${pages}`;
+    };
+    panel.querySelector('.ldp-panel-close').addEventListener('click', () => closeReaderPanel(app));
+    search.addEventListener('input', () => { page = 0; render(); });
+    panel.addEventListener('click', (event) => {
+      const row = event.target.closest('.ldp-panel-item');
+      if (event.target.closest('.ldp-panel-item-main') && row) {
+        closeReaderPanel(app);
+        app.loadTopic(row.dataset.topicId, Number(row.dataset.postNumber));
+      } else if (event.target.closest('.ldp-panel-delete') && row) {
+        saveHistoryEntries(getHistoryEntries().filter((item) => String(item.topicId) !== row.dataset.topicId));
+        render();
+      } else if (event.target.closest('[data-panel-action="clear"]')) {
+        if (confirm('清空当前账号在本站的全部浏览历史？')) { saveHistoryEntries([]); render(); }
+      } else if (event.target.closest('[data-panel-action="prev"]')) { page -= 1; render(); }
+      else if (event.target.closest('[data-panel-action="next"]')) { page += 1; render(); }
+    });
+    render();
+    search.focus({ preventScroll: true });
+  }
+
+  function showCollectionPanel(app) {
+    closeReaderPanel(app);
+    const controller = new AbortController();
+    app.panelAbort = controller;
+    const panel = document.createElement('section');
+    panel.className = 'ldp-reader-panel';
+    panel.innerHTML = `<div class="ldp-panel-head"><strong>收藏与回应</strong><button class="ldp-panel-close" title="关闭">×</button></div>
+      <input class="ldp-panel-search" type="search" placeholder="搜索收藏与回应" aria-label="搜索收藏与回应">
+      <div class="ldp-panel-tabs">
+        <button class="ldp-panel-tab active" data-tab="responses">回应</button>
+        <button class="ldp-panel-tab" data-tab="topics">帖子</button>
+        <button class="ldp-panel-tab" data-tab="posts">楼层</button>
+      </div><div class="ldp-panel-list"><div class="ldp-panel-loading">正在读取…</div></div>
+      <div class="ldp-panel-foot"><span></span><div><button type="button" data-panel-action="prev">上一页</button> <button type="button" data-panel-action="next">下一页</button></div></div>`;
+    app.modal.appendChild(panel);
+    const state = { tab: 'responses', page: 0, bookmarks: null, responses: null };
+    let tabController = null;
+    const pageSize = 20;
+    const list = panel.querySelector('.ldp-panel-list');
+    const search = panel.querySelector('.ldp-panel-search');
+    const pageText = panel.querySelector('.ldp-panel-foot span');
+
+    const itemsForTab = () => {
+      if (state.tab === 'responses') return state.responses || [];
+      return (state.bookmarks || []).filter((item) => {
+        const target = collectionItemTarget(item);
+        const isPost = String(item.bookmarkable_type || '').toLowerCase() === 'post' || target.postNumber > 1;
+        return state.tab === 'posts' ? isPost : !isPost;
+      });
+    };
+    const render = () => {
+      const query = search.value.trim().toLowerCase();
+      const items = itemsForTab().filter((item) => !query || JSON.stringify([
+        item.title, item.topic_title, item.username, item.name,
+      ]).toLowerCase().includes(query));
+      const pages = Math.max(1, Math.ceil(items.length / pageSize));
+      state.page = Math.max(0, Math.min(pages - 1, state.page));
+      const slice = items.slice(state.page * pageSize, (state.page + 1) * pageSize);
+      list.innerHTML = slice.length ? slice.map((item) => panelItemHtml(item, state.tab === 'responses' ? 'responses' : 'bookmarks')).join('')
+        : '<div class="ldp-panel-empty">此分类暂无内容</div>';
+      pageText.textContent = `${state.page + 1} / ${pages}`;
+    };
+    const loadTab = async () => {
+      if (tabController) tabController.abort();
+      tabController = new AbortController();
+      const activeController = tabController;
+      const abortTab = () => activeController.abort();
+      controller.signal.addEventListener('abort', abortTab, { once: true });
+      list.innerHTML = '<div class="ldp-panel-loading">正在读取…</div>';
+      try {
+        if (state.tab === 'responses' && !state.responses) state.responses = await loadResponsesCollection(activeController.signal);
+        if (state.tab !== 'responses' && !state.bookmarks) state.bookmarks = await loadBookmarksCollection(activeController.signal);
+        if (activeController.signal.aborted) return;
+        render();
+      } catch (error) {
+        if (error && error.name === 'AbortError') return;
+        list.innerHTML = `<div class="ldp-panel-error">读取失败：${esc(error.message)}</div>`;
+      } finally { controller.signal.removeEventListener('abort', abortTab); }
+    };
+    panel.querySelector('.ldp-panel-close').addEventListener('click', () => closeReaderPanel(app));
+    panel.querySelector('.ldp-panel-tabs').addEventListener('click', (event) => {
+      const tab = event.target.closest('[data-tab]');
+      if (!tab) return;
+      state.tab = tab.dataset.tab; state.page = 0;
+      panel.querySelectorAll('.ldp-panel-tab').forEach((button) => button.classList.toggle('active', button === tab));
+      loadTab();
+    });
+    search.addEventListener('input', () => { state.page = 0; render(); });
+    panel.addEventListener('click', async (event) => {
+      const row = event.target.closest('.ldp-panel-item');
+      if (event.target.closest('.ldp-panel-item-main') && row && row.dataset.topicId) {
+        closeReaderPanel(app); app.loadTopic(row.dataset.topicId, Number(row.dataset.postNumber)); return;
+      }
+      if (event.target.closest('.ldp-panel-delete') && row) {
+        const button = event.target.closest('.ldp-panel-delete'); button.disabled = true;
+        try {
+          if (state.tab === 'responses') {
+            if (row.dataset.reactionType === 'like') {
+              await apiSend(`${BASE}/post_actions/${row.dataset.postId}?post_action_type_id=2`, 'DELETE');
+              if (app.loader) app.loader.updatePost(row.dataset.postId, (post) => {
+                const actions = Array.isArray(post.actions_summary) ? post.actions_summary.map((item) => Object.assign({}, item)) : [];
+                const like = actions.find((item) => Number(item.id) === 2);
+                if (like) { like.acted = false; like.count = Math.max(0, Number(like.count || 0) - 1); }
+                post.actions_summary = actions; return post;
+              });
+            } else if (row.dataset.postId && row.dataset.reactionId) {
+              await apiSend(`${BASE}/discourse-reactions/posts/${row.dataset.postId}/custom-reactions/${encodeURIComponent(row.dataset.reactionId)}/toggle.json`, 'PUT');
+              if (app.loader) app.loader.updatePost(row.dataset.postId, (post) => {
+                const reactions = Array.isArray(post.reactions) ? post.reactions.map((item) => Object.assign({}, item)) : [];
+                const reaction = reactions.find((item) => String(item.id) === row.dataset.reactionId);
+                if (reaction) reaction.count = Math.max(0, Number(reaction.count || 0) - 1);
+                post.reactions = reactions.filter((item) => Number(item.count) > 0);
+                post.current_user_reaction = null; return post;
+              });
+            }
+            state.responses = (state.responses || []).filter((item) => {
+              const postId = String(item.post_id || item.id || '');
+              const reactionId = String(item.reaction_id || item.reaction_value || item.reaction || '');
+              return postId !== row.dataset.postId || reactionId !== String(row.dataset.reactionId || '');
+            });
+            await invalidateCollectionCache('responses');
+          } else if (row.dataset.recordId) {
+            await apiSend(`${BASE}/bookmarks/${row.dataset.recordId}`, 'DELETE');
+            if (app.loader && row.dataset.postId) app.loader.updatePost(row.dataset.postId, {
+              bookmarked: false, bookmark_id: null,
+            });
+            state.bookmarks = (state.bookmarks || []).filter((item) => String(item.id || item.bookmark_id) !== row.dataset.recordId);
+            await invalidateCollectionCache('bookmarks');
+          }
+          render();
+        } catch (error) { alert('移除失败：' + error.message); }
+        finally { if (button.isConnected) button.disabled = false; }
+      } else if (event.target.closest('[data-panel-action="prev"]')) { state.page -= 1; render(); }
+      else if (event.target.closest('[data-panel-action="next"]')) { state.page += 1; render(); }
+    });
+    loadTab();
+  }
+
+  let READER_APP = null;
+  function createReaderApp() {
     const overlay = document.createElement('div');
-    overlay.className = 'ldp-overlay';
-    overlay.innerHTML = `
-      <div class="ldp-modal">
-        <div class="ldp-header">
-          <div style="flex:1">
-            <h2 class="ldp-title"><span class="ldp-sk ldp-sk-title"></span></h2>
-            <div class="ldp-topic-tags" hidden></div>
-            <div class="ldp-meta"><span class="ldp-sk ldp-sk-meta"></span></div>
+    overlay.className = 'ldp-overlay ldp-v2';
+    overlay.innerHTML = `<div class="ldp-modal" role="dialog" aria-modal="true" aria-labelledby="ldp-reader-title">
+      <header class="ldp-header">
+        <div class="ldp-header-line">
+          <img class="ldp-site-mark" src="${escAttr(document.querySelector('link[rel="icon"]')?.href || 'https://cdn3.ldstatic.com/optimized/4X/6/a/6/6a6affc7b1ce8140279e959d32671304db06d5ab_2_180x180.png')}" alt="">
+          <div class="ldp-header-main"><div class="ldp-title-lockup">
+            <div class="ldp-title-copy"><h2 class="ldp-title" id="ldp-reader-title"><span class="ldp-sk ldp-sk-title"></span></h2>
+              <div class="ldp-meta"><span class="ldp-sk ldp-sk-meta"></span><span class="ldp-topic-taxonomy"></span></div></div></div></div>
+          <button class="ldp-close ldp-header-close" title="关闭" aria-label="关闭">${READER_ICONS.close}</button>
+        </div>
+        <div class="ldp-toolbar">
+          <div class="ldp-toolbar-group">
+            <button class="ldp-toolbtn" data-reader-action="only-op" title="只看楼主">${READER_ICONS.filter}</button>
           </div>
           <div class="ldp-head-btns">
-            <button class="ldp-close" title="关闭">×</button>
+            <button class="ldp-toolbtn" data-reader-action="history" title="浏览历史">${READER_ICONS.history}</button>
+            <button class="ldp-toolbtn ldp-collections-tool" data-reader-action="collections" title="收藏与回应">${READER_ICONS.collection}</button>
+            <span class="ldp-tool-separator"></span>
+            <span class="ldp-obsidian-host"></span>
+            <button class="ldp-toolbtn" data-reader-action="refresh" title="清除当前主题缓存并刷新">${READER_ICONS.refresh}</button>
+            <span class="ldp-settings-host"></span>
           </div>
         </div>
-        <div class="ldp-body">
-          <div class="ldp-topic"></div>
-          <div class="ldp-comments-header">评论<span class="ldp-comments-count"></span></div>
-          <div class="ldp-load-up-tip"><span class="ldp-tip-icon">⌛</span>正在向上加载…</div>
-          <div class="ldp-up-sentinel"></div>
-          <div class="ldp-comments"><div class="ldp-comments-empty">暂无评论</div></div>
-          <div class="ldp-loading-tip"><span class="ldp-tip-icon">⌛</span>正在加载评论…</div>
-          <div class="ldp-down-sentinel"></div>
-          <div class="ldp-load-down-tip"><span class="ldp-tip-icon">⌛</span>正在向下加载…</div>
-          <div class="ldp-loadmask">${SKELETON_HTML}</div>
-        </div>
-        <div class="ldp-footer" hidden>
-          <button class="ldp-fbtn ldp-f-like" disabled title="点赞">
-            <svg viewBox="0 0 24 24" fill="currentColor">${ICONS.like}</svg>
-            <span class="ldp-f-like-count">0</span>
-          </button>
-          <button class="ldp-fbtn ldp-f-reply" title="回复帖子">
-            <svg viewBox="0 0 1024 1024" fill="currentColor">${ICONS.reply}</svg>
-            <span class="ldp-f-reply-count">0</span>
-          </button>
-          <button class="ldp-fbtn ldp-f-boost" title="给楼主发送Boost">
-            <svg viewBox="0 0 1024 1024" style="width:16px;height:16px;">${ICONS.boost}</svg>
-          </button>
-          <button class="ldp-fbtn ldp-f-bookmark" title="加入书签">
-            <svg viewBox="0 0 24 24" fill="currentColor">${ICONS.bookmark}</svg>
-          </button>
-          <a class="ldp-fbtn ldp-f-open" href="#" target="_blank" rel="noopener" title="打开原贴">
-            <svg viewBox="0 0 24 24" fill="currentColor">${ICONS.newTab}</svg>
-          </a>
-        </div>
-        <div class="ldp-slider" hidden>
-          <div class="ldp-slider-track"></div>
-          <div class="ldp-slider-thumb" title="拖动跳转楼层">1</div>
-          <div class="ldp-slider-tip">#1</div>
-        </div>
-      </div>`;
+      </header><div class="ldp-shell-host"></div>
+      <footer class="ldp-footer" hidden>
+        <button class="ldp-fbtn ldp-f-like" disabled title="点赞"><svg viewBox="0 0 24 24">${ICONS.like}</svg><span class="ldp-f-like-count">0</span></button>
+        <button class="ldp-fbtn ldp-f-reply" title="回复帖子"><svg viewBox="0 0 1024 1024">${ICONS.reply}</svg><span class="ldp-f-reply-count">0</span></button>
+        <button class="ldp-fbtn ldp-f-boost" title="给楼主发送 Boost"><svg viewBox="0 0 1024 1024">${ICONS.boost}</svg><span>Boost</span></button>
+        <button class="ldp-fbtn ldp-f-bookmark" title="收藏本帖"><svg viewBox="0 0 24 24">${ICONS.bookmark}</svg><span>收藏</span></button>
+        <a class="ldp-fbtn ldp-f-open" href="#" target="_blank" rel="noopener" title="打开原帖"><svg viewBox="0 0 24 24">${ICONS.newTab}</svg><span>原帖</span></a>
+      </footer>
+      <button class="ldp-new-posts" hidden></button></div>`;
     document.body.appendChild(overlay);
-    CURRENT_OVERLAY = overlay;
-
     const modal = overlay.querySelector('.ldp-modal');
-    const body = overlay.querySelector('.ldp-body');
-    const topicEl = overlay.querySelector('.ldp-topic');
-    const commentsEl = overlay.querySelector('.ldp-comments');
-    const countEl = overlay.querySelector('.ldp-comments-count');
-    const emptyEl = overlay.querySelector('.ldp-comments-empty');
-    const upSentinel = overlay.querySelector('.ldp-up-sentinel');
-    const downSentinel = overlay.querySelector('.ldp-down-sentinel');
-    const maskEl = overlay.querySelector('.ldp-loadmask');
-    const loadingTip = overlay.querySelector('.ldp-loading-tip');
-    const loadUpTip = overlay.querySelector('.ldp-load-up-tip');
-    const loadDownTip = overlay.querySelector('.ldp-load-down-tip');
-    const footerEl = overlay.querySelector('.ldp-footer');
-    const fLikeBtn = overlay.querySelector('.ldp-f-like');
-    const fLikeCountEl = overlay.querySelector('.ldp-f-like-count');
-    const fReplyBtn = overlay.querySelector('.ldp-f-reply');
-    const fReplyCountEl = overlay.querySelector('.ldp-f-reply-count');
-    const fBoostBtn = overlay.querySelector('.ldp-f-boost');
-    const fBookmarkBtn = overlay.querySelector('.ldp-f-bookmark');
-    const fOpenLink = overlay.querySelector('.ldp-f-open');
-    const floorNavigator = createFloorNavigator(overlay.querySelector('.ldp-slider'), body, topicId);
-
-    const tracker = createReadTracker(topicId, body);
-    const ctx = {
-      topicId, op: null, topicEl, commentsEl, countEl, emptyEl,
-      scrollRoot: body,
-      nodeMap: new Map(),
-      postMap: new Map(),
-      tracker,
-      totalComments: 0,
-      footerReplyCountEl: fReplyCountEl,
+    const app = {
+      overlay, modal, topicId: null, targetPostNumber: 1, topic: null, loader: null,
+      controller: null, virtualFlow: null, tracker: null, timeline: null, stopBase64: null,
+      repliesIO: null, refreshTimer: null, panelAbort: null, onlyOp: false, closed: false,
+      loadTopic: null, close: null,
     };
 
-    const close = () => {
-      abortController.abort(); // 取消所有进行中的请求
-      tracker.stop();
-      ctx.repliesIO?.disconnect();
-      floorNavigator.destroy();
-      closeUserCard();
+    const cleanupTopic = () => {
+      clearInterval(app.refreshTimer); app.refreshTimer = null;
+      if (app.controller) app.controller.abort();
+      if (app.virtualFlow) app.virtualFlow.destroy();
+      if (app.repliesIO) app.repliesIO.disconnect();
+      if (app.timeline) app.timeline.destroy();
+      if (app.tracker) app.tracker.stop();
+      if (app.loader) app.loader.destroy();
+      if (app.stopBase64) app.stopBase64();
+      closeEmojiPanels();
+      app.controller = app.virtualFlow = app.timeline = app.tracker = app.repliesIO = app.loader = app.stopBase64 = null;
+      flushHistoryEntries();
+    };
+
+    app.close = () => {
+      if (app.closed) return;
+      app.closed = true;
+      closeEmojiPanels(); closeReaderPanel(app); closeUserCard(); cleanupTopic();
+      document.removeEventListener('keydown', onKeyDown);
       overlay.remove();
       if (CURRENT_OVERLAY === overlay) CURRENT_OVERLAY = null;
-      document.removeEventListener('keydown', onEsc);
+      if (CURRENT_MODAL_CLOSE === app.close) CURRENT_MODAL_CLOSE = null;
+      if (READER_APP === app) READER_APP = null;
     };
-    function onEsc(e) { if (e.key === 'Escape') close(); }
-    overlay.querySelector('.ldp-close').addEventListener('click', close);
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-    document.addEventListener('keydown', onEsc);
-    overlay.ldpClose = close;
-
-    /* ---- 底部"已加载全部评论"提示 ---- */
-    function showBottomTip() {
-      if (!body.querySelector('.ldp-bottom-tip')) {
-        const tip = document.createElement('div');
-        tip.className = 'ldp-bottom-tip';
-        tip.textContent = '已加载全部评论';
-        body.insertBefore(tip, downSentinel.nextSibling);
-      }
+    function onKeyDown(event) {
+      if (event.key !== 'Escape' || document.querySelector('.ldp-lightbox') || CURRENT_USER_CARD) return;
+      if (closeEmojiPanels()) return;
+      if (modal.querySelector('.ldp-reader-panel')) closeReaderPanel(app); else app.close();
     }
+    document.addEventListener('keydown', onKeyDown);
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) app.close(); });
+    modal.querySelector('.ldp-close').addEventListener('click', app.close);
 
-    /* ---- 主初始化流程（嵌套树 API 加载） ---- */
-    let topicData = null;
-
-    try {
-      // ====== 阶段 1：加载嵌套树数据 ======
-      const mePromise = ensureMe().catch(() => {});
-
-      // 处理跳转到指定楼层的情况（包含通知跳转和已读跳未读）
-      let resolvedTarget = targetPostNumber;
-      let cachedTopicDetail = null;  // 缓存"已读跳未读"阶段拉到的话题详情，供后面复用，避免重复请求
-
-      // 如果是"已读跳未读"场景（targetPostNumber === 0），需要先获取已读进度
-      if (targetPostNumber === 0) {
-        // 先获取话题元数据以确定已读进度
-        try {
-          const metaRes = await fetch(`${BASE}/t/${topicId}.json?track_visit=true&forceLoad=true`, {
-            method: 'GET',
-            credentials: 'include',
-            cache: 'no-store',
-            headers: {
-              'Accept': 'application/json, text/javascript, */*; q=0.01',
-              'X-Requested-With': 'XMLHttpRequest',
-              'Discourse-Present': 'true',
-              'Discourse-Track-View': 'true',
-              'Discourse-Track-View-Topic-Id': String(topicId),
-            },
-          });
-          if (metaRes.ok) {
-            const metaData = await metaRes.json();
-            cachedTopicDetail = metaData;
-            const lastRead = metaData.last_read_post_number || 0;
-            const highest = metaData.highest_post_number || 1;
-            // 如果有未读评论，跳转到第一条未读
-            if (lastRead > 0 && lastRead < highest) {
-              resolvedTarget = lastRead + 1;
-            }
-          }
-        } catch (e) {
-          // 获取已读进度失败，忽略并从头加载
-        }
+    modal.querySelector('.ldp-toolbar').addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-reader-action]');
+      if (!button) return;
+      const action = button.dataset.readerAction;
+      if (action === 'history') showHistoryPanel(app);
+      else if (action === 'collections') showCollectionPanel(app);
+      else if (action === 'only-op' && app.virtualFlow) {
+        button.disabled = true;
+        app.onlyOp = !app.onlyOp;
+        button.classList.toggle('active', app.onlyOp);
+        try { await app.virtualFlow.setOnlyOp(app.onlyOp); }
+        finally { button.disabled = false; }
+      } else if (action === 'refresh' && app.topicId) {
+        const id = app.topicId, target = (app.virtualFlow && app.virtualFlow.getCurrentPost() || {}).post_number || app.targetPostNumber;
+        await invalidateTopicSnapshot(id); app.loadTopic(id, target, { forceNetwork: true });
       }
+    });
 
-      // 如果需要跳转到指定楼层（通知跳转或已读跳未读）
-      if (resolvedTarget && resolvedTarget > 1) {
-        // 使用扁平流 API 精确定位
-        try {
-          const anchorUrl = `${BASE}/t/${topicId}.json?post_number=${resolvedTarget}`;
-          const anchorRes = await fetch(anchorUrl, {
-            method: 'GET',
-            credentials: 'include',
-            cache: 'no-store',
-            headers: {
-              'Accept': 'application/json',
-              'X-Requested-With': 'XMLHttpRequest',
-            },
-          });
-          if (!anchorRes.ok) throw new Error('HTTP ' + anchorRes.status);
-          const anchorData = await anchorRes.json();
+    modal.querySelector('.ldp-new-posts').addEventListener('click', () => {
+      const target = Number(modal.querySelector('.ldp-new-posts').dataset.postNumber) || 1;
+      app.loadTopic(app.topicId, target, { forceNetwork: true });
+    });
 
-          const requestedTarget = resolvedTarget;
-          resolvedTarget = resolveTargetPostNumber(
-              resolvedTarget,
-              anchorData.post_stream?.posts || []
-          );
-          if (resolvedTarget !== requestedTarget) {
-            console.debug(
-                `[LinuxDo 增强阅读] 目标楼层 #${requestedTarget} 不可见，`
-                + `改为定位 #${resolvedTarget}`
-            );
-          }
-
-          idToPost.clear();
-          anchorData.post_stream.posts.forEach((post) => {
-            idToPost.set(post.id, post);
-            ctx.postMap.set(post.post_number, post);
-          });
-
-          // 提取基本信息
-          let opPost = anchorData.post_stream.posts.find(p => p.post_number === 1);
-          const opNotInWindow = !opPost;  // 标记楼主是否不在当前窗口
-
-          // 如果窗口中不包含楼主，从话题详情中获取（优先复用前面已拉取的缓存，避免重复请求）
-          if (opNotInWindow) {
-            if (cachedTopicDetail) {
-              opPost = cachedTopicDetail.post_stream.posts.find(p => p.post_number === 1);
-            } else {
-              try {
-                const topicDetailRes = await fetch(`${BASE}/t/${topicId}.json?track_visit=true&forceLoad=true`, {
-                  method: 'GET',
-                  credentials: 'include',
-                  cache: 'no-store',
-                  headers: { 'Accept': 'application/json' },
-                });
-
-                if (topicDetailRes.ok) {
-                  const topicDetail = await topicDetailRes.json();
-                  cachedTopicDetail = topicDetail;
-                  opPost = topicDetail.post_stream.posts.find(p => p.post_number === 1);
-                }
-              } catch (e) {
-                console.error('加载楼主帖子失败:', e);
-              }
-            }
-          }
-
-          // 如果仍然没有楼主数据，使用占位符
-          if (!opPost) {
-            const opUsername = (anchorData.details && anchorData.details.created_by && anchorData.details.created_by.username) || '未知';
-            opPost = {
-              id: anchorData.post_stream.stream ? anchorData.post_stream.stream[0] : 0,
-              post_number: 1,
-              username: opUsername,
-              name: opUsername,
-              cooked: '<p style="opacity: 0.5;">楼主帖子加载失败</p>',
-              created_at: anchorData.created_at || new Date().toISOString(),
-              actions_summary: [],
-              boosts: [],
-              can_boost: false,
-            };
-          }
-
-          ctx.op = opPost.username;
-          ctx.totalComments = anchorData.posts_count - 1;
-          floorNavigator.setTotal(
-              anchorData.highest_post_number || anchorData.posts_count || 1,
-              resolvedTarget
-          );
-
-          // 更新标题和元数据
-          overlay.querySelector('.ldp-title').textContent = anchorData.title;
-          overlay.querySelector('.ldp-meta').textContent =
-              `${anchorData.posts_count} 帖 · ${anchorData.views || 0} 浏览 · 楼主 @${ctx.op || '?'}`;
-          renderTopicTaxonomy(overlay, anchorData);
-          updateCommentsHeader(ctx);
-
-          await mePromise;
-          // 渲染 1 楼
-          const opNode = renderPost(opPost, false, ctx, 0);
-          ctx.topicEl.appendChild(opNode);
-          ctx.nodeMap.set(1, opNode);
-          ctx.postMap.set(1, opPost);
-          idToPost.set(opPost.id, opPost);
-          ctx.tracker.observe(opNode);
-
-          // 立即移除骨架屏
-          maskEl.classList.add('hide');
-          setTimeout(() => maskEl.remove(), 300);
-
-          // 绑定底部操作栏
-          fOpenLink.href = `${BASE}/t/${topicId}`;
-          bindBookmark(fBookmarkBtn, anchorData);
-          bindFooterLike(fLikeBtn, fLikeCountEl, opPost);
-
-          const canBoostOp = !!(opPost && opPost.can_boost);
-          if (!canBoostOp) { fBoostBtn.disabled = true; fBoostBtn.style.opacity = '0.4'; }
-          fBoostBtn.addEventListener('click', () => {
-            if (fBoostBtn.disabled) return;
-            const opNode = ctx.topicEl.querySelector('.ldp-post');
-            if (!opNode) return;
-            const wrap = opNode.querySelector(':scope > .ldp-boost-input-wrap');
-            if (!wrap) return;
-            const opening = !wrap.classList.contains('open');
-            wrap.classList.toggle('open', opening);
-            if (opening) { wrap.querySelector('.ldp-boost-input').focus(); wrap.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-          });
-
-          fReplyBtn.addEventListener('click', () => {
-            const opNode = ctx.topicEl.querySelector('.ldp-post');
-            if (!opNode) return;
-            const box = ensureReplyBox(opNode);
-            box.classList.toggle('open');
-            if (box.classList.contains('open')) { box.querySelector('textarea').focus(); box.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-          });
-          footerEl.hidden = false;
-          floorNavigator.refresh();
-
-          bindActions(modal, ctx);
-          tracker.start();
-
-          // 初始化 pending 数组（用于构建楼中楼）
-          ctx.pending = [];
-          const lazyReplyNodes = new Set();
-          ctx.repliesIO = {
-            observe: (node) => { if (node) lazyReplyNodes.add(node); },
-            disconnect: () => {},
-          };
-
-          // 保存完整的帖子流（用于双向加载）
-          const streamFull = anchorData.post_stream.stream || [];
-          const stream = streamFull.filter(id => {
-            const cached = anchorData.post_stream.posts.find(p => p.id === id);
-            return !(cached && cached.post_number === 1);
-          });
-
-          // 初始化双向加载状态
-          const postCache = new Map();
-          anchorData.post_stream.posts.forEach(p => postCache.set(p.id, p));
-
-          let upCursor = 0;
-          let downCursor = stream.length;
-          let topReached = false;
-          let bottomReached = false;
-          let loadingDown = false;
-          let loadingUp = false;
-          let isAnchoring = true;  // 锚定锁：定位完成前禁止触发加载
-
-          // 计算已加载的楼层范围
-          const loadedPostIds = new Set(anchorData.post_stream.posts.map(p => p.id));
-          const firstLoadedId = anchorData.post_stream.posts[0]?.id;
-          const lastLoadedId = anchorData.post_stream.posts[anchorData.post_stream.posts.length - 1]?.id;
-
-          if (firstLoadedId && streamFull.includes(firstLoadedId)) {
-            upCursor = streamFull.indexOf(firstLoadedId);
-            topReached = upCursor === 0;
-          }
-          if (lastLoadedId && streamFull.includes(lastLoadedId)) {
-            downCursor = streamFull.indexOf(lastLoadedId) + 1;
-            bottomReached = downCursor >= streamFull.length;
-          }
-
-          // 渲染目标楼层周围的帖子（使用 attachPost 构建楼中楼关系）
-          loadingTip.classList.add('show');
-          anchorData.post_stream.posts.forEach(post => {
-            if (post.post_number === 1) return;  // 已渲染
-            attachPost(post, ctx);
-          });
-          reflowPending(ctx);
-          loadingTip.classList.remove('show');
-
-          // 展开完整祖先链，等待滚动稳定后再高亮目标；失败时函数内部降级为扁平定位。
-          await locatePost(resolvedTarget, ctx);
-
-          // ====== 添加双向加载逻辑 ======
-          async function fetchPosts(postIds) {
-            if (!postIds || !postIds.length) return [];
-            const qs = postIds.map(id => `post_ids[]=${id}`).join('&');
-            const res = await fetchJSON(`${BASE}/t/${topicId}/posts.json?${qs}`);
-            return res.post_stream.posts || [];
-          }
-
-          async function loadDown() {
-            if (isAnchoring || loadingDown || bottomReached || downCursor >= streamFull.length) return;
-            loadingDown = true;
-            loadDownTip.classList.add('show');
-            try {
-              const batch = streamFull.slice(downCursor, Math.min(downCursor + PAGE_SIZE, streamFull.length));
-              if (batch.length === 0) {
-                bottomReached = true;
-                showBottomTip();
-                return;
-              }
-
-              const posts = await fetchPosts(batch);
-              posts.forEach(p => {
-                if (p.post_number === 1 || loadedPostIds.has(p.id)) return;
-                loadedPostIds.add(p.id);
-                attachPost(p, ctx);
-              });
-              reflowPending(ctx);
-
-              downCursor += batch.length;
-              bottomReached = downCursor >= streamFull.length;
-
-              if (bottomReached) showBottomTip();
-            } catch (e) {
-              console.error('向下加载失败:', e);
-            } finally {
-              loadingDown = false;
-              loadDownTip.classList.remove('show');
-            }
-          }
-
-          async function loadUp() {
-            if (isAnchoring || loadingUp || topReached || upCursor <= 0) return;
-            loadingUp = true;
-            loadUpTip.classList.add('show');
-            try {
-              const oldScrollHeight = body.scrollHeight;
-              const oldScrollTop = body.scrollTop;
-
-              const start = Math.max(0, upCursor - PAGE_SIZE);
-              const batch = streamFull.slice(start, upCursor);
-              if (batch.length === 0) {
-                topReached = true;
-                if (!body.querySelector('.ldp-top-tip')) {
-                  const tip = document.createElement('div');
-                  tip.className = 'ldp-top-tip';
-                  tip.textContent = '已是最早的评论';
-                  commentsEl.before(tip);
-                }
-                return;
-              }
-
-              const posts = await fetchPosts(batch);
-
-              // 按 stream 顺序处理帖子（不要反转）
-              // streamFull 中的顺序：[id1, id2, id3...] 对应楼层号顺序
-              // fetchPosts 返回的帖子顺序可能与请求顺序不同，需要按 stream 顺序重新排序
-              const postIdToPost = new Map(posts.map(p => [p.id, p]));
-              const orderedPosts = batch
-                  .map(id => postIdToPost.get(id))
-                  .filter(Boolean);
-
-              const fragment = document.createDocumentFragment();
-              const tempCtx = Object.assign({}, ctx, {
-                commentsEl: fragment,
-                nodeMap: ctx.nodeMap,
-                topicEl: ctx.topicEl,
-              });
-
-              orderedPosts.forEach(p => {
-                if (p.post_number === 1 || loadedPostIds.has(p.id)) return;
-                loadedPostIds.add(p.id);
-                attachPost(p, tempCtx);
-              });
-              reflowPending(tempCtx);
-
-              commentsEl.prepend(fragment);
-
-              // 高度补偿
-              requestAnimationFrame(() => {
-                const newScrollHeight = body.scrollHeight;
-                body.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
-              });
-
-              upCursor = start;
-              topReached = upCursor === 0;
-
-              if (topReached && !body.querySelector('.ldp-top-tip')) {
-                const tip = document.createElement('div');
-                tip.className = 'ldp-top-tip';
-                tip.textContent = '已是最早的评论';
-                commentsEl.before(tip);
-              }
-            } catch (e) {
-              console.error('向上加载失败:', e);
-            } finally {
-              loadingUp = false;
-              loadUpTip.classList.remove('show');
-            }
-          }
-
-          // 监听滚动事件
-          if (!bottomReached) {
-            const sentinelDownIO = new IntersectionObserver(
-                (entries) => { if (entries.some(en => en.isIntersecting) && !isAnchoring) loadDown(); },
-                { root: body, rootMargin: '300px' }
-            );
-            sentinelDownIO.observe(downSentinel);
-          }
-
-          if (!topReached) {
-            const sentinelUpIO = new IntersectionObserver(
-                (entries) => { if (entries.some(en => en.isIntersecting) && !isAnchoring) loadUp(); },
-                { root: body, rootMargin: '600px' }
-            );
-            sentinelUpIO.observe(upSentinel);
-          }
-
-          body.addEventListener('scroll', () => {
-            if (isAnchoring) return;
-            const { scrollTop, scrollHeight, clientHeight } = body;
-            if (scrollHeight - scrollTop - clientHeight < 400) loadDown();
-            if (scrollTop < 800) loadUp();
-          }, { passive: true });
-
-          // locatePost 已等待滚动真正停止，可以安全开放双向加载。
-          isAnchoring = false;
-
-          const repliesObserver = new IntersectionObserver((entries, observer) => {
-            entries.forEach((entry) => {
-              if (!entry.isIntersecting) return;
-              const node = entry.target;
-              observer.unobserve(node);
-              if (node.dataset.repliesLoaded === '1') return;
-
-              const postId = Number(node.dataset.postId);
-              const postNumber = Number(node.dataset.postNumber);
-              const loadingEl = node.querySelector(':scope > .ldp-sub-loading');
-              if (loadingEl) loadingEl.style.display = 'block';
-
-              loadAllChildren(postId, postNumber, null, ctx, true)
-                .catch((err) => {
-                  console.error(`[LinuxDo 增强阅读] 楼层 #${postNumber} 楼中楼自动加载失败:`, err);
-                  const actionsEl = node.querySelector(':scope > .ldp-sub-actions');
-                  if (actionsEl) actionsEl.style.display = 'block';
-                })
-                .finally(() => {
-                  if (loadingEl) loadingEl.style.display = 'none';
-                });
-            });
-          }, { root: body, rootMargin: '300px' });
-          ctx.repliesIO = repliesObserver;
-          lazyReplyNodes.forEach((node) => {
-            if (node.isConnected) repliesObserver.observe(node);
-          });
-          lazyReplyNodes.clear();
-
-          showBottomTip();
-
-        } catch (e) {
-          alert('加载失败：' + e.message);
-        }
-
-        return;  // 跳转场景直接返回，不加载完整嵌套树
-      }
-
-      // 正常浏览：加载嵌套树 API
-      let nestedResponse = await fetchNestedTree(topicId, 0);
-
-      if (Array.isArray(nestedResponse.post_stream?.posts)) {
-        const converted = standardTopicToNestedTree(nestedResponse);
-        if (!converted) throw new Error('服务器返回数据缺少 OP 帖子');
-        nestedResponse = converted;
-      }
-
-      // 检查服务器返回的是嵌套树还是扁平流（私有话题等）
-      if (nestedResponse.roots && nestedResponse.roots.length >= 0) {
-        // 成功获取嵌套树数据
-        const opPost = nestedResponse.op_post;
-        let roots = nestedResponse.roots;
-        const topicMeta = nestedResponse.topic;
-        nestedHasMoreRoots = nestedResponse.has_more_roots || false;
-        nestedRootsPage = nestedResponse.page || 0;
-        nestedTreeRoots = roots;
-
-        if (!opPost) {
-          throw new Error('服务器返回数据缺少 OP 帖子');
-        }
-
-        // 建立混合索引
-        idToPost.clear();
-        idToPost.set(opPost.id, opPost);
-        indexTree(roots);
-        ctx.postMap.clear();
-        ctx.postMap.set(1, opPost);
-        indexPostsByNumber(roots, ctx);
-
-        // 构造 topicData 对象（兼容后续逻辑）
-        topicData = {
-          id: topicMeta?.id || topicId,
-          title: topicMeta?.title || '',
-          posts_count: topicMeta?.posts_count || 1,
-          views: 0,
-          post_stream: {
-            posts: [opPost, ...roots],
-            stream: []
-          },
-          details: {
-            created_by: { username: opPost.username }
-          },
-          bookmarked: topicMeta?.bookmarked,
-          bookmark_id: topicMeta?.bookmark_id
+    app.loadTopic = async (topicId, targetPostNumber, options) => {
+      cleanupTopic(); closeReaderPanel(app); closeUserCard();
+      app.topicId = String(topicId); app.targetPostNumber = Number(targetPostNumber) || 0; app.onlyOp = false;
+      modal.querySelector('[data-reader-action="only-op"]').classList.remove('active');
+      modal.querySelector('.ldp-title').innerHTML = '<span class="ldp-sk ldp-sk-title"></span>';
+      modal.querySelector('.ldp-meta').innerHTML = '<span class="ldp-sk ldp-sk-meta"></span><span class="ldp-topic-taxonomy"></span>';
+      modal.querySelector('.ldp-new-posts').hidden = true;
+      modal.querySelectorAll('.ldp-f-open').forEach((link) => { link.href = `${BASE}/t/${topicId}`; });
+      modal.querySelector('.ldp-footer').hidden = true;
+      const shellHost = modal.querySelector('.ldp-shell-host');
+      shellHost.innerHTML = `<div class="ldp-shell"><div class="ldp-body"><div class="ldp-topic"></div>
+        <div class="ldp-comments-header">回应<span class="ldp-comments-count"></span></div><div class="ldp-comments"></div>
+        <div class="ldp-loadmask">${SKELETON_HTML}</div></div>
+        <aside class="ldp-timeline" aria-label="帖子时间轴"><button class="ldp-tl-date ldp-tl-top-date">顶部</button>
+          <div class="ldp-tl-current"><strong class="ldp-tl-current-post">1 / 1</strong><span class="ldp-tl-current-date">当前</span></div>
+          <button class="ldp-tl-track" role="slider" aria-label="滚动位置"><span class="ldp-tl-fill"></span><span class="ldp-tl-thumb"></span></button>
+          <button class="ldp-tl-date ldp-tl-bottom-date">底部</button></aside></div>`;
+      const shell = shellHost.querySelector('.ldp-shell');
+      const body = shell.querySelector('.ldp-body');
+      const topicEl = shell.querySelector('.ldp-topic');
+      const commentsEl = shell.querySelector('.ldp-comments');
+      const mask = shell.querySelector('.ldp-loadmask');
+      const controller = new AbortController();
+      app.controller = controller;
+      const loader = createLoaderV2(topicId, controller.signal);
+      app.loader = loader;
+      const tracker = createReadTracker(topicId, body);
+      app.tracker = tracker;
+      const ctx = {
+        topicId, op: null, topicEl, commentsEl, countEl: shell.querySelector('.ldp-comments-count'), emptyEl: null,
+        scrollRoot: body, nodeMap: new Map(), pending: [], tracker, totalComments: 0,
+        subReplyState: new Map(), subReplyCache: new Map(), windowEpoch: 1,
+        onPostsChanged: null, onMutation: () => { if (app.timeline) app.timeline.refresh(); },
+        signal: controller.signal, loader, topic: null, repliesIO: null, virtualFlow: null,
+      };
+      ctx.repliesIO = createRepliesIO(ctx);
+      app.repliesIO = ctx.repliesIO;
+      try {
+        const topic = await loader.init(targetPostNumber, options);
+        if (controller.signal.aborted) return;
+        app.topic = topic;
+        ctx.topic = topic;
+        ctx.op = topic._opUsername;
+        ctx.totalComments = Math.max(0, Number(topic.posts_count || topic.highest_post_number || 1) - 1);
+        ctx.lastReadPostNumber = Number(topic.last_read_post_number) || 0;
+        tracker.setReadWaterline(ctx.lastReadPostNumber);
+        modal.querySelector('.ldp-title').textContent = topic.title || `主题 ${topicId}`;
+        const resolveDomCategoryName = (catId) => {
+          if (!catId) return '';
+          const badge = document.querySelector(`.badge-category[data-category-id="${CSS.escape(String(catId))}"] .badge-category__name`);
+          return badge ? badge.textContent.trim() : '';
         };
-
-        ctx.op = opPost.username;
-        ctx.totalComments = (topicMeta?.posts_count || 1) - 1;  // 总评论数 = 总帖子数 - 楼主
-        floorNavigator.setTotal(
-            topicMeta?.highest_post_number || topicMeta?.posts_count || 1,
-            1
-        );
-
-        // 更新标题和元数据
-        overlay.querySelector('.ldp-title').textContent = topicMeta?.title || `话题 #${topicId}`;
-        overlay.querySelector('.ldp-meta').textContent =
-            `${topicMeta?.posts_count || 1} 帖 · 楼主 @${ctx.op || '?'}`;
-        renderTopicTaxonomy(overlay, topicMeta);
-        updateCommentsHeader(ctx);
-
-        await mePromise;
-        // 渲染 1 楼
-        const opNode = renderPost(opPost, false, ctx, 0);
-        ctx.topicEl.appendChild(opNode);
-        ctx.nodeMap.set(1, opNode);
-        ctx.tracker.observe(opNode);
-
-        // 立即移除骨架屏
-        maskEl.classList.add('hide');
-        setTimeout(() => maskEl.remove(), 300);
-
-        // 绑定底部操作栏
-        fOpenLink.href = `${BASE}/t/${topicId}`;
-        bindBookmark(fBookmarkBtn, topicData);
-        bindFooterLike(fLikeBtn, fLikeCountEl, opPost);
-
-        const canBoostOp = !!(opPost && opPost.can_boost);
-        if (!canBoostOp) { fBoostBtn.disabled = true; fBoostBtn.style.opacity = '0.4'; }
-        fBoostBtn.addEventListener('click', () => {
-          if (fBoostBtn.disabled) return;
-          const opNode = ctx.topicEl.querySelector('.ldp-post');
-          if (!opNode) return;
-          const wrap = opNode.querySelector(':scope > .ldp-boost-input-wrap');
-          if (!wrap) return;
-          const opening = !wrap.classList.contains('open');
-          wrap.classList.toggle('open', opening);
-          if (opening) { wrap.querySelector('.ldp-boost-input').focus(); wrap.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-        });
-
-        fReplyBtn.addEventListener('click', () => {
-          const opNode = ctx.topicEl.querySelector('.ldp-post');
-          if (!opNode) return;
-          const box = ensureReplyBox(opNode);
-          box.classList.toggle('open');
-          if (box.classList.contains('open')) { box.querySelector('textarea').focus(); box.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-        });
-        footerEl.hidden = false;
-        floorNavigator.refresh();
-
-        bindActions(modal, ctx);
-        tracker.start();
-
-        // ====== 阶段 2：渲染嵌套树 ======
-        loadingTip.classList.add('show');
-        try {
-          renderNestedTree(roots, commentsEl, ctx, 1);
-          loadingTip.classList.remove('show');
-
-          // 如果有更多顶层回复，添加滚动监听器
-          if (nestedHasMoreRoots) {
-            let isLoadingMore = false;  // 加载锁
-
-            // IntersectionObserver 监听底部哨兵
-            const sentinelDownIO = new IntersectionObserver(
-                (entries) => {
-                  if (entries.some((en) => en.isIntersecting) && !isLoadingMore) {
-                    loadMoreRoots();
-                  }
-                },
-                { root: body, rootMargin: '300px' }
-            );
-            sentinelDownIO.observe(downSentinel);
-
-            // scroll 事件兜底
-            body.addEventListener('scroll', () => {
-              if (isLoadingMore) return;
-              const { scrollTop, scrollHeight, clientHeight } = body;
-              if (scrollHeight - scrollTop - clientHeight < 400) {
-                loadMoreRoots();
-              }
-            }, { passive: true });
-
-            // 加载更多顶层回复
-            async function loadMoreRoots() {
-              if (!nestedHasMoreRoots || isLoadingMore) return;
-
-              isLoadingMore = true;
-              loadDownTip.classList.add('show');
-              try {
-                const nextPage = nestedRootsPage + 1;
-                const response = await fetchNestedTree(topicId, nextPage);
-
-                if (response.roots && response.roots.length > 0) {
-                  // 去重：过滤已存在的帖子
-                  const existingIds = new Set(nestedTreeRoots.map(r => r.id));
-                  const newRoots = response.roots.filter(r => !existingIds.has(r.id));
-
-                  if (newRoots.length > 0) {
-                    // 追加新数据到索引
-                    indexTree(newRoots);
-
-                    // 追加到内存树
-                    nestedTreeRoots = nestedTreeRoots.concat(newRoots);
-
-                    // 渲染新数据
-                    renderNestedTree(newRoots, commentsEl, ctx, 1);
-                  }
-
-                  // 更新状态
-                  nestedHasMoreRoots = response.has_more_roots || false;
-                  nestedRootsPage = response.page || nextPage;
-
-                  if (!nestedHasMoreRoots) {
-                    showBottomTip();
-                  }
-                } else {
-                  // 没有新数据，停止加载
-                  nestedHasMoreRoots = false;
-                  showBottomTip();
-                }
-              } catch (e) {
-                console.error('加载更多评论失败:', e);
-              } finally {
-                isLoadingMore = false;
-                loadDownTip.classList.remove('show');
-              }
-            }
-          } else {
-            showBottomTip();
+        const renderTaxonomy = (categoryName, tagList) => {
+          const taxonomy = [];
+          if (categoryName && categoryName !== '未分类') {
+            taxonomy.push(`<span class="ldp-topic-chip ldp-topic-category-chip">${esc(categoryName)}</span>`);
           }
-        } catch (err) {
-          loadingTip.classList.remove('show');
-          alert('渲染评论失败：' + err.message);
+          (tagList || []).forEach((tag) => {
+            const tagName = typeof tag === 'string' ? tag : (tag && tag.name);
+            if (tagName) taxonomy.push(`<span class="ldp-topic-chip">#${esc(tagName)}</span>`);
+          });
+          const target = modal.querySelector('.ldp-topic-taxonomy');
+          if (target) target.innerHTML = taxonomy.join('');
+        };
+        const category = topic.category_name || (topic.category && topic.category.name) || resolveDomCategoryName(topic.category_id);
+        modal.querySelector('.ldp-meta').innerHTML = `<span>${Number(topic.posts_count) || 1} 帖 · ${Number(topic.views) || 0} 浏览 · 楼主 @${esc(ctx.op || '?')}</span><span class="ldp-topic-taxonomy"></span>`;
+        renderTaxonomy(category, topic.tags);
+        if (!category && topic.category_id) {
+          getObsidianCategoryName(topic).then((name) => {
+            if (!controller.signal.aborted && String(app.topicId) === String(topicId)) renderTaxonomy(name, (app.topic && app.topic.tags) || topic.tags);
+          }).catch(() => {});
         }
-
-      } else if (nestedResponse.flat_topic) {
-        // 服务器返回扁平流（私有话题等）
-        alert('此话题不支持树形视图，请刷新页面使用标准视图');
-        return;
-      } else {
-        throw new Error('服务器返回数据格式异常');
+        shell.querySelector('.ldp-comments-count').textContent = `（${ctx.totalComments}）`;
+        let opNode = null;
+        if (topic._opPost) {
+          opNode = renderPost(topic._opPost, false, ctx);
+          topicEl.appendChild(opNode); tracker.observe(opNode);
+        }
+        const obsidianHost = modal.querySelector('.ldp-obsidian-host');
+        const obsidianActions = createObsidianActionGroup(topicId, () => app.topic);
+        const settingsButton = obsidianActions.querySelector('.ldp-obsidian-settings');
+        obsidianHost.replaceChildren(obsidianActions);
+        modal.querySelector('.ldp-settings-host').replaceChildren(settingsButton);
+        const oldFooter = modal.querySelector('.ldp-footer');
+        const footer = oldFooter.cloneNode(true); oldFooter.replaceWith(footer);
+        bindBookmarks([footer.querySelector('.ldp-f-bookmark')], topic);
+        app.stopBase64 = bindModalBase64Selection(shell);
+        bindActions(shell, ctx);
+        if (opNode) bindReaderFooter(footer, ctx, topic, opNode);
+        footer.hidden = false;
+        tracker.start();
+        const target = await loader.resolveThreadTarget(resolveInitialTarget(topic, targetPostNumber), controller.signal);
+        if (controller.signal.aborted) return;
+        const virtualFlow = createVirtualFlow(loader, ctx);
+        app.virtualFlow = virtualFlow;
+        ctx.virtualFlow = virtualFlow;
+        const controls = {
+          getStreamLength: () => loader.streamLength,
+          getTotalPosts: () => Number((loader.topic && (loader.topic.highest_post_number || loader.topic.posts_count)) || ctx.totalComments + 1),
+          getStreamIndex: (postId) => loader.getStreamIndex(postId),
+          scrollToTop: () => virtualFlow.scrollToTop(),
+          seekToIndex: async (index, postNumber) => {
+            if (Number(postNumber) <= 1) return virtualFlow.scrollToTop();
+            return virtualFlow.seekToIndex(index, postNumber, { smooth: true });
+          },
+        };
+        app.timeline = bindTimeline(shell, ctx, topic, controls);
+        ctx.onPostsChanged = app.timeline.refresh;
+        await virtualFlow.mountInitial(target);
+        if (controller.signal.aborted) return;
+        mask.classList.add('hide'); setTimeout(() => mask.remove(), 260);
+        rememberTopicHistory(topic, target.targetPostNumber || target.postNumber);
+        if (loader.refreshPromise) loader.refreshPromise.then((latest) => {
+          if (!latest || controller.signal.aborted || String(app.topicId) !== String(topicId)) return;
+          app.topic = latest; ctx.topic = latest; ctx.op = latest._opUsername || ctx.op;
+          ctx.totalComments = Math.max(0, Number(latest.posts_count || latest.highest_post_number || 1) - 1);
+          modal.querySelector('.ldp-title').textContent = latest.title || `主题 ${topicId}`;
+          const meta = modal.querySelector('.ldp-meta > span:first-child');
+          if (meta) meta.textContent = `${Number(latest.posts_count) || 1} 帖 · ${Number(latest.views) || 0} 浏览 · 楼主 @${ctx.op || '?'}`;
+          shell.querySelector('.ldp-comments-count').textContent = `（${ctx.totalComments}）`;
+          const categoryName = latest.category_name || (latest.category && latest.category.name) || resolveDomCategoryName(latest.category_id);
+          renderTaxonomy(categoryName, latest.tags);
+        }).catch(() => {});
+        app.refreshTimer = setInterval(async () => {
+          if (document.visibilityState !== 'visible' || controller.signal.aborted) return;
+          try {
+            const latest = await fetchJSON(`${BASE}/t/${topicId}.json`, {
+              signal: controller.signal, priority: 'background', dedupeKey: `new-posts:${BASE}:${topicId}:${Date.now() >> 15}`,
+            });
+            const currentTopic = loader.topic || topic;
+            const currentHighest = Number(currentTopic.highest_post_number || currentTopic.posts_count || 1);
+            const nextHighest = Number(latest.highest_post_number || latest.posts_count || 1);
+            if (nextHighest > currentHighest) {
+              const notice = modal.querySelector('.ldp-new-posts');
+              notice.textContent = `${nextHighest - currentHighest} 条新回应`;
+              notice.dataset.postNumber = String(nextHighest); notice.hidden = false;
+            }
+          } catch (error) { /* 后台检查失败不打断阅读 */ }
+        }, 45000);
+      } catch (error) {
+        if (error && error.name === 'AbortError') return;
+        mask.remove(); body.innerHTML = `<div class="ldp-error">加载失败：${esc(error.message)}</div>`;
       }
+    };
 
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        // 用户关闭弹框，静默退出
-        return;
-      }
-      // 加载失败，显示错误
-      if (maskEl) maskEl.remove();
-      body.innerHTML = `<div class="ldp-error">加载失败：${esc(err.message)}</div>`;
-    }
+    CURRENT_OVERLAY = overlay;
+    CURRENT_MODAL_CLOSE = app.close;
+    return app;
   }
 
-  /* ============ 15. 拦截标题/通知点击 ============ */
+  function openModalV2(topicId, targetPostNumber) {
+    closeUserCard();
+    if (!READER_APP || READER_APP.closed || !READER_APP.overlay.isConnected) READER_APP = createReaderApp();
+    return READER_APP.loadTopic(topicId, targetPostNumber);
+  }
+
+  let PAGE_COLLECTION_MENU = null;
+  function disposePageCollectionMenu() {
+    const current = PAGE_COLLECTION_MENU;
+    if (!current) return;
+    PAGE_COLLECTION_MENU = null;
+    if (current.app.panelAbort) current.app.panelAbort.abort();
+    current.button.setAttribute('aria-expanded', 'false');
+    current.button.classList.remove('active');
+    current.host.remove();
+    document.removeEventListener('pointerdown', current.onPointerDown, true);
+    document.removeEventListener('keydown', current.onKeyDown, true);
+    window.removeEventListener('resize', current.position);
+  }
+
+  function openPageCollectionMenu(button) {
+    if (!button) return;
+    if (PAGE_COLLECTION_MENU && PAGE_COLLECTION_MENU.button === button) {
+      closeReaderPanel(PAGE_COLLECTION_MENU.app);
+      return;
+    }
+    disposePageCollectionMenu();
+    const host = document.createElement('div');
+    host.className = 'ldp-page-collection-host';
+    document.body.appendChild(host);
+    const app = {
+      modal: host,
+      panelAbort: null,
+      onPanelClosed: disposePageCollectionMenu,
+      loadTopic(topicId, postNumber) {
+        disposePageCollectionMenu();
+        openModalV2(topicId, postNumber);
+      },
+    };
+    Object.defineProperty(app, 'loader', {
+      get() { return READER_APP && !READER_APP.closed ? READER_APP.loader : null; },
+    });
+    showCollectionPanel(app);
+    const panel = host.querySelector('.ldp-reader-panel');
+    if (!panel) {
+      disposePageCollectionMenu();
+      return;
+    }
+    panel.classList.add('ldp-page-collection-panel');
+    const position = () => {
+      if (!button.isConnected || !panel.isConnected) {
+        disposePageCollectionMenu();
+        return;
+      }
+      const rect = button.getBoundingClientRect();
+      const top = Math.max(8, Math.round(rect.bottom + 8));
+      panel.style.top = `${top}px`;
+      panel.style.height = `${Math.max(240, Math.min(560, window.innerHeight - top - 12))}px`;
+      if (window.innerWidth <= 560) {
+        panel.style.left = '8px';
+        panel.style.right = '8px';
+        panel.style.width = 'auto';
+      } else {
+        panel.style.left = 'auto';
+        const panelWidth = Math.min(420, window.innerWidth - 16);
+        const desiredRight = Math.round(window.innerWidth - rect.right);
+        const maxRight = Math.max(8, window.innerWidth - panelWidth - 8);
+        panel.style.right = `${Math.max(8, Math.min(maxRight, desiredRight))}px`;
+        panel.style.width = 'min(420px, calc(100vw - 16px))';
+      }
+    };
+    const onPointerDown = (event) => {
+      if (!host.contains(event.target) && !button.contains(event.target)) closeReaderPanel(app);
+    };
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') closeReaderPanel(app);
+    };
+    PAGE_COLLECTION_MENU = { app, host, button, panel, position, onPointerDown, onKeyDown };
+    button.setAttribute('aria-expanded', 'true');
+    button.classList.add('active');
+    position();
+    setTimeout(() => {
+      if (PAGE_COLLECTION_MENU && PAGE_COLLECTION_MENU.app === app) {
+        document.addEventListener('pointerdown', onPointerDown, true);
+      }
+    }, 0);
+    document.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('resize', position);
+  }
+
+  function startPageCollectionAction() {
+    let scheduled = false;
+    const ensureButton = () => {
+      scheduled = false;
+      const icons = document.querySelector('.d-header-icons');
+      const language = icons && icons.querySelector(':scope > .language-switcher');
+      const signedIn = icons && icons.querySelector(':scope > #current-user');
+      if (!icons || !signedIn) {
+        document.querySelectorAll('.ldp-page-collections-item').forEach((item) => item.remove());
+        if (PAGE_COLLECTION_MENU && !PAGE_COLLECTION_MENU.button.isConnected) disposePageCollectionMenu();
+        return;
+      }
+      let item = icons.querySelector(':scope > .ldp-page-collections-item');
+      if (!item) {
+        item = document.createElement('li');
+        item.className = 'header-dropdown-toggle ldp-page-collections-item';
+        item.innerHTML = `<button type="button" class="btn no-text btn-icon icon btn-flat ldp-page-collections-button"
+          title="收藏与回应" aria-label="收藏与回应" aria-haspopup="dialog" aria-expanded="false">${READER_ICONS.collection}</button>`;
+        icons.insertBefore(item, language || icons.firstElementChild);
+        item.querySelector('button').addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          openPageCollectionMenu(event.currentTarget);
+        });
+      } else if (language && item.nextElementSibling !== language) {
+        icons.insertBefore(item, language);
+      }
+    };
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(ensureButton);
+    };
+    const observer = new MutationObserver(schedule);
+    observer.observe(document.body, { childList: true, subtree: true });
+    schedule();
+  }
+
+  /* ============ 14. 拦截标题 / 通知点击 ============ */
   document.addEventListener('click', function (e) {
     const a = e.target.closest('a.title, a.raw-topic-link, a.search-link, a.search-result-topic, a[href*="/t/"]');
     if (!a || a.classList.contains('ldp-link-open') || a.classList.contains('ldp-f-open')) return;
-
-    const href = a.getAttribute('href') || '';
-    const parsed = parseTopicHref(href);
-    if (!parsed) return;
-
-    const inMenu = !!a.closest(MENU_PANEL_SEL);
-    const inSearch = !!a.closest(SEARCH_SEL);
-    const isTitle = a.classList.contains('title') || a.classList.contains('raw-topic-link')
-        || a.classList.contains('search-link') || a.classList.contains('search-result-topic');
-
+    const inMenu = !!a.closest(MENU_PANEL_SEL), inSearch = !!a.closest(SEARCH_SEL);
+    const isTitle = a.classList.contains('title') || a.classList.contains('raw-topic-link') || a.classList.contains('search-link') || a.classList.contains('search-result-topic');
     if (!isTitle && !inMenu && !inSearch) return;
-
-    e.preventDefault();
-    e.stopPropagation();
-
-    const { topicId, targetPostNumber } = parsed;
-
-    if (inMenu && targetPostNumber) {
-      // 通知面板点击：有具体楼层号 → 场景 C（直接跳指定楼层）
-      openModal(topicId, targetPostNumber);
-    } else if (isTitle || inSearch) {
-      // 列表页/搜索结果点击标题 → 场景 A/B 自动判断
-      // 传 0 触发"已读跳未读"逻辑，openModal 内部会检查 last_read_post_number
-      openModal(topicId, 0);
-    } else {
-      // 其他情况（菜单里的帖子链接，无具体楼层）→ 场景 A/B
-      openModal(topicId, 0);
-    }
+    const parsed = parseTopicHref(a.getAttribute('href') || '');
+    if (!parsed) return;
+    e.preventDefault(); e.stopPropagation();
+    const directTarget = inMenu && parsed.targetPostNumber ? parsed.targetPostNumber : 0;
+    openModalV2(parsed.topicId, directTarget);
   }, true);
+
+  startBase64MenuObserver();
+  startObsidianPageActions();
+  startPageCollectionAction();
 })();
