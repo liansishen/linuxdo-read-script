@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinuxDo 增强阅读
 // @namespace    https://linux.do/
-// @version      2.2.0
+// @version      2.2.1
 // @license      MIT
 // @description  在 LINUX DO 与 IDC Flare 高性能浮窗阅读帖子，支持默认楼中楼、自动载入新回复、全表情点赞回应、列表发帖时间列、右侧时间轴、投票、剧透、视频、公式、大图压缩上传、删帖、历史收藏、双栏资料卡和 Obsidian 快照。
 // @author       Fashion
@@ -671,18 +671,10 @@
     .ldp-v2 .ldp-actions{gap:3px;margin-top:7px;}
     .ldp-v2 .ldp-btn{min-width:27px;min-height:27px;border-radius:5px;}
     .ldp-post-bookmark.bookmarked{color:#a46015;background:#fff4df;}
-    .ldp-reaction-btn{gap:4px;}
-    .ldp-reaction-btn.reacted{color:#176c43;background:#e7f3ec;}
-    .ldp-reaction-img{width:16px;height:16px;display:inline-block;vertical-align:middle;object-fit:contain;pointer-events:none;}
-    .ldp-reaction-pills{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px;}
-    .ldp-reaction-pills:empty{display:none;}
-    .ldp-op-reactions{margin-top:8px;display:flex;}
-    .ldp-reaction-pill{display:inline-flex;align-items:center;gap:4px;min-height:24px;padding:2px 7px;
-      border:1px solid var(--primary-low,#dce2df);border-radius:999px;background:var(--primary-very-low,#f5f7f6);
-      color:var(--primary-medium,#55605a);font-size:11px;cursor:pointer;opacity:.92;transition:all .14s ease;}
-    .ldp-reaction-pill:hover{opacity:1;border-color:#85aa96;background:#edf6f1;color:#176c43;}
-    .ldp-reaction-pill.reacted{opacity:1;border-color:#5f9f7d;background:#e4f2ea;color:#176c43;font-weight:600;}
-    .ldp-reaction-count{margin-left:2px;font-size:11px;font-variant-numeric:tabular-nums;}
+    .ldp-like-icon,.ldp-f-like-icon{display:inline-flex;align-items:center;justify-content:center;line-height:1;}
+    .ldp-like.liked .ldp-reaction-char,.ldp-fbtn.liked .ldp-reaction-char{font-size:14px;line-height:1;}
+    .ldp-reaction-img{width:15px;height:15px;display:inline-block;vertical-align:middle;object-fit:contain;pointer-events:none;}
+    .ldp-f-like-icon .ldp-reaction-img{width:18px;height:18px;}
     .ldp-reply-summary{position:relative;}
     .ldp-reply-summary::before{content:"";position:absolute;left:3px;top:9px;bottom:9px;width:2px;border-radius:2px;background:#79aa90;}
     .ldp-reply-summary:not(.expanded) > .ldp-content{max-height:5.1em;overflow:hidden;mask-image:linear-gradient(#000 65%,transparent);}
@@ -1648,16 +1640,17 @@
     return Array.from(new Set(combined));
   }
 
-  function renderReactionPillsHtml(post) {
-    if (!post || !Array.isArray(post.reactions) || REACTIONS_AVAILABLE === false) return '';
-    const current = normalizeEmojiId(post.current_user_reaction && post.current_user_reaction.id);
-    const items = post.reactions.filter((r) => r && r.id && Number(r.count) > 0 && normalizeEmojiId(r.id) !== 'heart');
-    if (!items.length) return '';
-    return items.map((r) => {
-      const id = normalizeEmojiId(r.id);
-      const count = Math.max(0, Number(r.count) || 0);
-      return `<button type="button" class="ldp-reaction-pill ${current === id ? 'reacted' : ''}" data-reaction-id="${escAttr(id)}" title=":${escAttr(id)}:（点击切换回应）">${reactionIconHtml(id)}<span>${count}</span></button>`;
-    }).join('');
+  function getPostLikeView(post) {
+    const info = likeInfo(post || {});
+    const currentReaction = normalizeEmojiId(post && post.current_user_reaction && post.current_user_reaction.id);
+    const reactionsSum = (post && Array.isArray(post.reactions) ? post.reactions : [])
+      .reduce((sum, item) => sum + Math.max(0, Number(item && item.count) || 0), 0);
+    const count = Math.max(info.count, reactionsSum);
+    const acted = info.acted || !!currentReaction;
+    const isCustomReaction = !!(currentReaction && currentReaction !== 'heart');
+    const isOwnPost = !!(ME_USERNAME && post && post.username === ME_USERNAME);
+    const canInteract = !isOwnPost && (info.canAct || acted);
+    return { count, acted, canAct: info.canAct, currentReaction, isCustomReaction, canInteract };
   }
 
   function parseTopicHref(href) {
@@ -2648,7 +2641,20 @@
     return panel;
   }
 
+  let hoverReactionOpenTimer = 0;
+  let hoverReactionCloseTimer = 0;
+  let activeHoverReactionBtn = null;
+
+  function clearHoverReactionTimers() {
+    clearTimeout(hoverReactionOpenTimer);
+    clearTimeout(hoverReactionCloseTimer);
+    hoverReactionOpenTimer = 0;
+    hoverReactionCloseTimer = 0;
+    activeHoverReactionBtn = null;
+  }
+
   function closeEmojiPanels() {
+    clearHoverReactionTimers();
     let closed = false;
     document.querySelectorAll('.ldp-emoji-panel').forEach((panel) => {
       if (panel._ownerBtn) panel._ownerBtn._ldpEmojiPanel = null;
@@ -2681,10 +2687,11 @@
       panel.remove();
       triggerBtn._ldpEmojiPanel = null;
     });
-    mountFloatingEmojiPanel(triggerBtn, panel);
+    mountFloatingEmojiPanel(triggerBtn, panel, { autoFocus: true });
   }
 
-  function mountFloatingEmojiPanel(triggerBtn, panel) {
+  function mountFloatingEmojiPanel(triggerBtn, panel, options) {
+    const opts = options || {};
     panel._ownerBtn = triggerBtn;
     panel.style.position = 'fixed';
     document.body.appendChild(panel);
@@ -2712,8 +2719,10 @@
       };
       document.addEventListener('mousedown', closer, true);
     }, 0);
-    const si = panel.querySelector('.ldp-emoji-search input');
-    if (si) setTimeout(() => si.focus(), 50);
+    if (opts.autoFocus !== false) {
+      const si = panel.querySelector('.ldp-emoji-search input');
+      if (si) setTimeout(() => si.focus(), 50);
+    }
   }
 
   function renderBoosts(boosts) {
@@ -4003,13 +4012,7 @@
     const boostsHtml = isDeleted ? '' : renderBoosts(p.boosts || []);
     const canBoost = !isDeleted && p.can_boost === true;
     const canDelete = !isDeleted && isME && Number(p.post_number) !== 1;
-    const currentReaction = normalizeEmojiId(p.current_user_reaction && p.current_user_reaction.id);
-    const nonHeartReactionCount = (p.reactions || []).reduce((sum, item) => (
-      item && normalizeEmojiId(item.id) !== 'heart' ? sum + Math.max(0, Number(item.count) || 0) : sum
-    ), 0);
-    const validReactions = validReactionIds(ctx.topic, p);
-    const reactionPillsHtml = isDeleted ? '' : renderReactionPillsHtml(p);
-    const isOpRoot = Number(p.post_number) === 1;
+    const likeView = getPostLikeView(p);
 
     const lastReadPostNumber = Math.max(1, Number(
       ctx.tracker && ctx.tracker.getReadWaterline ? ctx.tracker.getReadWaterline() : ctx.lastReadPostNumber
@@ -4019,15 +4022,15 @@
     const actionsHtml = isDeleted
       ? ''
       : `<div class="ldp-actions">
-        <button class="ldp-btn ldp-like ${acted ? 'liked' : ''}"
-          data-acted="${acted ? '1' : '0'}" ${canAct || acted ? '' : 'disabled'} title="点赞">
-            <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;vertical-align:middle;">${ICONS.like}</svg>
-          <span class="ldp-like-count">${count}</span>
+        <button type="button" class="ldp-btn ldp-like ${likeView.acted ? 'liked' : ''}"
+          data-acted="${likeView.acted ? '1' : '0'}"
+          data-current-reaction="${escAttr(likeView.currentReaction)}"
+          ${likeView.canInteract ? '' : 'disabled'} title="点赞（悬停选择表情）">
+          <span class="ldp-like-icon">${likeView.isCustomReaction
+            ? reactionIconHtml(likeView.currentReaction)
+            : `<svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;vertical-align:middle;">${ICONS.like}</svg>`}</span>
+          <span class="ldp-like-count">${likeView.count}</span>
         </button>
-        ${REACTIONS_AVAILABLE !== false ? `<button type="button" class="ldp-btn ldp-reaction-btn ${currentReaction && currentReaction !== 'heart' ? 'reacted' : ''}"
-          data-current-reaction="${escAttr(currentReaction)}" data-valid-reactions="${escAttr(validReactions.join(','))}"
-          title="使用任意表情点赞/回应" aria-label="使用任意表情点赞/回应">${currentReaction && currentReaction !== 'heart' ? reactionIconHtml(currentReaction) : EMOJI_BTN_ICON}${nonHeartReactionCount ? `<span class="ldp-reaction-count">${nonHeartReactionCount}</span>` : ''}</button>` : ''}
-        <span class="ldp-reaction-pills">${reactionPillsHtml}</span>
         <button class="ldp-btn ldp-replybtn" title="回复">
             <svg viewBox="0 0 1024 1024" style="width:12px;height:12px;fill:currentColor;vertical-align:middle;">${ICONS.reply}</svg>
         </button>
@@ -4063,7 +4066,6 @@
         <span class="ldp-unread-dot" title="未读" aria-label="未读"></span>
       </div>
       <div class="ldp-content">${cooked}</div>
-      ${!isDeleted && isOpRoot ? `<div class="ldp-reaction-pills ldp-op-reactions">${reactionPillsHtml}</div>` : ''}
       ${isDeleted ? '' : `<div class="ldp-boosts-list">${boostsHtml}</div>
       <div class="ldp-boost-input-wrap">
         <input type="text" class="ldp-boost-input" maxlength="50"
@@ -4117,39 +4119,32 @@
 
   function syncRenderedPostState(root, post) {
     if (!root || !post || !post.id) return;
-    const { count, acted, canAct } = likeInfo(post);
-    const currentReaction = normalizeEmojiId(post.current_user_reaction && post.current_user_reaction.id);
-    const nonHeartReactionCount = (post.reactions || []).reduce((sum, item) => (
-      item && normalizeEmojiId(item.id) !== 'heart' ? sum + Math.max(0, Number(item.count) || 0) : sum
-    ), 0);
-    const pillsHtml = renderReactionPillsHtml(post);
+    const likeView = getPostLikeView(post);
     root.querySelectorAll(`.ldp-post[data-post-id="${CSS.escape(String(post.id))}"]`).forEach((node) => {
       const like = node.querySelector(':scope > .ldp-actions .ldp-like');
       if (like) {
-        like.classList.toggle('liked', acted);
-        like.dataset.acted = acted ? '1' : '0';
-        like.disabled = !(canAct || acted);
+        like.classList.toggle('liked', likeView.acted);
+        like.dataset.acted = likeView.acted ? '1' : '0';
+        like.dataset.currentReaction = likeView.currentReaction;
+        like.disabled = !likeView.canInteract;
+        const iconNode = like.querySelector('.ldp-like-icon');
+        if (iconNode) {
+          iconNode.innerHTML = likeView.isCustomReaction
+            ? reactionIconHtml(likeView.currentReaction)
+            : `<svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;vertical-align:middle;">${ICONS.like}</svg>`;
+        }
         const countNode = like.querySelector('.ldp-like-count');
-        if (countNode) countNode.textContent = String(count);
+        if (countNode) countNode.textContent = String(likeView.count);
       }
       const bookmark = node.querySelector(':scope > .ldp-actions .ldp-post-bookmark');
       if (bookmark) {
         bookmark.classList.toggle('bookmarked', !!post.bookmarked);
         bookmark.dataset.bookmarkId = String(post.bookmark_id || '');
       }
-      const reaction = node.querySelector(':scope > .ldp-actions .ldp-reaction-btn');
-      if (reaction) {
-        reaction.classList.toggle('reacted', !!(currentReaction && currentReaction !== 'heart'));
-        reaction.dataset.currentReaction = currentReaction;
-        reaction.innerHTML = `${currentReaction && currentReaction !== 'heart' ? reactionIconHtml(currentReaction) : EMOJI_BTN_ICON}${nonHeartReactionCount ? `<span class="ldp-reaction-count">${nonHeartReactionCount}</span>` : ''}`;
-      }
-      node.querySelectorAll(':scope > .ldp-actions > .ldp-reaction-pills, :scope > .ldp-op-reactions').forEach((pillsEl) => {
-        pillsEl.innerHTML = pillsHtml;
-      });
     });
   }
 
-  async function togglePostReaction(postId, rawReactionId, ctx, modal) {
+  async function togglePostReaction(postId, rawReactionId, ctx, syncRoot) {
     const reactionId = normalizeEmojiId(rawReactionId);
     if (!postId || !reactionId) return;
     try {
@@ -4189,26 +4184,94 @@
         });
       }
       const updated = ctx && ctx.loader && ctx.loader.getPostById(postId);
-      if (updated && modal) syncRenderedPostState(modal, updated);
+      if (updated && syncRoot) syncRenderedPostState(syncRoot, updated);
       invalidateCollectionCache('responses').catch(() => {});
       if (ctx && ctx.topicId) invalidateTopicSnapshot(ctx.topicId).catch(() => {});
     } catch (err) {
       if (err && err.status === 404) {
         REACTIONS_AVAILABLE = false;
-        if (modal) modal.querySelectorAll('.ldp-reaction-btn, .ldp-reaction-pills, .ldp-f-reaction').forEach((node) => node.remove());
+        if (reactionId === 'heart') {
+          await performDefaultHeartLike(postId, ctx, syncRoot);
+        }
       } else {
-        alert('表情回应操作失败：' + err.message);
+        alert('表情点赞失败：' + err.message);
       }
     }
   }
 
-  function toggleReactionEmojiPanel(triggerBtn, postId, ctx, modal) {
-    const existing = triggerBtn._ldpEmojiPanel;
-    if (existing && existing.parentNode) {
-      existing.remove();
-      triggerBtn._ldpEmojiPanel = null;
+  async function performDefaultHeartLike(postId, ctx, syncRoot) {
+    const post = (ctx && ctx.loader && ctx.loader.getPostById(postId))
+      || (ctx && ctx.topic && Number(ctx.topic._opPost?.id) === Number(postId) ? ctx.topic._opPost : null);
+    const view = getPostLikeView(post);
+    if (view.isCustomReaction && REACTIONS_AVAILABLE !== false) {
+      await togglePostReaction(postId, view.currentReaction, ctx, syncRoot);
       return;
     }
+    const nextActed = !view.acted;
+    if (nextActed) {
+      await apiSend(`${BASE}/post_actions`, 'POST', { id: postId, post_action_type_id: 2, flag_topic: false });
+    } else {
+      try {
+        await apiSend(`${BASE}/post_actions/${postId}?post_action_type_id=2`, 'DELETE');
+      } catch (err) {
+        if (REACTIONS_AVAILABLE !== false && view.currentReaction === 'heart') {
+          await togglePostReaction(postId, 'heart', ctx, syncRoot);
+          return;
+        }
+        throw err;
+      }
+    }
+    if (ctx && ctx.loader) {
+      ctx.loader.updatePost(postId, (current) => {
+        const actions = Array.isArray(current.actions_summary)
+          ? current.actions_summary.map((item) => Object.assign({}, item)) : [];
+        let like = actions.find((item) => Number(item.id) === 2);
+        if (!like) { like = { id: 2, can_act: true, count: 0 }; actions.push(like); }
+        like.acted = nextActed;
+        like.count = Math.max(0, Number(view.count) + (nextActed ? 1 : -1));
+        current.actions_summary = actions;
+        if (Array.isArray(current.reactions)) {
+          const reactions = current.reactions.map((item) => Object.assign({}, item));
+          let heart = reactions.find((entry) => normalizeEmojiId(entry.id) === 'heart');
+          if (nextActed) {
+            if (!heart) { heart = { id: 'heart', type: 'emoji', count: 0 }; reactions.push(heart); }
+            heart.count = Math.max(0, Number(heart.count || 0) + 1);
+          } else if (heart) {
+            heart.count = Math.max(0, Number(heart.count || 0) - 1);
+          }
+          current.reactions = reactions.filter((item) => Number(item.count) > 0);
+        }
+        current.current_user_reaction = nextActed ? { id: 'heart', type: 'emoji', can_undo: true } : null;
+        return current;
+      });
+    }
+    const updated = ctx && ctx.loader && ctx.loader.getPostById(postId);
+    if (updated && syncRoot) syncRenderedPostState(syncRoot, updated);
+    invalidateCollectionCache('responses').catch(() => {});
+    if (ctx && ctx.topicId) invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+  }
+
+  const LIKE_HOVER_OPEN_DELAY = 320;
+  const LIKE_HOVER_CLOSE_DELAY = 260;
+
+  function scheduleHoverReactionPanelClose(panel) {
+    clearTimeout(hoverReactionCloseTimer);
+    hoverReactionCloseTimer = setTimeout(() => {
+      hoverReactionCloseTimer = 0;
+      if (!panel || !panel.isConnected) return;
+      const searchInput = panel.querySelector('.ldp-emoji-search input');
+      if (searchInput && document.activeElement === searchInput) return;
+      if (panel.matches(':hover') || (panel._ownerBtn && panel._ownerBtn.isConnected && panel._ownerBtn.matches(':hover'))) {
+        return;
+      }
+      if (panel._ownerBtn) panel._ownerBtn._ldpEmojiPanel = null;
+      panel.remove();
+    }, LIKE_HOVER_CLOSE_DELAY);
+  }
+
+  function openHoverReactionPanel(triggerBtn, postId, ctx, syncRoot) {
+    if (!triggerBtn || !triggerBtn.isConnected || triggerBtn.disabled || REACTIONS_AVAILABLE === false) return;
+    if (triggerBtn._ldpEmojiPanel && triggerBtn._ldpEmojiPanel.isConnected) return;
     closeEmojiPanels();
     const post = (ctx && ctx.loader && ctx.loader.getPostById(postId))
       || (ctx && ctx.topic && Number(ctx.topic._opPost?.id) === Number(postId) ? ctx.topic._opPost : null);
@@ -4217,17 +4280,59 @@
       (post && post.current_user_reaction && post.current_user_reaction.id) || triggerBtn.dataset.currentReaction || '',
     );
     const panel = buildEmojiPanel((_code, emojiName) => {
-      panel.remove();
-      triggerBtn._ldpEmojiPanel = null;
-      togglePostReaction(postId, emojiName, ctx, modal);
+      closeEmojiPanels();
+      togglePostReaction(postId, emojiName, ctx, syncRoot);
     }, {
       quickReactions,
       currentReaction,
-      placeholder: '搜索全部表情进行点赞/回应…',
+      placeholder: '搜索全部表情点赞…',
     });
-    mountFloatingEmojiPanel(triggerBtn, panel);
+    mountFloatingEmojiPanel(triggerBtn, panel, { autoFocus: false });
+    panel.addEventListener('mouseenter', () => {
+      clearTimeout(hoverReactionCloseTimer);
+      hoverReactionCloseTimer = 0;
+    });
+    panel.addEventListener('mouseleave', (e) => {
+      if (triggerBtn.contains(e.relatedTarget)) return;
+      scheduleHoverReactionPanelClose(panel);
+    });
   }
 
+  function bindHoverLikeReaction(container, selector, resolvePostId, ctx, syncRoot) {
+    if (!container) return;
+    container.addEventListener('mouseover', (e) => {
+      const btn = e.target.closest(selector);
+      if (!btn || btn.disabled || REACTIONS_AVAILABLE === false) return;
+      if (btn._ldpEmojiPanel && btn._ldpEmojiPanel.isConnected) {
+        clearTimeout(hoverReactionCloseTimer);
+        hoverReactionCloseTimer = 0;
+        return;
+      }
+      if (activeHoverReactionBtn === btn && hoverReactionOpenTimer) return;
+      clearTimeout(hoverReactionOpenTimer);
+      activeHoverReactionBtn = btn;
+      hoverReactionOpenTimer = setTimeout(() => {
+        hoverReactionOpenTimer = 0;
+        if (activeHoverReactionBtn === btn) activeHoverReactionBtn = null;
+        if (!btn.isConnected || btn.disabled || !btn.matches(':hover')) return;
+        const pid = resolvePostId(btn);
+        if (pid) openHoverReactionPanel(btn, pid, ctx, syncRoot);
+      }, LIKE_HOVER_OPEN_DELAY);
+    });
+    container.addEventListener('mouseout', (e) => {
+      const btn = e.target.closest(selector);
+      if (!btn || btn.contains(e.relatedTarget)) return;
+      if (activeHoverReactionBtn === btn) {
+        clearTimeout(hoverReactionOpenTimer);
+        hoverReactionOpenTimer = 0;
+        activeHoverReactionBtn = null;
+      }
+      const panel = btn._ldpEmojiPanel;
+      if (panel && panel.isConnected && !panel.contains(e.relatedTarget)) {
+        scheduleHoverReactionPanelClose(panel);
+      }
+    });
+  }
   /* ============ 8. 回复框 ============ */
   function ensureReplyBox(post) {
     let box = post.querySelector(':scope > .ldp-replybox');
@@ -4680,6 +4785,20 @@
 
   /* ============ 10. 事件委托 ============ */
   function bindActions(modal, ctx) {
+    bindHoverLikeReaction(
+      modal,
+      '.ldp-like',
+      (btn) => btn.closest('.ldp-post')?.dataset.postId,
+      ctx,
+      modal,
+    );
+    if (ctx.scrollRoot) {
+      ctx.scrollRoot.addEventListener('scroll', () => {
+        if (hoverReactionOpenTimer || document.querySelector('.ldp-emoji-panel')) {
+          closeEmojiPanels();
+        }
+      }, { passive: true });
+    }
     // 先于站点和浏览器默认链接行为接管 Discourse 图片、黑色信息条和右下角放大控件。
     modal.addEventListener('click', (e) => {
       interceptImagePreviewClick(e, modal);
@@ -4778,36 +4897,18 @@
 
       const likeBtn = e.target.closest('.ldp-like');
       if (likeBtn && !likeBtn.disabled) {
-        const countEl = likeBtn.querySelector('.ldp-like-count'), acted = likeBtn.dataset.acted === '1';
+        closeEmojiPanels();
         likeBtn.disabled = true;
         try {
-          let nextCount;
-          if (!acted) {
-            await apiSend(`${BASE}/post_actions`, 'POST', { id: postId, post_action_type_id: 2, flag_topic: false });
-            nextCount = (+countEl.textContent) + 1;
-            syncCopies('.ldp-like', (button) => {
-              button.classList.add('liked'); button.dataset.acted = '1';
-              const count = button.querySelector('.ldp-like-count'); if (count) count.textContent = nextCount;
-            });
-          } else {
-            await apiSend(`${BASE}/post_actions/${postId}?post_action_type_id=2`, 'DELETE');
-            nextCount = Math.max(0, (+countEl.textContent) - 1);
-            syncCopies('.ldp-like', (button) => {
-              button.classList.remove('liked'); button.dataset.acted = '0';
-              const count = button.querySelector('.ldp-like-count'); if (count) count.textContent = nextCount;
-            });
+          await performDefaultHeartLike(postId, ctx, modal);
+        } catch (err) {
+          alert('操作失败：' + err.message);
+        } finally {
+          if (likeBtn.isConnected) {
+            const currentPost = ctx.loader && ctx.loader.getPostById(postId);
+            likeBtn.disabled = currentPost ? !getPostLikeView(currentPost).canInteract : false;
           }
-          if (ctx.loader) ctx.loader.updatePost(postId, (post) => {
-            const actions = Array.isArray(post.actions_summary) ? post.actions_summary.map((item) => Object.assign({}, item)) : [];
-            let like = actions.find((item) => Number(item.id) === 2);
-            if (!like) { like = { id: 2 }; actions.push(like); }
-            like.count = nextCount; like.acted = !acted;
-            post.actions_summary = actions;
-            return post;
-          });
-          invalidateCollectionCache('responses').catch(() => {});
-          invalidateTopicSnapshot(ctx.topicId).catch(() => {});
-        } catch (err) { alert('操作失败：' + err.message); } finally { likeBtn.disabled = false; }
+        }
         return;
       }
 
@@ -4839,26 +4940,6 @@
         return;
       }
 
-      const reactionPill = e.target.closest('.ldp-reaction-pill[data-reaction-id]');
-      if (reactionPill && !reactionPill.disabled) {
-        e.preventDefault();
-        e.stopPropagation();
-        reactionPill.disabled = true;
-        try {
-          await togglePostReaction(postId, reactionPill.dataset.reactionId, ctx, modal);
-        } finally {
-          if (reactionPill.isConnected) reactionPill.disabled = false;
-        }
-        return;
-      }
-
-      const reactionBtn = e.target.closest('.ldp-reaction-btn');
-      if (reactionBtn) {
-        e.preventDefault();
-        e.stopPropagation();
-        toggleReactionEmojiPanel(reactionBtn, postId, ctx, modal);
-        return;
-      }
 
       const replyBtn = e.target.closest('.ldp-replybtn');
       if (replyBtn) {
@@ -5350,9 +5431,8 @@
   function bindReaderFooter(footer, ctx, topic, opNode) {
     if (!footer || !opNode || !topic._opPost) return;
     const likeButton = footer.querySelector('.ldp-f-like');
+    const likeIconSlot = footer.querySelector('.ldp-f-like-icon');
     const likeCount = footer.querySelector('.ldp-f-like-count');
-    const reactionButton = footer.querySelector('.ldp-f-reaction');
-    const reactionIconSlot = footer.querySelector('.ldp-f-reaction-icon');
     const replyCount = footer.querySelector('.ldp-f-reply-count');
     const replyButton = footer.querySelector('.ldp-f-reply');
     const boostButton = footer.querySelector('.ldp-f-boost');
@@ -5363,57 +5443,33 @@
 
     const syncOpFooterState = (post) => {
       if (!post || Number(post.id) !== opId) return;
-      const info = likeInfo(post);
-      likeCount.textContent = String(info.count);
-      likeButton.classList.toggle('liked', info.acted);
-      likeButton.dataset.acted = info.acted ? '1' : '0';
-      likeButton.disabled = !(info.canAct || info.acted);
-      if (reactionButton) {
-        reactionButton.hidden = REACTIONS_AVAILABLE === false;
-        const currentReaction = normalizeEmojiId(post.current_user_reaction && post.current_user_reaction.id);
-        reactionButton.dataset.currentReaction = currentReaction;
-        reactionButton.classList.toggle('liked', !!(currentReaction && currentReaction !== 'heart'));
-        if (reactionIconSlot) {
-          reactionIconSlot.innerHTML = currentReaction && currentReaction !== 'heart'
-            ? reactionIconHtml(currentReaction)
-            : EMOJI_BTN_ICON;
-        }
+      const likeView = getPostLikeView(post);
+      likeCount.textContent = String(likeView.count);
+      likeButton.classList.toggle('liked', likeView.acted);
+      likeButton.dataset.acted = likeView.acted ? '1' : '0';
+      likeButton.dataset.currentReaction = likeView.currentReaction;
+      likeButton.disabled = !likeView.canInteract;
+      if (likeIconSlot) {
+        likeIconSlot.innerHTML = likeView.isCustomReaction
+          ? reactionIconHtml(likeView.currentReaction)
+          : `<svg viewBox="0 0 24 24">${ICONS.like}</svg>`;
       }
     };
     syncOpFooterState(ctx.loader.getPostById(opId) || topic._opPost);
     ctx.loader.subscribePosts((posts) => posts.forEach(syncOpFooterState));
-    if (reactionButton) {
-      reactionButton.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        toggleReactionEmojiPanel(reactionButton, opId, ctx, shellEl);
-      });
-    }
+    bindHoverLikeReaction(footer, '.ldp-f-like', () => opId, ctx, shellEl);
+
     likeButton.addEventListener('click', async () => {
-      const post = ctx.loader.getPostById(opId) || topic._opPost;
-      const info = likeInfo(post);
+      if (likeButton.disabled) return;
+      closeEmojiPanels();
       likeButton.disabled = true;
       try {
-        if (info.acted) await apiSend(`${BASE}/post_actions/${opId}?post_action_type_id=2`, 'DELETE');
-        else await apiSend(`${BASE}/post_actions`, 'POST', { id: opId, post_action_type_id: 2, flag_topic: false });
-        ctx.loader.updatePost(opId, (current) => {
-          const actions = Array.isArray(current.actions_summary)
-            ? current.actions_summary.map((item) => Object.assign({}, item)) : [];
-          let like = actions.find((item) => Number(item.id) === 2);
-          if (!like) { like = { id: 2, can_act: true }; actions.push(like); }
-          like.acted = !info.acted;
-          like.count = Math.max(0, Number(info.count) + (info.acted ? -1 : 1));
-          current.actions_summary = actions;
-          return current;
-        });
-        invalidateCollectionCache('responses').catch(() => {});
-        invalidateTopicSnapshot(ctx.topicId).catch(() => {});
+        await performDefaultHeartLike(opId, ctx, shellEl);
       } catch (error) {
-        syncOpFooterState(post);
+        syncOpFooterState(ctx.loader.getPostById(opId) || topic._opPost);
         alert('操作失败：' + error.message);
       }
     });
-
     replyButton.addEventListener('click', () => {
       const box = ensureReplyBox(opNode);
       box.classList.toggle('open');
@@ -5482,20 +5538,30 @@
       if (!cachedPosts.length) {
         return { post: null, postNumber: 1, ratio: 0, totalPosts, atBottom: false };
       }
-      const maxScroll = Math.max(0, body.scrollHeight - body.clientHeight);
+      const topSpacer = body.querySelector('.ldp-virtual-spacer-top');
       const bottomSpacer = body.querySelector('.ldp-virtual-spacer-bottom');
+      const topSpacerHeight = topSpacer ? topSpacer.offsetHeight : 0;
       const bottomSpacerHeight = bottomSpacer ? bottomSpacer.offsetHeight : 0;
-      const atTop = body.scrollTop <= 2;
-      const atRealBottom = bottomSpacerHeight <= 4
-        && (maxScroll <= 2 ? totalPosts <= cachedPosts.length : (maxScroll - body.scrollTop <= 6));
+      const windowNode = body.querySelector('.ldp-virtual-window');
+      const commentsReady = streamLength === 0 || !!(windowNode && windowNode.children.length > 0);
+      const maxScroll = Math.max(0, body.scrollHeight - body.clientHeight);
 
-      if (atTop && !(maxScroll <= 2 && totalPosts === 1)) {
+      // 无滚动条场景（一页内已完整展示全部楼层）：进度条直接满格并显示末尾总楼层
+      if (commentsReady && topSpacerHeight <= 4 && bottomSpacerHeight <= 4 && maxScroll <= 2) {
+        currentPost = cachedPosts[cachedPosts.length - 1];
+        return { post: currentPost, postNumber: totalPosts, ratio: 1, totalPosts, atBottom: true };
+      }
+
+      // 有滚动条且已滚动到真实底部
+      if (commentsReady && bottomSpacerHeight <= 4 && maxScroll > 2 && (maxScroll - body.scrollTop <= 6)) {
+        currentPost = cachedPosts[cachedPosts.length - 1];
+        return { post: currentPost, postNumber: totalPosts, ratio: 1, totalPosts, atBottom: true };
+      }
+
+      // 有滚动条且位于顶部
+      if (body.scrollTop <= 2) {
         currentPost = cachedPosts[0];
         return { post: currentPost, postNumber: 1, ratio: 0, totalPosts, atBottom: false };
-      }
-      if (atRealBottom) {
-        currentPost = cachedPosts[cachedPosts.length - 1];
-        return { post: currentPost, postNumber: totalPosts, ratio: totalPosts > 1 ? 1 : 0, totalPosts, atBottom: true };
       }
 
       const bodyRect = body.getBoundingClientRect();
@@ -5506,7 +5572,6 @@
         : 0;
       const probeY = bodyRect.top + baseOffset + tailProgress * Math.max(0, bodyRect.height - baseOffset - 8);
 
-      // 在已挂载楼层中寻找覆盖或最接近 probeY 的最深楼层节点，避免滚到底部仍停在视口首条楼层
       let matched = null;
       for (let i = 0; i < cachedPosts.length; i++) {
         const candidate = cachedPosts[i];
@@ -5543,6 +5608,8 @@
         } else if (totalPosts > 1) {
           baseRatio = Math.max(0, Math.min(1, (postNumber - 1) / (totalPosts - 1)));
         }
+      } else if (maxScroll > 2) {
+        baseRatio = Math.max(0, Math.min(1, body.scrollTop / maxScroll));
       }
       const ratio = tailProgress > 0
         ? Math.max(baseRatio, baseRatio + (1 - baseRatio) * tailProgress)
@@ -5727,6 +5794,7 @@
     track.addEventListener('keydown', onTrackKeydown);
     body.addEventListener('scroll', schedule, { passive: true });
     resizeObserver.observe(track);
+    resizeObserver.observe(body);
     resizeObserver.observe(ctx.topicEl);
     resizeObserver.observe(ctx.commentsEl);
     refresh();
@@ -7486,8 +7554,7 @@
         </div>
       </header><div class="ldp-shell-host"></div>
       <footer class="ldp-footer" hidden>
-        <button class="ldp-fbtn ldp-f-like" disabled title="点赞"><svg viewBox="0 0 24 24">${ICONS.like}</svg><span class="ldp-f-like-count">0</span></button>
-        <button class="ldp-fbtn ldp-f-reaction" type="button" title="使用任意表情回应楼主"><span class="ldp-f-reaction-icon">${EMOJI_BTN_ICON}</span><span>表情</span></button>
+        <button class="ldp-fbtn ldp-f-like" disabled title="点赞（悬停选择表情）"><span class="ldp-f-like-icon"><svg viewBox="0 0 24 24">${ICONS.like}</svg></span><span class="ldp-f-like-count">0</span></button>
         <button class="ldp-fbtn ldp-f-reply" title="回复帖子"><svg viewBox="0 0 1024 1024">${ICONS.reply}</svg><span class="ldp-f-reply-count">0</span></button>
         <button class="ldp-fbtn ldp-f-boost" title="给楼主发送 Boost"><svg viewBox="0 0 1024 1024">${ICONS.boost}</svg><span>Boost</span></button>
         <button class="ldp-fbtn ldp-f-bookmark" title="收藏本帖"><svg viewBox="0 0 24 24">${ICONS.bookmark}</svg><span>收藏</span></button>
@@ -7683,6 +7750,8 @@
         app.timeline = bindTimeline(shell, ctx, topic, controls);
         ctx.onPostsChanged = app.timeline.refresh;
         await virtualFlow.mountInitial(target);
+        app.timeline.refresh();
+        requestAnimationFrame(() => { if (app.timeline) app.timeline.refresh(); });
         if (controller.signal.aborted) return;
         mask.classList.add('hide'); setTimeout(() => mask.remove(), 260);
         rememberTopicHistory(topic, target.targetPostNumber || target.postNumber);
