@@ -8,6 +8,9 @@
 // @match        https://linux.do/*
 // @match        https://idcflare.com/*
 // @icon         https://cdn3.ldstatic.com/optimized/4X/6/a/6/6a6affc7b1ce8140279e959d32671304db06d5ab_2_180x180.png
+// @homepageURL  https://github.com/liansishen/linuxdo-read-script
+// @updateURL    https://raw.githubusercontent.com/liansishen/linuxdo-read-script/main/LinuxDo%20%E5%A2%9E%E5%BC%BA%E9%98%85%E8%AF%BB.user.js
+// @downloadURL  https://raw.githubusercontent.com/liansishen/linuxdo-read-script/main/LinuxDo%20%E5%A2%9E%E5%BC%BA%E9%98%85%E8%AF%BB.user.js
 // @grant        unsafeWindow
 // @grant        GM.getValue
 // @grant        GM.setValue
