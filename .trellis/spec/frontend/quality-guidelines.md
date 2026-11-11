@@ -58,6 +58,12 @@ Questions to answer:
 - Inline SVG paths or resolved `<symbol>` markup must be used instead of bare `<use href="#...">` so the icon still renders on list pages where Discourse has not injected topic-only SVG symbols.
 - Append `.ldp-device-tooltip` to `.ldp-overlay` with `textContent` (`回复自 ${ios_device_name}`) and close it on scroll, outside click, or `Escape` before closing the modal.
 
+### Rate-Limit & Background Sync Discipline (`429` Prevention)
+
+- `createReadTracker` must follow Discourse `screen-track.js` cadence: 60s normal flush interval, rush flush only when an unreported floor above `readWaterline` crosses `READ_THRESHOLD`, 3-minute idle pause without scroll/pointer/wheel activity, 6-minute per-post timing cap, `'Discourse-Background': 'true'` header, and immediate backoff respecting `globalCooldownUntil` / `Retry-After` / `extras.wait_seconds`.
+- `apiSend` must propagate HTTP `429` (`Retry-After` or JSON `extras.wait_seconds`) into `setGlobalCooldown` so write endpoints and GET queues share cooldown state.
+- `message-bus` `/topic/{id}` events carry `payload.id` for non-creation events (`acted`, `rebaked`, `liked`, etc.). Only `payload.type === 'created'` may trigger new-reply fetching, and when `payload.id` is present it must fetch `/t/{id}/posts.json?post_ids[]={id}` (`maxAttempts: 0`) instead of reloading `/t/{id}.json?track_visit=false`.
+
 ---
 
 ## Testing Requirements

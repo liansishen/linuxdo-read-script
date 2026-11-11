@@ -1,6 +1,6 @@
 {
   "name": "linuxdo-read-script",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "private": true,
   "scripts": {
     "check": "node --check \"LinuxDo 增强阅读.user.js\"",

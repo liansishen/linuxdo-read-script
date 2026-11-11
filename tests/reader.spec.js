@@ -83,9 +83,10 @@ async function bootReader(page, options = {}) {
     }
     if (url.pathname === `/t/${TOPIC_ID}.json`) {
       const target = Number(url.searchParams.get('post_number'));
+      const trackVisit = url.searchParams.get('track_visit');
       const postCount = (options.topicState && options.topicState.postCount) || POST_COUNT;
       const missing = Number(options.missingPostNumber) || 0;
-      requests.push({ type: target ? 'anchor' : 'topic', target, at: Date.now() });
+      requests.push({ type: target ? 'anchor' : (trackVisit === 'false' ? 'auto-sync' : 'topic'), target, at: Date.now() });
       const topicOptions = Object.assign({ postCount }, options.topicState || {});
       const anchorPosts = target === missing ? [buildPost(Math.max(1, target - 1))] : [buildPost(target)];
       await route.fulfill({ json: target ? topicPayload(anchorPosts, topicOptions) : topicPayload([buildPost(1)], topicOptions) });
@@ -129,6 +130,16 @@ async function bootReader(page, options = {}) {
       return;
     }
     if (url.pathname === '/topics/timings') {
+      const headers = route.request().headers();
+      requests.push({ type: 'timings', at: Date.now(), background: headers['discourse-background'] || '' });
+      if (options.timingsRateLimit) {
+        await route.fulfill({
+          status: 429,
+          headers: { 'Retry-After': String(options.timingsRetryAfter || 8) },
+          json: { errors: ['Slow down'], extras: { wait_seconds: options.timingsRetryAfter || 8 } },
+        });
+        return;
+      }
       await route.fulfill({ json: { success: 'OK' } });
       return;
     }
@@ -1178,4 +1189,58 @@ test('renders iOS and Mac device icons to the right of user level with hover/cli
   await expect(page.locator('.ldp-device-tooltip')).toHaveCount(0);
   await expect(macDevice).toHaveAttribute('aria-expanded', 'false');
   await expect(page.locator('.ldp-v2 .ldp-modal')).toBeVisible();
+});
+
+test('throttles timings on 429 and ignores non-created message-bus events while fetching created post IDs directly', async ({ page }) => {
+  const requests = await bootReader(page, {
+    target: 12,
+    timingsRateLimit: true,
+    timingsRetryAfter: 10,
+  });
+  await page.route(`https://linux.do/message-bus/**`, async (route) => {
+    const body = await route.request().postData() || '';
+    if (body.includes('acted')) {
+      await route.fulfill({
+        json: [[`/topic/${TOPIC_ID}`, { id: postId(12), post_number: 12, type: 'acted' }, 1]],
+      });
+      return;
+    }
+    await route.fulfill({
+      json: [[`/topic/${TOPIC_ID}`, { id: postId(POST_COUNT + 1), post_number: POST_COUNT + 1, type: 'created' }, 2]],
+    });
+  });
+
+  // Unread floor 12 triggers initial rush timings once, then 429 Retry-After blocks repeated 5s spam
+  await expect.poll(() => requests.filter((r) => r.type === 'timings').length, { timeout: 5000 }).toBe(1);
+  expect(requests.find((r) => r.type === 'timings').background).toBe('true');
+
+  // During the 10s 429 cooldown, neither another timings POST noracted message-bus triggers full topic sync
+  await page.evaluate(() => fetch('/message-bus/client/poll', { method: 'POST', body: 'acted' }));
+  await page.waitForTimeout(2200);
+  expect(requests.filter((r) => r.type === 'timings')).toHaveLength(1);
+  expect(requests.filter((r) => r.type === 'auto-sync')).toHaveLength(0);
+
+  // On normal non-cooldown session, created message-bus pulls posts.json?post_ids[]=... instead of /t/42.json?track_visit=false
+  await page.click('.ldp-header-close');
+  const liveRequests = await bootReader(page, { target: 10 });
+  await page.route(`https://linux.do/message-bus/**`, async (route) => {
+    const body = await route.request().postData() || '';
+    if (body.includes('acted')) {
+      await route.fulfill({
+        json: [[`/topic/${TOPIC_ID}`, { id: postId(10), post_number: 10, type: 'acted' }, 1]],
+      });
+      return;
+    }
+    await route.fulfill({
+      json: [[`/topic/${TOPIC_ID}`, { id: postId(POST_COUNT + 1), post_number: POST_COUNT + 1, type: 'created' }, 2]],
+    });
+  });
+  await page.evaluate(() => fetch('/message-bus/client/poll', { method: 'POST', body: 'acted' }));
+  await page.waitForTimeout(700);
+  expect(liveRequests.filter((r) => r.type === 'auto-sync')).toHaveLength(0);
+
+  await page.evaluate(() => fetch('/message-bus/client/poll', { method: 'POST', body: 'created' }));
+  await expect.poll(() => liveRequests.some((r) => r.type === 'posts' && r.ids.includes(postId(POST_COUNT + 1)))).toBe(true);
+  expect(liveRequests.filter((r) => r.type === 'auto-sync')).toHaveLength(0);
+  await expect(page.locator('.ldp-new-posts')).toContainText('已自动载入 1 条新回复');
 });

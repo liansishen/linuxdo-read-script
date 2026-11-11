@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinuxDo 增强阅读
 // @namespace    https://linux.do/
-// @version      2.2.3
+// @version      2.2.4
 // @license      MIT
 // @description  在 LINUX DO 与 IDC Flare 高性能浮窗阅读帖子，支持默认楼中楼、自动载入新回复、全表情点赞回应、列表发帖时间列、右侧时间轴、投票、剧透、视频、公式、大图压缩上传、删帖、历史收藏、双栏资料卡和 Obsidian 快照。
 // @author       Fashion
@@ -29,7 +29,10 @@
   const PAGE_SIZE = 40;
   const MAX_RENDERED_POSTS = 72;
   const READ_THRESHOLD = 1500;
-  const FLUSH_INTERVAL = 5000;
+  const FLUSH_INTERVAL = 60000;
+  const TIMINGS_IDLE_PAUSE_MS = 3 * 60 * 1000;
+  const TIMINGS_MAX_POST_TIME_MS = 6 * 60 * 1000;
+  const TIMINGS_BACKOFF_DELAYS = [5000, 10000, 20000, 40000];
   let ME_USERNAME = null;
   let ME_USER = null;
   let ME_STATE = 'unknown';
@@ -37,8 +40,8 @@
   // --- 楼中楼默认展开分批加载 & 自动载入新回复配置 ---
   const SUB_REPLY_INITIAL_SIZE = 5;   // 楼中楼默认自动展开条数
   const SUB_REPLY_PAGE_SIZE = 20;     // 点击“展示更多回复”每次追加条数
-  const REPLIES_HOVER_DELAY = 200;    // 楼层进入视口后触发楼中楼补全延迟(ms)
-  const AUTO_REFRESH_INTERVAL = 15000;// 自动检查并载入新回复间隔(ms)
+  const REPLIES_HOVER_DELAY = 250;    // 楼层进入视口后触发楼中楼补全延迟(ms)
+  const AUTO_REFRESH_INTERVAL = 45000;// 自动检查并载入新回复兜底轮询间隔(ms)
   const AUTO_LOAD_REPLIES_KEY = 'ldp-auto-load-replies';
   const TOPIC_LIVE_LISTENERS = new Set();
 
@@ -173,10 +176,10 @@
   }
 
   // --- 全局只读请求队列 & HTTP 429 退避重试 ---
-  const REQUEST_MIN_INTERVAL = 100;   // 相邻 GET 请求最小间隔(ms)
-  const REQUEST_MAX_CONCURRENCY = 3;
+  const REQUEST_MIN_INTERVAL = 180;   // 相邻 GET 请求最小间隔(ms)
+  const REQUEST_MAX_CONCURRENCY = 2;
   const RETRY_MAX_ATTEMPTS = 3;       // 429 最多重试次数（不含首次请求）
-  const RETRY_BASE_DELAY = 500;       // 无 Retry-After 时的指数退避基础延迟(ms)
+  const RETRY_BASE_DELAY = 1000;      // 无 Retry-After 时的指数退避基础延迟(ms)
   const SLICE_RADIUS = 20;            // 定位楼层前后各预加载的窗口半径
   const TOPIC_CACHE_FRESH_MS = 90 * 1000;
   const TOPIC_CACHE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1095,6 +1098,7 @@
     });
     delete fetchOptions.priority;
     delete fetchOptions.dedupeKey;
+    delete fetchOptions.maxAttempts;
 
     throwIfAborted(signal);
     const res = await fetch(url, fetchOptions);
@@ -1104,7 +1108,14 @@
     error.url = String(url);
     error.attempt = attempt;
     if (res.status === 429) {
-      const retryAfter = parseRetryAfter(res.headers.get('Retry-After'));
+      let retryAfter = parseRetryAfter(res.headers.get('Retry-After'));
+      if (retryAfter === null) {
+        try {
+          const data = await res.clone().json();
+          const waitSeconds = Number(data && data.extras && data.extras.wait_seconds);
+          if (Number.isFinite(waitSeconds) && waitSeconds > 0) retryAfter = waitSeconds * 1000;
+        } catch (e) {}
+      }
       error.retryDelay = retryAfter === null ? RETRY_BASE_DELAY * Math.pow(2, attempt) : retryAfter;
     }
     throw error;
@@ -1118,14 +1129,18 @@
 
   async function fetchWithRetry(url, options) {
     const opts = options || {};
+    const maxAttempts = Number.isInteger(opts.maxAttempts) && opts.maxAttempts >= 0
+      ? opts.maxAttempts : RETRY_MAX_ATTEMPTS;
     for (let attempt = 0; ; attempt++) {
       try {
         return await queueRequest(
           () => fetchOnce(url, opts, attempt), opts.signal, opts.priority
         );
       } catch (error) {
-        if (!error || error.status !== 429 || attempt >= RETRY_MAX_ATTEMPTS) throw error;
-        setGlobalCooldown(Date.now() + Math.max(0, Number(error.retryDelay) || 0), true);
+        if (error && error.status === 429) {
+          setGlobalCooldown(Date.now() + Math.max(0, Number(error.retryDelay) || RETRY_BASE_DELAY), true);
+        }
+        if (!error || error.status !== 429 || attempt >= maxAttempts) throw error;
         await waitForGlobalCooldown(opts.signal);
       }
     }
@@ -1282,8 +1297,10 @@
     const res = await fetch(url, opt);
     if (!res.ok) {
       let message = 'HTTP ' + res.status;
+      let waitSeconds = 0;
       try {
         const data = await res.json();
+        waitSeconds = Number(data && data.extras && data.extras.wait_seconds) || 0;
         const errors = Array.isArray(data.errors)
           ? data.errors.map((item) => typeof item === 'string' ? item : (item && item.message))
               .filter((item) => typeof item === 'string' && item.trim())
@@ -1293,6 +1310,12 @@
       } catch (e) { /* keep HTTP status fallback */ }
       const error = new Error(message);
       error.status = res.status;
+      if (res.status === 429) {
+        const retryAfter = parseRetryAfter(res.headers.get('Retry-After'));
+        const delay = retryAfter !== null ? retryAfter : (waitSeconds > 0 ? waitSeconds * 1000 : 10000);
+        error.retryDelay = delay;
+        setGlobalCooldown(Date.now() + delay, true);
+      }
       throw error;
     }
     return res.json().catch(() => ({}));
@@ -3665,7 +3688,15 @@
     const visible = new Set();
     let readWaterline = 1;
     let lastTick = Date.now();
-    let tickTimer = null, flushTimer = null;
+    let lastActivityAt = Date.now();
+    let lastFlushAt = Date.now();
+    let blockSendingUntil = 0;
+    let failureCount = 0;
+    let inFlight = false;
+    let stopped = false;
+    let tickTimer = null;
+
+    const noteActivity = () => { lastActivityAt = Date.now(); };
 
     const io = new IntersectionObserver((entries) => {
       entries.forEach((en) => {
@@ -3675,15 +3706,6 @@
         else visible.delete(pn);
       });
     }, { root: scrollRoot, threshold: [0, 0.5, 1] });
-
-    const tick = () => {
-      const now = Date.now();
-      const delta = now - lastTick;
-      lastTick = now;
-      if (document.visibilityState === 'visible') {
-        visible.forEach((pn) => dwell.set(pn, (dwell.get(pn) || 0) + delta));
-      }
-    };
 
     const markReadThrough = (pn) => {
       readWaterline = Math.max(readWaterline, Number(pn) || 1);
@@ -3695,52 +3717,113 @@
       });
     };
 
-    const flush = async () => {
+    const flush = async (force) => {
+      if (inFlight || ME_STATE === 'guest') return;
+      const now = Date.now();
+      if (!force && (now < blockSendingUntil || now < globalCooldownUntil)) return;
       const params = { topic_id: topicId };
-      let total = 0, any = false;
+      const increments = new Map();
+      let total = 0;
       dwell.forEach((ms, pn) => {
         if (ms < READ_THRESHOLD) return;
-        const inc = ms - (reported.get(pn) || 0);
+        const prev = reported.get(pn) || 0;
+        if (prev >= TIMINGS_MAX_POST_TIME_MS) return;
+        const capped = Math.min(ms, TIMINGS_MAX_POST_TIME_MS);
+        const inc = capped - prev;
         if (inc <= 0) return;
         params[`timings[${pn}]`] = inc;
+        increments.set(pn, inc);
         total += inc;
-        reported.set(pn, ms);
-        any = true;
+        reported.set(pn, capped);
       });
-      if (!any) return;
+      if (!increments.size) return;
       params.topic_time = total;
+      inFlight = true;
+      lastFlushAt = now;
       try {
-        await apiSend(`${BASE}/topics/timings`, 'POST', params, { 'X-SILENCE-LOGGER': 'true' });
+        await apiSend(`${BASE}/topics/timings`, 'POST', params, {
+          'X-SILENCE-LOGGER': 'true',
+          'Discourse-Background': 'true',
+        });
+        failureCount = 0;
+        blockSendingUntil = 0;
         let maxReadPostNumber = 0;
-        Object.keys(params).forEach((k) => {
-          const m = k.match(/^timings\[(\d+)\]$/);
-          if (m) maxReadPostNumber = Math.max(maxReadPostNumber, +m[1]);
+        increments.forEach((_, pn) => {
+          if (pn > maxReadPostNumber) maxReadPostNumber = pn;
         });
         if (maxReadPostNumber) markReadThrough(maxReadPostNumber);
       } catch (e) {
-        Object.keys(params).forEach((k) => {
-          const m = k.match(/^timings\[(\d+)\]$/);
-          if (m) reported.set(+m[1], (reported.get(+m[1]) || 0) - params[k]);
+        increments.forEach((inc, pn) => {
+          reported.set(pn, Math.max(0, (reported.get(pn) || 0) - inc));
         });
+        const retryDelay = e && Number(e.retryDelay) > 0
+          ? Number(e.retryDelay)
+          : TIMINGS_BACKOFF_DELAYS[Math.min(failureCount, TIMINGS_BACKOFF_DELAYS.length - 1)];
+        failureCount += 1;
+        blockSendingUntil = Date.now() + retryDelay;
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const tick = () => {
+      const now = Date.now();
+      const delta = Math.max(0, Math.min(5000, now - lastTick));
+      lastTick = now;
+      if (document.visibilityState !== 'visible') return;
+      if (now - lastActivityAt <= TIMINGS_IDLE_PAUSE_MS) {
+        visible.forEach((pn) => {
+          const current = dwell.get(pn) || 0;
+          if (current < TIMINGS_MAX_POST_TIME_MS) {
+            dwell.set(pn, Math.min(TIMINGS_MAX_POST_TIME_MS, current + delta));
+          }
+        });
+      }
+      if (inFlight || now < blockSendingUntil || now < globalCooldownUntil) return;
+      let rush = false;
+      dwell.forEach((ms, pn) => {
+        if (!rush && ms >= READ_THRESHOLD && !(reported.get(pn) > 0) && pn > readWaterline) {
+          rush = true;
+        }
+      });
+      if (rush || now - lastFlushAt >= FLUSH_INTERVAL) {
+        flush(false);
       }
     };
 
     return {
       getReadWaterline() { return readWaterline; },
       setReadWaterline(pn) { readWaterline = Math.max(1, Number(pn) || 0); },
-      observe(node) { if (node) io.observe(node); },
+      observe(node) { if (node && !stopped) io.observe(node); },
       unobserve(node) { if (node) { io.unobserve(node); visible.delete(+node.dataset.postNumber); } },
       start() {
-        lastTick = Date.now();
+        const now = Date.now();
+        lastTick = now;
+        lastActivityAt = now;
+        lastFlushAt = now;
+        stopped = false;
+        if (scrollRoot) {
+          scrollRoot.addEventListener('scroll', noteActivity, { passive: true });
+          scrollRoot.addEventListener('pointerdown', noteActivity, { passive: true });
+          scrollRoot.addEventListener('wheel', noteActivity, { passive: true });
+        }
         tickTimer = setInterval(tick, 1000);
-        flushTimer = setInterval(flush, FLUSH_INTERVAL);
       },
       stop() {
+        if (stopped) return;
+        stopped = true;
         clearInterval(tickTimer);
-        clearInterval(flushTimer);
+        tickTimer = null;
+        if (scrollRoot) {
+          scrollRoot.removeEventListener('scroll', noteActivity);
+          scrollRoot.removeEventListener('pointerdown', noteActivity);
+          scrollRoot.removeEventListener('wheel', noteActivity);
+        }
         io.disconnect();
         tick();
-        flush();
+        if (Date.now() >= blockSendingUntil && Date.now() >= globalCooldownUntil) {
+          flush(true);
+        }
       },
     };
   }
@@ -5638,7 +5721,8 @@
       }
       const request = fetchJSON(`${BASE}/posts/${postId}/replies.json`, {
         signal: ctx.signal,
-        priority: immediate ? 'target' : 'visible',
+        priority: immediate ? 'target' : 'background',
+        maxAttempts: immediate ? RETRY_MAX_ATTEMPTS : 1,
         dedupeKey: `direct-replies:${BASE}:${postId}`,
       }).then((items) => Array.isArray(items) ? items : []);
       inFlight.set(postId, request);
@@ -8109,15 +8193,131 @@
 
         let syncingNewReplies = false;
         let pendingNoticeCount = 0;
+        let lastAutoSyncAt = Date.now();
+        let liveBusSeen = false;
+        const pendingLiveIds = new Set();
+
+        const applySyncedNewIds = (missingNewIds, wasNearBottom) => {
+          if (!missingNewIds.length) return;
+          let newestPostNumber = Number(((loader.topic || topic) && (loader.topic || topic).highest_post_number) || 1);
+          missingNewIds.forEach((id) => {
+            const newPost = loader.getPostById(id);
+            if (!newPost) return;
+            newestPostNumber = Math.max(newestPostNumber, Number(newPost.post_number) || 1);
+            const parentNum = Number(newPost.reply_to_post_number) || 0;
+            if (parentNum > 1) {
+              const parentPost = loader.getPostByNumber(parentNum);
+              if (parentPost) {
+                const known = loader.getKnownChildren(parentNum);
+                loader.updatePost(parentPost.id, {
+                  reply_count: Math.max(Number(parentPost.reply_count) || 0, known.length),
+                });
+                const cacheKey = String(parentPost.id);
+                if (ctx.subReplyCache.has(cacheKey)) {
+                  const prev = ctx.subReplyCache.get(cacheKey) || [];
+                  if (!prev.some((r) => Number(r.id) === Number(newPost.id))) {
+                    ctx.subReplyCache.set(cacheKey, [...prev, newPost]);
+                  }
+                }
+                const state = mergeSubReplyState(parentNum, known, ctx);
+                if (state.renderedCount >= Math.max(0, state.all.length - missingNewIds.length)) {
+                  state.renderedCount = state.all.length;
+                }
+                renderSubReplyState(parentNum, ctx);
+              }
+            }
+          });
+
+          const updatedTopic = loader.topic || topic;
+          ctx.totalComments = Math.max(0, Number(updatedTopic.posts_count || updatedTopic.highest_post_number || 1) - 1);
+          updateCommentsHeader(ctx);
+          const meta = modal.querySelector('.ldp-meta > span:first-child');
+          if (meta) {
+            meta.textContent = `${Number(updatedTopic.posts_count) || 1} 帖 · ${Number(updatedTopic.views) || 0} 浏览 · 楼主 @${ctx.op || '?'}`;
+          }
+          const bottomDateBtn = shell.querySelector('.ldp-tl-bottom-date');
+          if (bottomDateBtn && updatedTopic.last_posted_at) {
+            bottomDateBtn.textContent = fmtDate(updatedTopic.last_posted_at) || '底部';
+          }
+          if (app.timeline) app.timeline.refresh();
+          virtualFlow.refresh();
+
+          if (!wasNearBottom && noticeEl) {
+            pendingNoticeCount = (noticeEl.hidden ? 0 : pendingNoticeCount) + missingNewIds.length;
+            noticeEl.textContent = `已自动载入 ${pendingNoticeCount} 条新回复 · 点击查看 ↓`;
+            noticeEl.dataset.postNumber = String(newestPostNumber);
+            noticeEl.hidden = false;
+          } else if (noticeEl) {
+            pendingNoticeCount = 0;
+            noticeEl.hidden = true;
+          }
+        };
+
+        const syncLiveCreatedPosts = async () => {
+          if (!app.autoLoadReplies || syncingNewReplies || !pendingLiveIds.size || controller.signal.aborted) return;
+          if (Date.now() < globalCooldownUntil) return;
+          const opId = Number((topic._opPost && topic._opPost.id) || 0);
+          const existingSet = new Set(loader.getStreamIds().map(Number));
+          const targetIds = Array.from(pendingLiveIds).filter((id) => id > 0 && id !== opId && !existingSet.has(id));
+          pendingLiveIds.clear();
+          if (!targetIds.length) return;
+          syncingNewReplies = true;
+          lastAutoSyncAt = Date.now();
+          try {
+            const wasNearBottom = virtualFlow.isNearBottom();
+            const qs = targetIds.map((id) => `post_ids[]=${encodeURIComponent(id)}`).join('&');
+            const part = await fetchJSON(`${BASE}/t/${topicId}/posts.json?${qs}`, {
+              signal: controller.signal,
+              priority: 'background',
+              maxAttempts: 0,
+              dedupeKey: `live-posts:${BASE}:${topicId}:${targetIds.join(',')}`,
+            });
+            if (controller.signal.aborted || String(app.topicId) !== String(topicId)) return;
+            const fetchedPosts = ((part && part.post_stream && part.post_stream.posts) || [])
+              .slice()
+              .sort((a, b) => Number(a.post_number) - Number(b.post_number));
+            if (!fetchedPosts.length) return;
+            const addedIds = [];
+            let maxPostNum = Number((loader.topic && loader.topic.highest_post_number) || topic.highest_post_number || 1);
+            let lastPostedAt = (loader.topic && loader.topic.last_posted_at) || topic.last_posted_at;
+            fetchedPosts.forEach((p) => {
+              const merged = loader.mergePost(p);
+              if (merged && Number(merged.id) > 0) {
+                addedIds.push(Number(merged.id));
+                maxPostNum = Math.max(maxPostNum, Number(merged.post_number) || 1);
+                if (merged.created_at) lastPostedAt = merged.created_at;
+              }
+            });
+            if (!addedIds.length) return;
+            const curTopic = loader.topic || topic;
+            const { topic: syncedTopic } = loader.syncLatestTopic({
+              posts_count: (Number(curTopic.posts_count) || 1) + addedIds.length,
+              highest_post_number: maxPostNum,
+              last_posted_at: lastPostedAt,
+            });
+            if (syncedTopic) { app.topic = syncedTopic; ctx.topic = syncedTopic; }
+            applySyncedNewIds(addedIds, wasNearBottom);
+          } catch (error) { /* 后台实时拉取失败不打断阅读 */ }
+          finally {
+            syncingNewReplies = false;
+            if (pendingLiveIds.size && Date.now() >= globalCooldownUntil) {
+              setTimeout(syncLiveCreatedPosts, 500);
+            }
+          }
+        };
+
         const syncNewReplies = async () => {
           if (!app.autoLoadReplies || syncingNewReplies || document.visibilityState !== 'visible' || controller.signal.aborted) return;
+          if (Date.now() < globalCooldownUntil) return;
           syncingNewReplies = true;
+          lastAutoSyncAt = Date.now();
           try {
             const latest = await fetchJSON(`${BASE}/t/${topicId}.json?track_visit=false`, {
               signal: controller.signal,
               cache: 'no-store',
               priority: 'background',
-              dedupeKey: `auto-sync:${BASE}:${topicId}:${Math.floor(Date.now() / 3000)}`,
+              maxAttempts: 0,
+              dedupeKey: `auto-sync:${BASE}:${topicId}:${Math.floor(Date.now() / 10000)}`,
             });
             if (controller.signal.aborted || String(app.topicId) !== String(topicId)) return;
             const wasNearBottom = virtualFlow.isNearBottom();
@@ -8140,87 +8340,66 @@
               return;
             }
 
-            // 自动拉取新增回复实体并无刷新注入虚拟流与楼中楼
             await loader.fetchIds(missingNewIds, 'background', controller.signal);
             if (controller.signal.aborted || String(app.topicId) !== String(topicId)) return;
             const { topic: syncedTopic } = loader.syncLatestTopic(latest);
             if (syncedTopic) { app.topic = syncedTopic; ctx.topic = syncedTopic; }
-
-            let newestPostNumber = Number((syncedTopic && syncedTopic.highest_post_number) || 1);
-            missingNewIds.forEach((id) => {
-              const newPost = loader.getPostById(id);
-              if (!newPost) return;
-              newestPostNumber = Math.max(newestPostNumber, Number(newPost.post_number) || 1);
-              const parentNum = Number(newPost.reply_to_post_number) || 0;
-              if (parentNum > 1) {
-                const parentPost = loader.getPostByNumber(parentNum);
-                if (parentPost) {
-                  const known = loader.getKnownChildren(parentNum);
-                  loader.updatePost(parentPost.id, {
-                    reply_count: Math.max(Number(parentPost.reply_count) || 0, known.length),
-                  });
-                  const cacheKey = String(parentPost.id);
-                  if (ctx.subReplyCache.has(cacheKey)) {
-                    const prev = ctx.subReplyCache.get(cacheKey) || [];
-                    if (!prev.some((r) => Number(r.id) === Number(newPost.id))) {
-                      ctx.subReplyCache.set(cacheKey, [...prev, newPost]);
-                    }
-                  }
-                  const state = mergeSubReplyState(parentNum, known, ctx);
-                  if (state.renderedCount >= Math.max(0, state.all.length - missingNewIds.length)) {
-                    state.renderedCount = state.all.length;
-                  }
-                  renderSubReplyState(parentNum, ctx);
-                }
-              }
-            });
-
-            const updatedTopic = loader.topic || topic;
-            ctx.totalComments = Math.max(0, Number(updatedTopic.posts_count || updatedTopic.highest_post_number || 1) - 1);
-            updateCommentsHeader(ctx);
-            const meta = modal.querySelector('.ldp-meta > span:first-child');
-            if (meta) {
-              meta.textContent = `${Number(updatedTopic.posts_count) || 1} 帖 · ${Number(updatedTopic.views) || 0} 浏览 · 楼主 @${ctx.op || '?'}`;
-            }
-            const bottomDateBtn = shell.querySelector('.ldp-tl-bottom-date');
-            if (bottomDateBtn && updatedTopic.last_posted_at) {
-              bottomDateBtn.textContent = fmtDate(updatedTopic.last_posted_at) || '底部';
-            }
-            if (app.timeline) app.timeline.refresh();
-            virtualFlow.refresh();
-
-            if (!wasNearBottom && noticeEl) {
-              pendingNoticeCount = (noticeEl.hidden ? 0 : pendingNoticeCount) + missingNewIds.length;
-              noticeEl.textContent = `已自动载入 ${pendingNoticeCount} 条新回复 · 点击查看 ↓`;
-              noticeEl.dataset.postNumber = String(newestPostNumber);
-              noticeEl.hidden = false;
-            } else if (noticeEl) {
-              pendingNoticeCount = 0;
-              noticeEl.hidden = true;
-            }
+            applySyncedNewIds(missingNewIds, wasNearBottom);
           } catch (error) { /* 后台自动同步失败不打断阅读 */ }
           finally { syncingNewReplies = false; }
         };
 
         let liveDebounceTimer = 0;
         const onLiveTopicMessage = (liveTopicId, payload) => {
-          if (String(liveTopicId) !== String(topicId) || !app.autoLoadReplies) return;
-          if (payload && (payload.type === 'created' || payload.type === 'revised' || payload.id)) {
-            clearTimeout(liveDebounceTimer);
-            liveDebounceTimer = setTimeout(syncNewReplies, 400);
+          if (String(liveTopicId) !== String(topicId)) return;
+          liveBusSeen = true;
+          if (!app.autoLoadReplies || !payload) return;
+          if (payload.type === 'created') {
+            const createdId = Number(payload.id) || 0;
+            if (createdId > 0) {
+              pendingLiveIds.add(createdId);
+              clearTimeout(liveDebounceTimer);
+              liveDebounceTimer = setTimeout(syncLiveCreatedPosts, 450);
+            } else {
+              clearTimeout(liveDebounceTimer);
+              liveDebounceTimer = setTimeout(syncNewReplies, 600);
+            }
+          } else if (payload.type === 'revised' && Number(payload.id) > 0 && loader.getPostById(payload.id)) {
+            const revisedId = Number(payload.id);
+            if (Date.now() >= globalCooldownUntil) {
+              fetchJSON(`${BASE}/t/${topicId}/posts.json?post_ids[]=${encodeURIComponent(revisedId)}`, {
+                signal: controller.signal,
+                priority: 'background',
+                maxAttempts: 0,
+                dedupeKey: `live-revised:${BASE}:${topicId}:${revisedId}:${payload.version || Date.now()}`,
+              }).then((part) => {
+                if (controller.signal.aborted || String(app.topicId) !== String(topicId)) return;
+                const updated = ((part && part.post_stream && part.post_stream.posts) || [])[0];
+                if (updated) {
+                  loader.mergePost(updated);
+                  virtualFlow.refresh();
+                }
+              }).catch(() => {});
+            }
           }
         };
         const onVisibilityChange = () => {
-          if (document.visibilityState === 'visible') syncNewReplies();
+          if (document.visibilityState === 'visible' && Date.now() - lastAutoSyncAt >= AUTO_REFRESH_INTERVAL) {
+            syncNewReplies();
+          }
         };
         TOPIC_LIVE_LISTENERS.add(onLiveTopicMessage);
         document.addEventListener('visibilitychange', onVisibilityChange);
         app.stopLiveSync = () => {
           clearTimeout(liveDebounceTimer);
+          pendingLiveIds.clear();
           TOPIC_LIVE_LISTENERS.delete(onLiveTopicMessage);
           document.removeEventListener('visibilitychange', onVisibilityChange);
         };
-        app.refreshTimer = setInterval(syncNewReplies, AUTO_REFRESH_INTERVAL);
+        app.refreshTimer = setInterval(() => {
+          const interval = liveBusSeen ? AUTO_REFRESH_INTERVAL * 2 : AUTO_REFRESH_INTERVAL;
+          if (Date.now() - lastAutoSyncAt >= interval) syncNewReplies();
+        }, AUTO_REFRESH_INTERVAL);
       } catch (error) {
         if (error && error.name === 'AbortError') return;
         mask.remove(); body.innerHTML = `<div class="ldp-error">加载失败：${esc(error.message)}</div>`;
