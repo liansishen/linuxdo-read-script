@@ -51,6 +51,13 @@ Questions to answer:
 - Follow controls use the Follow plugin contract: show when `is_followed || can_follow`, then send `PUT` or `DELETE /follow/{username}.json`. Keep the prior state on failure and surface the error inside the card; mutate the cached card data on success.
 - In-modal links use overlay-scoped `:visited` overrides when their normal color must remain stable. The site's author-level `a:visited` rule can otherwise beat component colors; define `:visited:hover` explicitly when the normal hover color should remain.
 
+### Modal Post Client Device Indicator (`post-via-ios`)
+
+- LinuxDo serializes official Apple app replies on `post_stream.posts[]` as `via_ios_app: boolean`, `ios_device_name: string`, and `ios_device_type: string` (e.g. `"computer"` for Mac / desktop icon `#desktop`, otherwise mobile icon `#mobile-screen-button`).
+- Render `.ldp-device[data-identifier="post-via-ios"]` immediately after `.ldp-level` in `.ldp-post-head` only when `via_ios_app` or `ios_device_name` is present (with fallback to live page DOM `[data-identifier="post-via-ios"]` when present).
+- Inline SVG paths or resolved `<symbol>` markup must be used instead of bare `<use href="#...">` so the icon still renders on list pages where Discourse has not injected topic-only SVG symbols.
+- Append `.ldp-device-tooltip` to `.ldp-overlay` with `textContent` (`回复自 ${ios_device_name}`) and close it on scroll, outside click, or `Escape` before closing the modal.
+
 ---
 
 ## Testing Requirements

@@ -3,7 +3,7 @@
 > 在 LINUX DO 与 IDC Flare 列表页点击标题即可弹窗预览整帖：融合 **2.0 工作台界面、默认缩进楼中楼、自动无感载入新回复、全站任意表情点赞回应、列表发帖时间列、虚拟楼层流、右侧日期时间轴、双栏用户资料卡、历史收藏与 Obsidian 快照**，以及上游最新 **投票、模糊剧透、视频播放、KaTeX 数学公式、表情选择器、回复模板、大图压缩与分片上传、删帖、楼层等级标识** 等全部特性。
 
 [![](https://img.shields.io/badge/github-repo-blue?logo=github)](https://github.com/liansishen/linuxdo-read-script)
-![version](https://img.shields.io/badge/version-2.2.2-blue)
+![version](https://img.shields.io/badge/version-2.2.3-blue)
 ![platform](https://img.shields.io/badge/platform-Tampermonkey%20%7C%20Violentmonkey-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -38,7 +38,7 @@
 - **回复模板菜单**：回复框内置 `+` 模板按钮，一键插入「隐藏详细信息」（`[details]`）与「模糊剧透」（`[spoiler]`），且不再前端死卡 16 字限制（交由服务端按实际规则校验并返回具体原因）。
 - **全类型粘贴上传 & 大图压缩 / 分片直传**：支持在回复框直接粘贴图片、动图、音频、视频或附件；超过 4MB 的图片/GIF 自动尝试转为 WebP，支持 S3 分片并发直传并在不支持分片的站点自动回退标准上传。
 - **删除自己的回复**：本人发布的非首楼回复提供删除按钮，删除后即时替换为「（帖子已被作者删除）」占位。
-- **等级标识与双栏用户资料卡**：楼层头部内联显示 `Lv.X` 用户等级；点击头像、昵称、`@用户名` 或 Boost 气泡头像均可弹出双栏封面资料卡（含简介、阅读时长、最近活跃、帖子/主题/获赞统计、带图标徽章、关注/私信/免打扰设置），按住 Ctrl/Cmd 点击则直接在新标签页打开用户主页。
+- **等级标识、用户设备图标与双栏用户资料卡**：楼层头部内联显示 `Lv.X` 用户等级，并在其右侧展示官方 App 发帖/回复设备图标（iOS 手机图标与 Mac 桌面图标，悬停或点击提示 `回复自 …`）；点击头像、昵称、`@用户名` 或 Boost 气泡头像均可弹出双栏封面资料卡（含简介、阅读时长、最近活跃、帖子/主题/获赞统计、带图标徽章、关注/私信/免打扰设置），按住 Ctrl/Cmd 点击则直接在新标签页打开用户主页。
 - **代码块复制、Base64 解码与原图灯箱**：弹窗代码块自动补齐一键复制按钮；选中 Base64 文本弹出浮动解码卡片；点击正文图片或信息条以原图打开灯箱。
 - **保存到 Obsidian**：支持通过 Local REST API 静默写入或 Obsidian URI 将楼主首帖保存/更新为 Markdown 笔记。
 

@@ -1125,3 +1125,57 @@ test('supports dragging the timeline thumb to jump floors', async ({ page }) => 
     return Number((text || '').split('/')[0].trim());
   }).toBeGreaterThan(1000);
 });
+
+test('renders iOS and Mac device icons to the right of user level with hover/click tooltip', async ({ page }) => {
+  await bootReader(page, {
+    target: 12,
+    postOverrides: {
+      12: {
+        trust_level: 3,
+        via_ios_app: true,
+        ios_device_name: 'iPhone 17 Pro Max',
+        ios_device_type: 'mobile',
+      },
+      13: {
+        trust_level: 2,
+        via_ios_app: true,
+        ios_device_name: 'MBP 14 英寸 (M4 Max, 2024)',
+        ios_device_type: 'computer',
+      },
+      14: {
+        trust_level: 1,
+      },
+    },
+  });
+
+  const floor12 = page.locator('.ldp-post[data-post-number="12"]');
+  const floor13 = page.locator('.ldp-post[data-post-number="13"]');
+  const floor14 = page.locator('.ldp-post[data-post-number="14"]');
+
+  const iosDevice = floor12.locator('.ldp-post-head > .ldp-level + .ldp-device');
+  await expect(iosDevice).toBeVisible();
+  await expect(iosDevice).toHaveAttribute('aria-label', '回复自 iPhone 17 Pro Max');
+  await expect(iosDevice.locator('svg')).toHaveAttribute('viewBox', '0 0 384 512');
+
+  const macDevice = floor13.locator('.ldp-post-head > .ldp-level + .ldp-device');
+  await expect(macDevice).toBeVisible();
+  await expect(macDevice).toHaveAttribute('aria-label', '回复自 MBP 14 英寸 (M4 Max, 2024)');
+  await expect(macDevice.locator('svg')).toHaveAttribute('viewBox', '0 0 576 512');
+
+  await expect(floor14.locator('.ldp-device')).toHaveCount(0);
+
+  // Hover shows tooltip, moving away closes unpinned tooltip
+  await iosDevice.hover();
+  await expect(page.locator('.ldp-device-tooltip')).toHaveText('回复自 iPhone 17 Pro Max');
+  await floor14.locator('.ldp-level').hover();
+  await expect(page.locator('.ldp-device-tooltip')).toHaveCount(0);
+
+  // Click pins tooltip and Escape closes tooltip without closing modal
+  await macDevice.click();
+  await expect(page.locator('.ldp-device-tooltip')).toHaveText('回复自 MBP 14 英寸 (M4 Max, 2024)');
+  await expect(macDevice).toHaveAttribute('aria-expanded', 'true');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.ldp-device-tooltip')).toHaveCount(0);
+  await expect(macDevice).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator('.ldp-v2 .ldp-modal')).toBeVisible();
+});

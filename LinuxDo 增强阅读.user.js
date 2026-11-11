@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinuxDo 增强阅读
 // @namespace    https://linux.do/
-// @version      2.2.2
+// @version      2.2.3
 // @license      MIT
 // @description  在 LINUX DO 与 IDC Flare 高性能浮窗阅读帖子，支持默认楼中楼、自动载入新回复、全表情点赞回应、列表发帖时间列、右侧时间轴、投票、剧透、视频、公式、大图压缩上传、删帖、历史收藏、双栏资料卡和 Obsidian 快照。
 // @author       Fashion
@@ -776,6 +776,16 @@
     .ldp-b-avatar{transition:opacity .15s,transform .15s;}
     .ldp-level{flex:none;font-size:11px;font-weight:600;line-height:1.4;padding:0 5px;border-radius:4px;
       border:1px solid var(--primary-low,#dfe4e1);background:var(--primary-very-low,#f3f6f4);color:var(--primary-medium,#5f6963);}
+    .ldp-device{flex:none;display:inline-flex;align-items:center;justify-content:center;
+      width:18px;height:18px;padding:0;border:none;border-radius:4px;background:transparent;
+      color:var(--primary-medium,#6b746f);cursor:pointer;line-height:1;transition:color .15s,background .15s;}
+    .ldp-device:hover,.ldp-device[aria-expanded="true"]{color:var(--primary,#222);background:var(--primary-very-low,#eff3f1);}
+    .ldp-device:focus-visible{outline:2px solid var(--tertiary,#08c);outline-offset:1px;}
+    .ldp-device svg{width:13px;height:13px;fill:currentColor;display:block;pointer-events:none;}
+    .ldp-device-tooltip{position:fixed;z-index:2147483570;max-width:min(320px,calc(100vw - 24px));
+      padding:5px 9px;border-radius:6px;background:var(--primary,#222);color:var(--secondary,#fff);
+      font-size:12px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+      box-shadow:0 6px 18px rgba(0,0,0,.22);pointer-events:none;}
     .ldp-topic-category-chip{border-color:#9fc5b1;background:#edf6f1;color:#176c43;font-weight:600;}
     .ldp-content .ldp-deleted{color:var(--primary-medium,#888);}
     .ldp-deletebtn:hover{color:var(--danger,#b42318);background:rgba(180,35,24,.08);opacity:1;}
@@ -963,6 +973,8 @@
   const EMOJI_BTN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16Zm-3.5-9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm7 0a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm-7.43 3.5a4.5 4.5 0 0 0 7.86 0h-1.8a2.8 2.8 0 0 1-4.26 0h-1.8Z"/></svg>';
   const INSERT_BTN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm1 9h4v2h-4v4h-2v-4H7v-2h4V7h2v4Z"/></svg>';
   const DETAILS_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.4 6.6 5.4 5.4-5.4 5.4L8 16l4-4-4-4 1.4-1.4Z"/></svg>';
+  const DEVICE_MOBILE_SVG = '<svg viewBox="0 0 384 512" aria-hidden="true"><path d="M80 0C44.7 0 16 28.7 16 64v384c0 35.3 28.7 64 64 64h224c35.3 0 64-28.7 64-64V64c0-35.3-28.7-64-64-64H80zm80 432h64c8.8 0 16 7.2 16 16s-7.2 16-16 16h-64c-8.8 0-16-7.2-16-16s7.2-16 16-16zM304 64v320H80V64h224z"/></svg>';
+  const DEVICE_DESKTOP_SVG = '<svg viewBox="0 0 576 512" aria-hidden="true"><path d="M64 0C28.7 0 0 28.7 0 64v288c0 35.3 28.7 64 64 64h176l-10.7 32H160c-17.7 0-32 14.3-32 32s14.3 32 32 32h256c17.7 0 32-14.3 32-32s-14.3-32-32-32h-69.3L336 416h176c35.3 0 64-28.7 64-64V64c0-35.3-28.7-64-64-64H64zm448 64v224H64V64h448z"/></svg>';
   const SPOILER_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5c-5 0-9.27 3.11-11 7.5C2.73 16.89 7 20 12 20s9.27-3.11 11-7.5C21.27 8.11 17 5 12 5Zm0 12.5a5 5 0 1 1 0-10 5 5 0 0 1 0 10Zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"/></svg>';
   const TRASH_BTN_ICON = '<svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:currentColor;vertical-align:middle;" aria-hidden="true"><path d="M8 3h8l1 2h4v2H3V5h4l1-2Zm-2 6h12l-1 12H7L6 9Zm3 2 .5 8h2L11 11H9Zm4 0-.5 8h2l.5-8h-2Z"/></svg>';
 
@@ -2747,8 +2759,54 @@
     return closed;
   }
 
+  let activeDeviceTooltip = null;
+
+  function closeDeviceTooltip() {
+    if (!activeDeviceTooltip) return false;
+    const { tip, btn } = activeDeviceTooltip;
+    activeDeviceTooltip = null;
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+    if (tip) tip.remove();
+    return true;
+  }
+
+  function openDeviceTooltip(btn, pinned) {
+    if (!btn || !btn.isConnected) return;
+    const label = btn.getAttribute('aria-label') || btn.dataset.deviceLabel || '';
+    if (!label) return;
+    if (activeDeviceTooltip && activeDeviceTooltip.btn === btn) {
+      if (pinned) activeDeviceTooltip.pinned = true;
+      return;
+    }
+    closeDeviceTooltip();
+    const tip = document.createElement('div');
+    tip.className = 'ldp-device-tooltip';
+    tip.setAttribute('role', 'tooltip');
+    tip.textContent = label;
+    const overlay = btn.closest('.ldp-overlay') || document.body;
+    overlay.appendChild(tip);
+    btn.setAttribute('aria-expanded', 'true');
+    activeDeviceTooltip = { tip, btn, pinned: !!pinned };
+    const rect = btn.getBoundingClientRect();
+    const modal = btn.closest('.ldp-modal');
+    const bounds = modal ? modal.getBoundingClientRect()
+      : { top: 8, left: 8, bottom: window.innerHeight - 8, right: window.innerWidth - 8 };
+    const tipW = tip.offsetWidth || 160;
+    const tipH = tip.offsetHeight || 28;
+    const gap = 6;
+    let top = (rect.top - tipH - gap >= bounds.top) ? (rect.top - tipH - gap) : (rect.bottom + gap);
+    if (top + tipH > bounds.bottom) top = bounds.bottom - tipH;
+    if (top < bounds.top) top = bounds.top;
+    let left = rect.left + (rect.width - tipW) / 2;
+    if (left < bounds.left + 6) left = bounds.left + 6;
+    if (left + tipW > bounds.right - 6) left = bounds.right - tipW - 6;
+    tip.style.top = `${Math.round(top)}px`;
+    tip.style.left = `${Math.round(left)}px`;
+  }
+
   function closeEmojiPanels() {
     let closed = closeReactionHoverBar();
+    closed = closeDeviceTooltip() || closed;
     document.querySelectorAll('.ldp-emoji-panel').forEach((panel) => {
       if (panel._ownerBtn) panel._ownerBtn._ldpEmojiPanel = null;
       panel.remove();
@@ -4087,6 +4145,55 @@
     });
   }
 
+  function resolveDeviceIconHtml(iconId) {
+    if (typeof document !== 'undefined') {
+      const sym = document.getElementById(iconId);
+      if (sym && sym.innerHTML) {
+        const vb = sym.getAttribute('viewBox') || (iconId === 'desktop' ? '0 0 576 512' : '0 0 384 512');
+        return `<svg class="fa d-icon d-icon-${iconId} svg-icon fa-width-auto svg-string" viewBox="${escAttr(vb)}" width="1em" height="1em" aria-hidden="true">${sym.innerHTML}</svg>`;
+      }
+    }
+    return iconId === 'desktop' ? DEVICE_DESKTOP_SVG : DEVICE_MOBILE_SVG;
+  }
+
+  function extractDomPostDevice(p) {
+    if (typeof document === 'undefined' || !p) return null;
+    const postEl = (p.id && document.querySelector(`article[data-post-id="${CSS.escape(String(p.id))}"]`))
+      || (p.post_number && document.querySelector(`article#post_${Number(p.post_number)}`));
+    if (!postEl) return null;
+    const trigger = postEl.querySelector('[data-identifier="post-via-ios"]');
+    if (!trigger) return null;
+    const ariaLabel = String(trigger.getAttribute('aria-label') || '').trim();
+    if (!ariaLabel) return null;
+    const useHref = trigger.querySelector('use')?.getAttribute('href') || '';
+    const isDesktop = useHref === '#desktop' || Boolean(trigger.querySelector('.d-icon-desktop'));
+    return { label: ariaLabel, iconId: isDesktop ? 'desktop' : 'mobile-screen-button' };
+  }
+
+  function renderPostDeviceHtml(p) {
+    if (!p) return '';
+    const rawName = String(p.ios_device_name || '').trim();
+    const rawType = String(p.ios_device_type || '').trim().toLowerCase();
+    let label = '';
+    let iconId = 'mobile-screen-button';
+    if (p.via_ios_app || rawName) {
+      const isDesktop = rawType === 'computer' || rawType === 'desktop' || rawType === 'mac'
+        || (!rawType && /\b(mac|mbp|mba|imac|macbook)\b/i.test(rawName));
+      iconId = isDesktop ? 'desktop' : 'mobile-screen-button';
+      if (rawName) {
+        label = /^回复自\s*/.test(rawName) ? rawName : `回复自 ${rawName}`;
+      } else {
+        label = isDesktop ? '回复自 Mac' : '回复自 iOS';
+      }
+    } else {
+      const domInfo = extractDomPostDevice(p);
+      if (!domInfo) return '';
+      label = domInfo.label;
+      iconId = domInfo.iconId;
+    }
+    return `<span class="ldp-device" data-identifier="post-via-ios" role="button" tabindex="0" aria-expanded="false" aria-label="${escAttr(label)}" data-device-label="${escAttr(label)}">${resolveDeviceIconHtml(iconId)}</span>`;
+  }
+
   /* ============ 7. 渲染单条 ============ */
   function renderPost(p, isReply, ctx) {
     const isDeleted = Boolean(p.deleted_at || p.user_deleted === true || (!p.username && !p.cooked));
@@ -4153,6 +4260,7 @@
         ${avatar && username ? `<button type="button" class="ldp-avatar-btn" title="查看 ${escAttr(username)} 的个人详情" aria-label="查看 ${escAttr(username)} 的个人详情" data-username="${escAttr(username)}"><img class="ldp-avatar" src="${escAttr(avatar)}" alt="" loading="lazy" decoding="async"></button>` : (avatar ? `<img class="ldp-avatar" src="${escAttr(avatar)}" alt="" loading="lazy" decoding="async">` : '')}
         ${userIdentityHtml}
         ${p.trust_level != null && p.trust_level !== '' ? `<span class="ldp-level">Lv.${esc(String(p.trust_level))}</span>` : ''}
+        ${isDeleted ? '' : renderPostDeviceHtml(p)}
         ${isOP ? '<span class="ldp-op">OP</span>' : ''}
         ${isME ? '<span class="ldp-me">ME</span>' : ''}
         ${time ? `<span class="ldp-time">· ${esc(time)}</span>` : ''}
@@ -4965,9 +5073,36 @@
       ctx,
       modal,
     );
+    modal.addEventListener('mouseover', (e) => {
+      const deviceBtn = e.target.closest('.ldp-device');
+      if (deviceBtn) openDeviceTooltip(deviceBtn, false);
+    });
+    modal.addEventListener('mouseout', (e) => {
+      const deviceBtn = e.target.closest('.ldp-device');
+      if (!deviceBtn || deviceBtn.contains(e.relatedTarget)) return;
+      if (activeDeviceTooltip && activeDeviceTooltip.btn === deviceBtn && !activeDeviceTooltip.pinned) {
+        closeDeviceTooltip();
+      }
+    });
+    modal.addEventListener('focusin', (e) => {
+      const deviceBtn = e.target.closest('.ldp-device');
+      if (deviceBtn) openDeviceTooltip(deviceBtn, false);
+    });
+    modal.addEventListener('focusout', (e) => {
+      const deviceBtn = e.target.closest('.ldp-device');
+      if (deviceBtn && activeDeviceTooltip && activeDeviceTooltip.btn === deviceBtn) closeDeviceTooltip();
+    });
+    modal.addEventListener('keydown', (e) => {
+      const deviceBtn = e.target.closest('.ldp-device');
+      if (deviceBtn && (e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault();
+        if (activeDeviceTooltip && activeDeviceTooltip.btn === deviceBtn && activeDeviceTooltip.pinned) closeDeviceTooltip();
+        else openDeviceTooltip(deviceBtn, true);
+      }
+    });
     if (ctx.scrollRoot) {
       ctx.scrollRoot.addEventListener('scroll', () => {
-        if (hoverReactionOpenTimer || document.querySelector('.ldp-emoji-panel, .ldp-reaction-hover-bar')) {
+        if (hoverReactionOpenTimer || activeDeviceTooltip || document.querySelector('.ldp-emoji-panel, .ldp-reaction-hover-bar')) {
           closeEmojiPanels();
         }
       }, { passive: true });
@@ -5012,6 +5147,19 @@
         openUserCardV2(avatarBtn.dataset.username, avatarBtn);
         return;
       }
+      const deviceBtn = e.target.closest('.ldp-device');
+      if (deviceBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (activeDeviceTooltip && activeDeviceTooltip.btn === deviceBtn && activeDeviceTooltip.pinned) {
+          closeDeviceTooltip();
+        } else {
+          openDeviceTooltip(deviceBtn, true);
+        }
+        return;
+      }
+      if (activeDeviceTooltip) closeDeviceTooltip();
+
 
       const userCardTrigger = e.target.closest('.ldp-user-link, .ldp-boost-avatar-link, .ldp-b-avatar');
       if (userCardTrigger && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
@@ -5330,6 +5478,10 @@
               username: postData.username || ME_USERNAME,
               name: postData.name,
               avatar_template: postData.avatar_template,
+              trust_level: postData.trust_level,
+              via_ios_app: postData.via_ios_app,
+              ios_device_name: postData.ios_device_name,
+              ios_device_type: postData.ios_device_type,
               cooked: postData.cooked,
               created_at: postData.created_at || new Date().toISOString(),
               reply_to_post_number: postNumber,
